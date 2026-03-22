@@ -1,0 +1,25 @@
+/target
+/US
+
+# Sensitive / local files
+.env*
+.claude/
+*.key
+*.pem
+*.cert
+credentials.*
+
+# SonarQube working directories
+.sonarqube/
+.sonar/
+.scannerwork/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
