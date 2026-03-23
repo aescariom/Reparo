@@ -1555,6 +1555,26 @@ Apply the fix now."#,
             info!("Keeping source changes: {:?}", source_changes);
         }
 
+        // Revert any changes to protected config files (package.json, tsconfig.json, etc.)
+        let all_current = git::changed_files(&self.config.path).unwrap_or_default();
+        let protected_changes: Vec<String> = all_current.iter().filter(|f| is_protected_file(f, &self.config.protected_files)).cloned().collect();
+        if !protected_changes.is_empty() {
+            warn!(
+                "Claude modified protected config file(s) {:?} — reverting",
+                protected_changes
+            );
+            for pf in &protected_changes {
+                let checkout_result = std::process::Command::new("git")
+                    .current_dir(&self.config.path)
+                    .args(["checkout", "HEAD", "--", pf])
+                    .status();
+                match checkout_result {
+                    Ok(s) if s.success() => info!("Reverted protected file: {}", pf),
+                    _ => warn!("Could not revert protected file: {}", pf),
+                }
+            }
+        }
+
         // Build a structured change description
         result.change_description = build_change_description(&claude_output, &changed);
 
@@ -2805,6 +2825,17 @@ fn is_internal_file(path: &str) -> bool {
         || lower.contains("report.md")
         || lower.contains("review_needed.md")
         || lower.ends_with("report-task.txt")
+}
+
+/// Check if a file is protected from Claude modifications.
+/// Matches the basename of `path` case-insensitively against the configured protected_files list.
+fn is_protected_file(path: &str, protected_files: &[String]) -> bool {
+    if protected_files.is_empty() {
+        return false;
+    }
+    let lower = path.to_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+    protected_files.iter().any(|p| p.to_lowercase() == filename)
 }
 
 fn is_test_file(path: &str) -> bool {

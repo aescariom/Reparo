@@ -126,6 +126,10 @@ pub struct Config {
     /// Maximum number of deduplication iterations (0 = unlimited)
     #[arg(long, env = "REPARO_MAX_DEDUP", default_value = "10")]
     pub max_dedup: usize,
+
+    /// Protected files (populated from YAML, not a CLI flag)
+    #[arg(skip)]
+    pub protected_files: Vec<String>,
 }
 
 /// Validated, ready-to-use configuration.
@@ -178,6 +182,9 @@ pub struct ValidatedConfig {
     pub skip_dedup: bool,
     /// Maximum dedup iterations (0 = unlimited)
     pub max_dedup: usize,
+    /// Files that Claude must never modify (reverted automatically after each fix).
+    /// Matched case-insensitively against the basename of changed files.
+    pub protected_files: Vec<String>,
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -310,6 +317,7 @@ impl Config {
             coverage_attempts: self.coverage_attempts,
             skip_dedup: self.skip_dedup,
             max_dedup: self.max_dedup,
+            protected_files: self.protected_files,
         };
 
         validated.print_summary();
@@ -573,6 +581,7 @@ mod tests {
             coverage_attempts: 3,
             skip_dedup: false,
             max_dedup: 10,
+            protected_files: vec![],
         }
     }
 

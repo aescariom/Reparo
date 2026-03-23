@@ -18,6 +18,10 @@ pub struct YamlConfig {
     pub execution: ExecutionYaml,
     pub commands: CommandsYaml,
     pub prompts: PromptsYaml,
+    /// Files that Claude must never modify during fixes (reverted automatically).
+    /// List of exact filenames (matched against the basename, case-insensitive).
+    #[serde(default)]
+    pub protected_files: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -361,6 +365,10 @@ pub fn merge_yaml_into_config(
         if let Some(v) = yaml.execution.max_dedup {
             config.max_dedup = v;
         }
+    }
+    // protected_files: always take from YAML (no CLI equivalent)
+    if !yaml.protected_files.is_empty() {
+        config.protected_files = yaml.protected_files.clone();
     }
 }
 
