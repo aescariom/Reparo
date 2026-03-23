@@ -473,6 +473,120 @@ impl Orchestrator {
             info!("=== Step 5b: Deduplication SKIPPED (no scanner) ===");
         }
 
+        // Step 5c: Final validation — ensure build + tests pass after all changes
+        info!("=== Step 5c: Final validation ===");
+        if !test_command.is_empty() {
+            let max_final_attempts = self.config.coverage_attempts;
+            let mut final_ok = false;
+
+            for attempt in 1..=max_final_attempts {
+                // Build check
+                if let Some(ref build_cmd) = self.config.commands.build {
+                    match runner::run_shell_command(&self.config.path, build_cmd, "final build check") {
+                        Ok((true, _)) => info!("Final build check passed"),
+                        Ok((false, output)) => {
+                            warn!("Final build check FAILED (attempt {}/{})", attempt, max_final_attempts);
+                            if attempt < max_final_attempts {
+                                info!("Asking Claude to fix the build error...");
+                                let repair_prompt = format!(
+                                    r#"The project build is failing. Fix the build error WITHOUT modifying any test files.
+
+## Build output:
+```
+{}
+```
+
+## Instructions:
+1. Fix the build error
+2. Do NOT modify any test files (*.spec.ts, *.test.ts, etc.)
+3. Do NOT change test logic or assertions
+4. Ensure the project compiles successfully
+
+Apply the fix now."#,
+                                    truncate(&output, 3000)
+                                );
+                                let repair_tier = claude::classify_repair_tier();
+                                let _ = claude::run_claude_with_tier(
+                                    &self.config.path, &repair_prompt,
+                                    repair_tier.effective_timeout(self.config.claude_timeout),
+                                    self.config.dangerously_skip_permissions, self.config.show_prompts,
+                                    Some(&repair_tier),
+                                );
+                                if let Some(ref fmt_cmd) = self.config.commands.format {
+                                    let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
+                                }
+                                continue;
+                            } else {
+                                error!("Build still failing after {} repair attempts", max_final_attempts);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Build command error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Test check
+                match runner::run_tests(&self.config.path, &test_command, self.config.test_timeout) {
+                    Ok((true, _)) => {
+                        info!("Final test validation passed — all tests green");
+                        final_ok = true;
+                        break;
+                    }
+                    Ok((false, output)) => {
+                        warn!("Final test validation FAILED (attempt {}/{})", attempt, max_final_attempts);
+                        if attempt < max_final_attempts {
+                            info!("Asking Claude to fix the test failure (without modifying tests)...");
+                            let repair_prompt = format!(
+                                r#"Tests are failing after applying SonarQube fixes. Fix the SOURCE CODE to make all tests pass. Do NOT modify any test files.
+
+## Test output:
+```
+{}
+```
+
+## Instructions:
+1. Fix the source code to make all tests pass
+2. Do NOT modify any test files (*.spec.ts, *.test.ts, etc.)
+3. Do NOT change test logic or assertions — the tests define the expected behavior
+4. Ensure the fix compiles and all tests pass
+
+Apply the fix now."#,
+                                truncate(&output, 3000)
+                            );
+                            let repair_tier = claude::classify_repair_tier();
+                            let _ = claude::run_claude_with_tier(
+                                &self.config.path, &repair_prompt,
+                                repair_tier.effective_timeout(self.config.claude_timeout),
+                                self.config.dangerously_skip_permissions, self.config.show_prompts,
+                                Some(&repair_tier),
+                            );
+                            if let Some(ref fmt_cmd) = self.config.commands.format {
+                                let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
+                            }
+                        } else {
+                            error!("Tests still failing after {} repair attempts", max_final_attempts);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Test command error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Commit any final fixes
+            if final_ok {
+                let _ = git::add_all(&self.config.path);
+                if git::has_staged_changes(&self.config.path).unwrap_or(false) {
+                    let _ = git::commit(&self.config.path, "fix: repair build/test issues from accumulated changes");
+                    info!("Committed final validation fixes");
+                }
+            }
+        }
+
         // Step 6: Generate report (on the fix branch)
         info!("=== Step 6: Generating report ===");
         let elapsed = start.elapsed().as_secs();
@@ -745,13 +859,17 @@ impl Orchestrator {
             info!("Coverage boost prompt:\n{}", prompt);
         }
 
-        info!("Generating tests for {} ...", fc.file);
-        match claude::run_claude(
+        let uncovered_count = (fc.total_lines - fc.covered_lines) as usize;
+        let test_tier = claude::classify_test_gen_tier(uncovered_count, fc.total_lines as usize);
+        let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
+        info!("Generating tests for {} [{}]...", fc.file, test_tier);
+        match claude::run_claude_with_tier(
             &self.config.path,
             &prompt,
-            self.config.claude_timeout,
+            test_timeout,
             self.config.dangerously_skip_permissions,
             false,
+            Some(&test_tier),
         ) {
             Ok(_) => {
                 info!("Claude completed test generation for {}", fc.file);
@@ -1056,13 +1174,16 @@ impl Orchestrator {
                 let _ = runner::run_shell_command(&self.config.path, clean_cmd, "clean");
             }
 
-            info!("Asking Claude to refactor {} to reduce duplication...", dup_file.file_path);
-            match claude::run_claude(
+            let dedup_tier = claude::classify_dedup_tier(dup_file.duplicated_lines, dup_file.duplication_pct);
+            let dedup_timeout = dedup_tier.effective_timeout(self.config.claude_timeout);
+            info!("Asking Claude to refactor {} to reduce duplication... [{}]", dup_file.file_path, dedup_tier);
+            match claude::run_claude_with_tier(
                 &self.config.path,
                 &prompt,
-                self.config.claude_timeout,
+                dedup_timeout,
                 self.config.dangerously_skip_permissions,
-                false, // don't re-show prompt
+                self.config.show_prompts,
+                Some(&dedup_tier),
             ) {
                 Ok(_output) => {
                     info!("Claude completed dedup refactoring for {}", dup_file.file_path);
@@ -1357,7 +1478,17 @@ impl Orchestrator {
             &rule_desc_with_hint,
         );
 
-        let claude_output = match claude::run_claude(&self.config.path, &prompt, self.config.claude_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts) {
+        // Classify the issue to pick the right model + effort
+        let tier = claude::classify_issue_tier(
+            &issue.rule,
+            &issue.severity,
+            &issue.message,
+            end_line.saturating_sub(start_line) + 1,
+        );
+        info!("Issue {} classified as tier {} (rule: {}, severity: {})", issue.key, tier, issue.rule, issue.severity);
+
+        let effective_timeout = tier.effective_timeout(self.config.claude_timeout);
+        let claude_output = match claude::run_claude_with_tier(&self.config.path, &prompt, effective_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts, Some(&tier)) {
             Ok(output) => output,
             Err(e) => {
                 result.status = FixStatus::Failed(format!("Claude failed: {}", e));
@@ -1469,12 +1600,14 @@ impl Orchestrator {
                                 &file_path,
                                 &issue.message,
                             );
-                            match claude::run_claude(
+                            let repair_tier = claude::classify_repair_tier();
+                            match claude::run_claude_with_tier(
                                 &self.config.path,
                                 &repair_prompt,
-                                self.config.claude_timeout,
+                                repair_tier.effective_timeout(self.config.claude_timeout),
                                 self.config.dangerously_skip_permissions,
                                 self.config.show_prompts,
+                                Some(&repair_tier),
                             ) {
                                 Ok(_) => {
                                     info!("Claude applied build fix — retrying...");
@@ -1523,12 +1656,14 @@ impl Orchestrator {
                                 &file_path,
                                 &issue.message,
                             );
-                            match claude::run_claude(
+                            let repair_tier = claude::classify_repair_tier();
+                            match claude::run_claude_with_tier(
                                 &self.config.path,
                                 &repair_prompt,
-                                self.config.claude_timeout,
+                                repair_tier.effective_timeout(self.config.claude_timeout),
                                 self.config.dangerously_skip_permissions,
                                 self.config.show_prompts,
+                                Some(&repair_tier),
                             ) {
                                 Ok(_) => {
                                     // Check Claude didn't modify test files
@@ -1646,12 +1781,14 @@ impl Orchestrator {
 Apply the fixes now."#,
                                 truncate(&output, 3000)
                             );
-                            match claude::run_claude(
+                            let lint_tier = claude::classify_repair_tier();
+                            match claude::run_claude_with_tier(
                                 &self.config.path,
                                 &lint_prompt,
-                                self.config.claude_timeout,
+                                lint_tier.effective_timeout(self.config.claude_timeout),
                                 self.config.dangerously_skip_permissions,
                                 self.config.show_prompts,
+                                Some(&lint_tier),
                             ) {
                                 Ok(_) => {
                                     // Format after lint fix
@@ -1763,12 +1900,19 @@ Apply a different fix now."#,
                                         issue.key, issue.rule, issue.message,
                                         file_path, issue.rule
                                     );
-                                    match claude::run_claude(
+                                    // Retry uses same tier but bumped up since first attempt failed
+                                    let retry_tier = claude::ClaudeTier::with_timeout(
+                                        if tier.model == "haiku" { "sonnet" } else { tier.model },
+                                        if tier.effort == "low" { "medium" } else { tier.effort },
+                                        tier.timeout_multiplier.max(1.0),
+                                    );
+                                    match claude::run_claude_with_tier(
                                         &self.config.path,
                                         &retry_prompt,
-                                        self.config.claude_timeout,
+                                        retry_tier.effective_timeout(self.config.claude_timeout),
                                         self.config.dangerously_skip_permissions,
                                         self.config.show_prompts,
+                                        Some(&retry_tier),
                                     ) {
                                         Ok(_) => {
                                             info!("Claude applied retry fix — verifying build+tests...");
@@ -1975,7 +2119,9 @@ Apply a different fix now."#,
             };
 
             // Run claude to generate tests
-            match claude::run_claude(&self.config.path, &prompt, self.config.claude_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts) {
+            let test_tier = claude::classify_test_gen_tier(current_uncovered.len(), file_content.lines().count());
+            let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
+            match claude::run_claude_with_tier(&self.config.path, &prompt, test_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts, Some(&test_tier)) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 1 {

@@ -7,12 +7,180 @@ use tracing::{info, warn};
 /// Default per-call timeout for Claude in seconds (US-015).
 pub const DEFAULT_CLAUDE_TIMEOUT: u64 = 300;
 
+/// Model and effort tier for a Claude invocation.
+#[derive(Debug, Clone)]
+pub struct ClaudeTier {
+    /// Model alias: "sonnet", "opus", "haiku"
+    pub model: &'static str,
+    /// Effort level: "low", "medium", "high", "max"
+    pub effort: &'static str,
+    /// Timeout multiplier relative to the base claude_timeout (1.0 = no change)
+    pub timeout_multiplier: f64,
+}
+
+impl ClaudeTier {
+    pub const fn new(model: &'static str, effort: &'static str) -> Self {
+        Self { model, effort, timeout_multiplier: 1.0 }
+    }
+
+    pub const fn with_timeout(model: &'static str, effort: &'static str, multiplier: f64) -> Self {
+        Self { model, effort, timeout_multiplier: multiplier }
+    }
+
+    /// Compute the effective timeout from a base timeout.
+    pub fn effective_timeout(&self, base_timeout: u64) -> u64 {
+        (base_timeout as f64 * self.timeout_multiplier) as u64
+    }
+}
+
+impl std::fmt::Display for ClaudeTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.model, self.effort)
+    }
+}
+
+/// Classify a SonarQube issue into a Claude model+effort tier.
+///
+/// Criteria:
+/// - Rule type (simple mechanical fix vs complex refactoring)
+/// - Severity (CRITICAL/BLOCKER = higher tier)
+/// - Cognitive complexity delta (how much refactoring is needed)
+/// - Number of affected lines
+pub fn classify_issue_tier(
+    rule: &str,
+    severity: &str,
+    message: &str,
+    affected_lines: u32,
+) -> ClaudeTier {
+    // --- Tier 1: Haiku + low effort — trivial mechanical fixes ---
+    let trivial_rules = [
+        "S1128",  // unused import
+        "S1481",  // unused variable
+        "S7772",  // prefer node: prefix
+        "S7764",  // prefer globalThis
+        "S7773",  // prefer Number.isNaN/parseInt/parseFloat
+        "S6535",  // unnecessary escape character
+        "S7781",  // prefer String#replaceAll
+        "S7719",  // unnecessary .getTime()
+        "S3863",  // imported multiple times
+        "S4325",  // unnecessary type assertion
+        "S7778",  // don't call push multiple times
+        "S6353",  // use concise character class
+        "S7735",  // unexpected negated condition
+        "S6594",  // use RegExp.exec
+        "S7766",  // prefer Math.max
+        "S1854",  // useless assignment
+        "S2933",  // mark as readonly
+        "S7756",  // prefer Blob#arrayBuffer
+        "S1788",  // default parameters should be last
+    ];
+
+    let rule_suffix = rule.split(':').last().unwrap_or(rule);
+
+    if trivial_rules.iter().any(|r| rule_suffix == *r) {
+        return ClaudeTier::with_timeout("haiku", "low", 0.3); // 30% of base timeout
+    }
+
+    // --- Tier 2: Sonnet + medium effort — moderate fixes ---
+    let moderate_rules = [
+        "S3358",  // nested ternary
+        "S6679",  // use Number.isNaN
+        "S107",   // too many parameters
+        "S6582",  // prefer optional chain
+        "S7785",  // prefer top-level await
+        "S6853",  // form label accessibility
+        "S7924",  // CSS contrast
+    ];
+
+    if moderate_rules.iter().any(|r| rule_suffix == *r) {
+        return ClaudeTier::with_timeout("sonnet", "medium", 0.5); // 50% of base timeout
+    }
+
+    // --- Tier 3 & 4: Cognitive complexity — scale by delta ---
+    if rule_suffix == "S3776" {
+        // Parse complexity from message: "...from 18 to the 15 allowed."
+        let complexity = parse_complexity_from_message(message);
+        return match complexity {
+            Some(c) if c <= 20 => ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+            Some(c) if c <= 40 => ClaudeTier::with_timeout("sonnet", "high", 1.0),
+            Some(c) if c <= 70 => ClaudeTier::with_timeout("opus", "high", 1.5),
+            Some(_) => ClaudeTier::with_timeout("opus", "max", 2.0), // 108+ complexity
+            None => {
+                // Can't parse — use affected lines as proxy
+                if affected_lines > 200 {
+                    ClaudeTier::with_timeout("opus", "high", 1.5)
+                } else {
+                    ClaudeTier::with_timeout("sonnet", "high", 1.0)
+                }
+            }
+        };
+    }
+
+    // --- Default: severity-based fallback ---
+    match severity {
+        "BLOCKER" => ClaudeTier::with_timeout("opus", "high", 1.5),
+        "CRITICAL" => ClaudeTier::with_timeout("sonnet", "high", 1.0),
+        "MAJOR" => ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+        _ => ClaudeTier::with_timeout("sonnet", "low", 0.5),
+    }
+}
+
+/// Classify deduplication difficulty.
+/// Lines that are not 100% identical (structural duplicates with small variations)
+/// are much harder to refactor — need opus + max effort.
+pub fn classify_dedup_tier(duplicated_lines: u64, duplication_pct: f64) -> ClaudeTier {
+    // Very high duplication with many lines = very difficult
+    if duplicated_lines > 200 || duplication_pct > 50.0 {
+        ClaudeTier::with_timeout("opus", "max", 2.0)
+    } else if duplicated_lines > 100 || duplication_pct > 30.0 {
+        ClaudeTier::with_timeout("opus", "high", 1.5)
+    } else if duplicated_lines > 50 || duplication_pct > 15.0 {
+        ClaudeTier::with_timeout("sonnet", "high", 1.0)
+    } else {
+        ClaudeTier::with_timeout("sonnet", "medium", 0.7)
+    }
+}
+
+/// Classify test generation difficulty based on number of uncovered lines.
+pub fn classify_test_gen_tier(uncovered_lines: usize, total_file_lines: usize) -> ClaudeTier {
+    if uncovered_lines > 150 || total_file_lines > 500 {
+        ClaudeTier::with_timeout("opus", "high", 1.5)
+    } else if uncovered_lines > 80 || total_file_lines > 300 {
+        ClaudeTier::with_timeout("sonnet", "high", 1.0)
+    } else if uncovered_lines > 30 {
+        ClaudeTier::with_timeout("sonnet", "medium", 0.7)
+    } else {
+        ClaudeTier::with_timeout("sonnet", "low", 0.5)
+    }
+}
+
+/// Classify build/test/lint repair — always fast, targeted fixes.
+pub fn classify_repair_tier() -> ClaudeTier {
+    ClaudeTier::with_timeout("sonnet", "medium", 0.5)
+}
+
+/// Parse cognitive complexity value from SonarQube message.
+/// Example: "Refactor this function to reduce its Cognitive Complexity from 45 to the 15 allowed."
+fn parse_complexity_from_message(message: &str) -> Option<u32> {
+    // Look for "from N to"
+    let from_idx = message.find("from ")?;
+    let after_from = &message[from_idx + 5..];
+    let end = after_from.find(|c: char| !c.is_ascii_digit())?;
+    after_from[..end].parse().ok()
+}
+
 /// Run `claude -d` with a prompt and a per-call timeout (US-015).
 ///
 /// Spawns Claude as a child process and kills it if it exceeds `timeout_secs`.
 /// Returns the stdout output from claude.
 pub fn run_claude(project_path: &Path, prompt: &str, timeout_secs: u64, skip_permissions: bool, show_prompt: bool) -> Result<String> {
-    info!("Running claude -d (prompt: {} chars, timeout: {}s)", prompt.len(), timeout_secs);
+    run_claude_with_tier(project_path, prompt, timeout_secs, skip_permissions, show_prompt, None)
+}
+
+/// Run `claude -d` with a specific model+effort tier.
+pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64, skip_permissions: bool, show_prompt: bool, tier: Option<&ClaudeTier>) -> Result<String> {
+    let tier_desc = tier.map(|t| format!(" [{}]", t)).unwrap_or_default();
+    info!("Running claude -d (prompt: {} chars, timeout: {}s{})", prompt.len(), timeout_secs, tier_desc);
     if show_prompt {
         info!("Claude prompt:\n{}", prompt);
     }
@@ -22,6 +190,16 @@ pub fn run_claude(project_path: &Path, prompt: &str, timeout_secs: u64, skip_per
     if skip_permissions {
         args.push("--dangerously-skip-permissions");
     }
+
+    // Add model and effort from tier
+    let model_str;
+    let effort_str;
+    if let Some(t) = tier {
+        model_str = t.model.to_string();
+        effort_str = t.effort.to_string();
+        args.extend(["--model", &model_str, "--effort", &effort_str]);
+    }
+
     args.extend(["-p", prompt]);
 
     let mut child = Command::new("claude")

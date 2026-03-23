@@ -422,15 +422,24 @@ impl SonarClient {
             page += 1;
         }
 
-        // Sort by severity then type
+        // Sort by: category (Security > Reliability > Maintainability)
+        //          → severity (BLOCKER > CRITICAL > MAJOR > MINOR > INFO)
+        //          → complexity descending (most complex first)
         all_issues.sort_by(|a, b| {
-            let sev_a = severity_rank(&a.severity);
-            let sev_b = severity_rank(&b.severity);
-            sev_a.cmp(&sev_b).then_with(|| {
-                let type_a = type_rank(&a.issue_type);
-                let type_b = type_rank(&b.issue_type);
-                type_a.cmp(&type_b)
-            })
+            let cat_a = category_rank(&a.issue_type);
+            let cat_b = category_rank(&b.issue_type);
+            cat_a.cmp(&cat_b)
+                .then_with(|| {
+                    let sev_a = severity_rank(&a.severity);
+                    let sev_b = severity_rank(&b.severity);
+                    sev_a.cmp(&sev_b)
+                })
+                .then_with(|| {
+                    // Most complex first (higher complexity = earlier)
+                    let cplx_a = extract_complexity(&a.message);
+                    let cplx_b = extract_complexity(&b.message);
+                    cplx_b.cmp(&cplx_a)
+                })
         });
 
         info!("Fetched {} issues from SonarQube", all_issues.len());
@@ -901,14 +910,32 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-fn type_rank(t: &str) -> u8 {
-    match t {
-        "BUG" => 0,
-        "VULNERABILITY" => 1,
-        "SECURITY_HOTSPOT" => 2,
-        "CODE_SMELL" => 3,
-        _ => 4,
+/// Rank by category: Security > Reliability > Maintainability
+fn category_rank(issue_type: &str) -> u8 {
+    match issue_type {
+        "VULNERABILITY" | "SECURITY_HOTSPOT" => 0, // Security
+        "BUG" => 1,                                // Reliability
+        "CODE_SMELL" => 2,                         // Maintainability
+        _ => 3,
     }
+}
+
+/// Legacy type_rank for backward compatibility in tests
+fn type_rank(t: &str) -> u8 {
+    category_rank(t)
+}
+
+/// Extract cognitive complexity from SonarQube message.
+/// e.g. "Refactor this function to reduce its Cognitive Complexity from 45 to the 15 allowed."
+/// Returns the complexity value, or 0 if not found.
+fn extract_complexity(message: &str) -> u32 {
+    if let Some(from_idx) = message.find("from ") {
+        let after_from = &message[from_idx + 5..];
+        if let Some(end) = after_from.find(|c: char| !c.is_ascii_digit()) {
+            return after_from[..end].parse().unwrap_or(0);
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -981,10 +1008,18 @@ mod tests {
     }
 
     #[test]
-    fn test_type_rank_order() {
-        assert!(type_rank("BUG") < type_rank("VULNERABILITY"));
-        assert!(type_rank("VULNERABILITY") < type_rank("SECURITY_HOTSPOT"));
-        assert!(type_rank("SECURITY_HOTSPOT") < type_rank("CODE_SMELL"));
+    fn test_category_rank_order() {
+        // Security > Reliability > Maintainability
+        assert!(category_rank("VULNERABILITY") < category_rank("BUG"));
+        assert!(category_rank("SECURITY_HOTSPOT") < category_rank("BUG"));
+        assert!(category_rank("BUG") < category_rank("CODE_SMELL"));
+    }
+
+    #[test]
+    fn test_extract_complexity() {
+        assert_eq!(extract_complexity("Refactor this function to reduce its Cognitive Complexity from 45 to the 15 allowed."), 45);
+        assert_eq!(extract_complexity("Refactor this function to reduce its Cognitive Complexity from 108 to the 15 allowed."), 108);
+        assert_eq!(extract_complexity("Remove this unused import of 'NgClass'."), 0);
     }
 
     /// Helper to create a test Issue with minimal fields.
@@ -1008,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_issues_sort_by_severity_then_type() {
+    fn test_issues_sort_category_then_severity() {
         let mut issues = vec![
             make_issue("1", "MINOR", "CODE_SMELL"),
             make_issue("2", "BLOCKER", "VULNERABILITY"),
@@ -1021,25 +1056,21 @@ mod tests {
 
         // Apply the same sorting as fetch_issues
         issues.sort_by(|a, b| {
-            let sev_a = severity_rank(&a.severity);
-            let sev_b = severity_rank(&b.severity);
-            sev_a.cmp(&sev_b).then_with(|| {
-                type_rank(&a.issue_type).cmp(&type_rank(&b.issue_type))
-            })
+            category_rank(&a.issue_type).cmp(&category_rank(&b.issue_type))
+                .then_with(|| severity_rank(&a.severity).cmp(&severity_rank(&b.severity)))
+                .then_with(|| extract_complexity(&b.message).cmp(&extract_complexity(&a.message)))
         });
 
         let keys: Vec<&str> = issues.iter().map(|i| i.key.as_str()).collect();
         // Expected order:
-        //   BLOCKER BUG (3), BLOCKER VULN (2),
-        //   CRITICAL BUG (5), CRITICAL CODE_SMELL (4),
-        //   MAJOR SECURITY_HOTSPOT (6),
-        //   MINOR CODE_SMELL (1),
-        //   INFO CODE_SMELL (7)
-        assert_eq!(keys, vec!["3", "2", "5", "4", "6", "1", "7"]);
+        //   Security:  BLOCKER VULN (2), MAJOR SECURITY_HOTSPOT (6)
+        //   Reliability: BLOCKER BUG (3), CRITICAL BUG (5)
+        //   Maintainability: CRITICAL CODE_SMELL (4), MINOR CODE_SMELL (1), INFO CODE_SMELL (7)
+        assert_eq!(keys, vec!["2", "6", "3", "5", "4", "1", "7"]);
     }
 
     #[test]
-    fn test_issues_sort_same_severity_different_types() {
+    fn test_issues_sort_same_severity_by_category() {
         let mut issues = vec![
             make_issue("a", "MAJOR", "CODE_SMELL"),
             make_issue("b", "MAJOR", "SECURITY_HOTSPOT"),
@@ -1048,14 +1079,35 @@ mod tests {
         ];
 
         issues.sort_by(|a, b| {
-            severity_rank(&a.severity)
-                .cmp(&severity_rank(&b.severity))
-                .then_with(|| type_rank(&a.issue_type).cmp(&type_rank(&b.issue_type)))
+            category_rank(&a.issue_type).cmp(&category_rank(&b.issue_type))
+                .then_with(|| severity_rank(&a.severity).cmp(&severity_rank(&b.severity)))
         });
 
         let keys: Vec<&str> = issues.iter().map(|i| i.key.as_str()).collect();
-        // BUG > VULNERABILITY > SECURITY_HOTSPOT > CODE_SMELL
-        assert_eq!(keys, vec!["c", "d", "b", "a"]);
+        // Security (VULN + HOTSPOT, same rank) > Reliability (BUG) > Maintainability (CODE_SMELL)
+        // b and d are both Security (rank 0), stable sort preserves input order
+        assert_eq!(keys[2], "c"); // BUG
+        assert_eq!(keys[3], "a"); // CODE_SMELL
+        assert!(keys[0] == "b" || keys[0] == "d"); // both Security
+    }
+
+    #[test]
+    fn test_issues_sort_same_category_severity_by_complexity() {
+        let mut issues = vec![
+            Issue { message: "Refactor this function to reduce its Cognitive Complexity from 15 to the 15 allowed.".to_string(), ..make_issue("low", "CRITICAL", "CODE_SMELL") },
+            Issue { message: "Refactor this function to reduce its Cognitive Complexity from 108 to the 15 allowed.".to_string(), ..make_issue("high", "CRITICAL", "CODE_SMELL") },
+            Issue { message: "Refactor this function to reduce its Cognitive Complexity from 45 to the 15 allowed.".to_string(), ..make_issue("mid", "CRITICAL", "CODE_SMELL") },
+        ];
+
+        issues.sort_by(|a, b| {
+            category_rank(&a.issue_type).cmp(&category_rank(&b.issue_type))
+                .then_with(|| severity_rank(&a.severity).cmp(&severity_rank(&b.severity)))
+                .then_with(|| extract_complexity(&b.message).cmp(&extract_complexity(&a.message)))
+        });
+
+        let keys: Vec<&str> = issues.iter().map(|i| i.key.as_str()).collect();
+        // Most complex first: 108, 45, 15
+        assert_eq!(keys, vec!["high", "mid", "low"]);
     }
 
     #[test]
