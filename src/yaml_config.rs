@@ -87,6 +87,8 @@ pub struct CommandsYaml {
     pub format: Option<String>,
     /// Lint/static analysis after tests (non-blocking)
     pub lint: Option<String>,
+    /// Path to the coverage report file (bypasses auto-detection)
+    pub coverage_report: Option<String>,
 }
 
 /// Prompt customization per rule or category (US-019).
@@ -157,6 +159,8 @@ pub struct ProjectCommands {
     pub coverage: Option<String>,
     pub format: Option<String>,
     pub lint: Option<String>,
+    /// Explicit path to the coverage report file (bypasses auto-detection)
+    pub coverage_report: Option<String>,
 }
 
 impl ProjectCommands {
@@ -407,6 +411,7 @@ pub fn resolve_commands(
         coverage: cli_coverage_command.clone().or(base.coverage),
         format: base.format,
         lint: base.lint,
+        coverage_report: base.coverage_report,
     }
 }
 
@@ -568,6 +573,21 @@ commands:
         assert!(cmds.test.is_none());
         assert!(cmds.build.is_none());
         assert!(!cmds.has_any());
+    }
+
+    #[test]
+    fn test_resolve_commands_coverage_report_passthrough() {
+        let yaml = YamlConfig {
+            commands: CommandsYaml {
+                coverage_report: Some("target/site/jacoco/jacoco.xml".to_string()),
+                coverage: Some("mvn test jacoco:report".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = resolve_commands(Some(&yaml), &None, &None);
+        assert_eq!(cmds.coverage_report.as_deref(), Some("target/site/jacoco/jacoco.xml"));
+        assert_eq!(cmds.coverage.as_deref(), Some("mvn test jacoco:report"));
     }
 
     #[test]

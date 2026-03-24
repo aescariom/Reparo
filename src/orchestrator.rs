@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
@@ -180,7 +180,7 @@ impl Orchestrator {
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
                     git::delete_branch(&self.config.path, &branch_name);
-                    anyhow::bail!("Setup command failed:\n{}", truncate(&output, 500));
+                    anyhow::bail!("Setup command failed:\n{}", truncate_tail(&output, 2000));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
@@ -237,7 +237,7 @@ impl Orchestrator {
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
                     git::delete_branch(&self.config.path, &branch_name);
-                    anyhow::bail!("Pre-flight build fails — fix the build before running Reparo:\n{}", truncate(&output, 500));
+                    anyhow::bail!("Pre-flight build fails — fix the build before running Reparo:\n{}", truncate_tail(&output, 2000));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
@@ -253,7 +253,7 @@ impl Orchestrator {
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
                     git::delete_branch(&self.config.path, &branch_name);
-                    anyhow::bail!("Pre-flight tests fail — fix tests before running Reparo:\n{}", truncate(&output, 500));
+                    anyhow::bail!("Pre-flight tests fail — fix tests before running Reparo:\n{}", truncate_tail(&output, 2000));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
@@ -278,7 +278,19 @@ impl Orchestrator {
         {
             info!("Generating coverage report before initial scan...");
             match runner::run_shell_command(&self.config.path, &cov_cmd, "pre-scan coverage") {
-                Ok((true, _)) => info!("Coverage report generated"),
+                Ok((true, output)) => {
+                    if output.contains("Skipping JaCoCo execution due to missing execution data") {
+                        warn!(
+                            "JaCoCo skipped report generation — no execution data (jacoco.exec) was produced. \
+                             Check that jacoco-maven-plugin is configured in the POM with prepare-agent execution."
+                        );
+                    }
+                    if runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref()).is_some() {
+                        info!("Coverage report generated");
+                    } else {
+                        warn!("Coverage command succeeded but no report file was produced");
+                    }
+                }
                 Ok((false, output)) => warn!("Coverage command failed: {}", truncate(&output, 200)),
                 Err(e) => warn!("Coverage command error: {}", e),
             }
@@ -691,7 +703,7 @@ Apply the fix now."#,
         };
 
         // Get per-file coverage sorted ascending (least covered first)
-        let lcov_path = match runner::find_lcov_report(&self.config.path) {
+        let lcov_path = match runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref()) {
             Some(p) => p,
             None => {
                 warn!("No lcov report found — cannot identify uncovered files");
@@ -810,7 +822,7 @@ Apply the fix now."#,
         // Final summary
         let remaining_below: Vec<_> = if has_file_threshold {
             // Re-read lcov to check which files are still below threshold
-            runner::find_lcov_report(&self.config.path)
+            runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref())
                 .map(|p| runner::per_file_lcov_coverage(&p))
                 .unwrap_or_default()
                 .into_iter()
@@ -855,12 +867,12 @@ Apply the fix now."#,
         test_framework: &str,
         test_examples_str: &str,
     ) -> Result<bool> {
-        // Read the source file
-        let full_path = self.config.path.join(&fc.file);
+        // Read the source file — try direct path first, then common source roots
+        let full_path = resolve_source_file(&self.config.path, &fc.file);
         let source_content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Cannot read {}: {} — skipping", fc.file, e);
+                warn!("Cannot read {} (resolved to {}): {} — skipping", fc.file, full_path.display(), e);
                 return Ok(false);
             }
         };
@@ -991,8 +1003,8 @@ Apply the fix now."#,
 
     /// Run the coverage command and return the overall project coverage percentage.
     fn run_coverage_and_measure(&self, cov_cmd: &str) -> Option<f64> {
-        match runner::run_shell_command(&self.config.path, cov_cmd, "coverage measurement") {
-            Ok((true, _)) => {}
+        let output_text = match runner::run_shell_command(&self.config.path, cov_cmd, "coverage measurement") {
+            Ok((true, output)) => output,
             Ok((false, output)) => {
                 warn!("Coverage command failed: {}", truncate(&output, 200));
                 return None;
@@ -1001,9 +1013,18 @@ Apply the fix now."#,
                 warn!("Coverage command error: {}", e);
                 return None;
             }
+        };
+
+        // Warn about common JaCoCo issues in the output
+        if output_text.contains("Skipping JaCoCo execution due to missing execution data") {
+            warn!(
+                "JaCoCo skipped report generation — no execution data (jacoco.exec) was produced. \
+                 This usually means tests did not run with the JaCoCo agent. \
+                 Check that the Maven profile or surefire argLine is configured correctly in the coverage command."
+            );
         }
 
-        let lcov_path = runner::find_lcov_report(&self.config.path)?;
+        let lcov_path = runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref())?;
         let overall = runner::overall_lcov_coverage(&lcov_path);
         if let Some(pct) = overall {
             info!("Project-wide test coverage: {:.1}%", pct);
@@ -1069,7 +1090,7 @@ Apply the fix now."#,
             );
 
             // Read the source file
-            let abs_path = self.config.path.join(&dup_file.file_path);
+            let abs_path = resolve_source_file(&self.config.path, &dup_file.file_path);
             let file_content = match std::fs::read_to_string(&abs_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1902,7 +1923,13 @@ Apply the fixes now."#,
         {
             info!("Regenerating coverage report before SonarQube re-scan...");
             match runner::run_shell_command(&self.config.path, cov_cmd, "coverage") {
-                Ok((true, _)) => info!("Coverage report updated"),
+                Ok((true, _)) => {
+                    if runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref()).is_some() {
+                        info!("Coverage report updated");
+                    } else {
+                        warn!("Coverage command succeeded but no report file was produced");
+                    }
+                }
                 Ok((false, output)) => warn!("Coverage command failed (non-blocking): {}", truncate(&output, 100)),
                 Err(e) => warn!("Coverage command error (non-blocking): {}", e),
             }
@@ -2243,14 +2270,20 @@ Apply a different fix now."#,
             if let Some(ref cov_cmd) = coverage_cmd {
                 info!("Running coverage command: {}", cov_cmd);
                 match runner::run_shell_command(&self.config.path, cov_cmd, "coverage") {
-                    Ok((true, _)) => info!("Coverage report generated successfully"),
+                    Ok((true, _)) => {
+                        if runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref()).is_some() {
+                            info!("Coverage report generated successfully");
+                        } else {
+                            warn!("Coverage command succeeded but no report file was produced");
+                        }
+                    }
                     Ok((false, output)) => warn!("Coverage command failed: {}", truncate(&output, 200)),
                     Err(e) => warn!("Failed to run coverage command: {}", e),
                 }
             }
 
             // Check coverage locally from lcov report (fast, no SonarQube round-trip)
-            let lcov_path = runner::find_lcov_report(&self.config.path);
+            let lcov_path = runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref());
             match lcov_path {
                 Some(ref lcov) => {
                     match runner::check_local_coverage(lcov, file_path, start_line, end_line) {
@@ -2879,6 +2912,32 @@ fn is_protected_file(path: &str, protected_files: &[String]) -> bool {
     protected_files.iter().any(|p| p.to_lowercase() == filename)
 }
 
+/// Resolve a source file path from a coverage report (e.g. `com/example/Foo.java`)
+/// to its actual location on disk. Tries the direct path first, then common source
+/// roots like `src/main/java/`, `src/main/kotlin/`, etc.
+fn resolve_source_file(project_path: &Path, relative_file: &str) -> PathBuf {
+    let direct = project_path.join(relative_file);
+    if direct.exists() {
+        return direct;
+    }
+    let source_roots = [
+        "src/main/java",
+        "src/main/kotlin",
+        "src/main/scala",
+        "src/main/groovy",
+        "src",
+        "app/src/main/java",
+        "app/src/main/kotlin",
+    ];
+    for root in &source_roots {
+        let candidate = project_path.join(root).join(relative_file);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    direct
+}
+
 fn is_test_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.contains("test")
@@ -2894,6 +2953,18 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max).collect();
         format!("{}...", truncated)
+    }
+}
+
+/// Truncate keeping the **tail** of the string — useful for build/test output
+/// where errors appear at the end.
+fn truncate_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let tail: String = s.chars().skip(count - max).collect();
+        format!("...{}", tail)
     }
 }
 
@@ -3055,6 +3126,16 @@ mod tests {
     #[test]
     fn test_truncate_long() {
         assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_tail_short() {
+        assert_eq!(truncate_tail("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_tail_long() {
+        assert_eq!(truncate_tail("hello world", 5), "...world");
     }
 
     // -- detect_test_framework --

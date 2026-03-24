@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Detect the test command for a project based on build files present
 pub fn detect_test_command(project_path: &Path) -> Option<String> {
@@ -179,21 +179,60 @@ pub struct LocalCoverageResult {
     pub fully_covered: bool,
 }
 
-/// Locate the lcov report in the project. Checks common paths.
+/// Locate the coverage report in the project. Checks common paths for lcov, JaCoCo XML, and Cobertura XML.
 pub fn find_lcov_report(project_path: &Path) -> Option<std::path::PathBuf> {
+    find_lcov_report_with_hint(project_path, None)
+}
+
+/// Find the coverage report, optionally using an explicit path from config.
+/// If `coverage_report_hint` is set, it is tried first (absolute or relative to project).
+pub fn find_lcov_report_with_hint(project_path: &Path, coverage_report_hint: Option<&str>) -> Option<std::path::PathBuf> {
+    // 1. Try explicit path from config
+    if let Some(hint) = coverage_report_hint {
+        let hint_path = Path::new(hint);
+        let abs = if hint_path.is_absolute() {
+            hint_path.to_path_buf()
+        } else {
+            project_path.join(hint)
+        };
+        if abs.exists() {
+            info!("Found coverage report (from config): {}", abs.display());
+            return Some(abs);
+        }
+        warn!(
+            "commands.coverage_report '{}' not found (resolved: {})",
+            hint,
+            abs.display()
+        );
+    }
+
+    // 2. Auto-detect from well-known paths
     let candidates = [
+        // lcov format
         "coverage/lcov.info",
         "coverage/lcov-report/lcov.info",
         "lcov.info",
         "build/reports/lcov.info",
+        // JaCoCo XML (Maven + Gradle)
+        "target/site/jacoco/jacoco.xml",
+        "target/jacoco/jacoco.xml",
+        "build/reports/jacoco/test/jacocoTestReport.xml",
+        "build/reports/jacoco/jacocoTestReport.xml",
+        // Cobertura XML (Python, Go, etc.)
+        "coverage.xml",
+        "build/reports/cobertura/coverage.xml",
     ];
     for candidate in &candidates {
         let path = project_path.join(candidate);
         if path.exists() {
-            info!("Found lcov report: {}", path.display());
+            info!("Found coverage report: {}", path.display());
             return Some(path);
         }
     }
+    warn!(
+        "No coverage report found. Searched paths: {}",
+        candidates.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+    );
     None
 }
 
@@ -279,10 +318,10 @@ pub fn check_local_coverage(
     })
 }
 
-/// Per-file coverage info parsed from lcov.
+/// Per-file coverage info parsed from coverage reports (lcov, JaCoCo XML, Cobertura XML).
 #[derive(Debug, Clone)]
 pub struct FileCoverage {
-    /// Source file path as reported in the lcov SF: line.
+    /// Source file path as reported in the coverage report.
     pub file: String,
     /// Number of coverable lines (DA entries).
     pub total_lines: u64,
@@ -292,15 +331,32 @@ pub struct FileCoverage {
     pub coverage_pct: f64,
 }
 
-/// Parse an lcov file and return per-file coverage, sorted ascending by coverage %.
+/// Parse a coverage report and return per-file coverage, sorted ascending by coverage %.
+/// Supports lcov, JaCoCo XML, and Cobertura XML formats (auto-detected by extension/content).
 ///
 /// Returns an empty vec if the file cannot be read.
-pub fn per_file_lcov_coverage(lcov_path: &Path) -> Vec<FileCoverage> {
-    let content = match std::fs::read_to_string(lcov_path) {
+pub fn per_file_lcov_coverage(report_path: &Path) -> Vec<FileCoverage> {
+    let content = match std::fs::read_to_string(report_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
 
+    let ext = report_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "xml" {
+        if content.contains("<report ") || content.contains("<report>") {
+            return per_file_jacoco_xml_coverage(&content);
+        } else if content.contains("<coverage ") || content.contains("<coverage>") {
+            return per_file_cobertura_xml_coverage(&content);
+        }
+        tracing::warn!("Unknown XML coverage format in {}", report_path.display());
+        return Vec::new();
+    }
+
+    per_file_lcov_coverage_from_content(&content)
+}
+
+/// Parse lcov-format content and return per-file coverage.
+fn per_file_lcov_coverage_from_content(content: &str) -> Vec<FileCoverage> {
     let mut results: Vec<FileCoverage> = Vec::new();
     let mut current_file: Option<String> = None;
     let mut total: u64 = 0;
@@ -340,34 +396,142 @@ pub fn per_file_lcov_coverage(lcov_path: &Path) -> Vec<FileCoverage> {
     results
 }
 
-/// Parse an lcov file and compute the overall project-wide line coverage percentage.
+/// Parse JaCoCo XML and return per-file coverage.
 ///
-/// Returns `None` if the lcov file cannot be read or contains no coverage data.
-pub fn overall_lcov_coverage(lcov_path: &Path) -> Option<f64> {
-    let content = std::fs::read_to_string(lcov_path).ok()?;
+/// JaCoCo XML has `<package name="com/example"><sourcefile name="Foo.java"><line nr="N" mi="M" ci="C"/></sourcefile></package>`.
+/// We count each `<line>` as a coverable line: covered if `ci > 0`.
+fn per_file_jacoco_xml_coverage(content: &str) -> Vec<FileCoverage> {
+    let mut results: Vec<FileCoverage> = Vec::new();
+    let mut current_package = String::new();
+    let mut current_file: Option<String> = None;
+    let mut total: u64 = 0;
+    let mut covered: u64 = 0;
 
-    let mut total_lines: u64 = 0;
-    let mut covered_lines: u64 = 0;
-
-    for line in content.lines() {
-        if line.starts_with("DA:") {
-            let parts: Vec<&str> = line[3..].splitn(2, ',').collect();
-            if parts.len() == 2 {
-                if let Ok(hits) = parts[1].parse::<u64>() {
-                    total_lines += 1;
-                    if hits > 0 {
-                        covered_lines += 1;
-                    }
+    // Normalize minified XML: ensure each tag starts on its own line
+    let normalized = content.replace('<', "\n<");
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<package ") {
+            if let Some(name) = extract_xml_attr(trimmed, "name") {
+                current_package = name.replace('/', "/");
+            }
+        } else if trimmed.starts_with("<sourcefile ") {
+            if let Some(name) = extract_xml_attr(trimmed, "name") {
+                current_file = Some(format!("{}/{}", current_package, name));
+                total = 0;
+                covered = 0;
+            }
+        } else if trimmed.starts_with("<line ") && current_file.is_some() {
+            // JaCoCo <line nr="N" mi="M" ci="C" mb="M" cb="C"/>
+            let ci = extract_xml_attr(trimmed, "ci")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mi = extract_xml_attr(trimmed, "mi")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            // Only count lines that have instructions (ci + mi > 0)
+            if ci + mi > 0 {
+                total += 1;
+                if ci > 0 {
+                    covered += 1;
                 }
             }
+        } else if trimmed.starts_with("</sourcefile>") {
+            if let Some(ref file) = current_file {
+                if total > 0 {
+                    let pct = (covered as f64 / total as f64) * 100.0;
+                    results.push(FileCoverage {
+                        file: file.clone(),
+                        total_lines: total,
+                        covered_lines: covered,
+                        coverage_pct: pct,
+                    });
+                }
+            }
+            current_file = None;
         }
     }
 
-    if total_lines == 0 {
+    results.sort_by(|a, b| a.coverage_pct.partial_cmp(&b.coverage_pct).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
+/// Parse Cobertura XML and return per-file coverage.
+///
+/// Cobertura XML: `<class filename="src/foo.py"><lines><line number="N" hits="H"/></lines></class>`.
+fn per_file_cobertura_xml_coverage(content: &str) -> Vec<FileCoverage> {
+    let mut results: Vec<FileCoverage> = Vec::new();
+    let mut current_file: Option<String> = None;
+    let mut total: u64 = 0;
+    let mut covered: u64 = 0;
+
+    // Normalize minified XML: ensure each tag starts on its own line
+    let normalized = content.replace('<', "\n<");
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<class ") {
+            if let Some(filename) = extract_xml_attr(trimmed, "filename") {
+                current_file = Some(filename);
+                total = 0;
+                covered = 0;
+            }
+        } else if trimmed.starts_with("<line ") && current_file.is_some() {
+            if let Some(hits_str) = extract_xml_attr(trimmed, "hits") {
+                if let Ok(hits) = hits_str.parse::<u64>() {
+                    total += 1;
+                    if hits > 0 {
+                        covered += 1;
+                    }
+                }
+            }
+        } else if trimmed.starts_with("</class>") {
+            if let Some(ref file) = current_file {
+                if total > 0 {
+                    let pct = (covered as f64 / total as f64) * 100.0;
+                    results.push(FileCoverage {
+                        file: file.clone(),
+                        total_lines: total,
+                        covered_lines: covered,
+                        coverage_pct: pct,
+                    });
+                }
+            }
+            current_file = None;
+        }
+    }
+
+    results.sort_by(|a, b| a.coverage_pct.partial_cmp(&b.coverage_pct).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
+/// Extract the value of an XML attribute from a tag string.
+/// E.g., `extract_xml_attr(r#"<line nr="10" ci="5"/>"#, "ci")` → `Some("5")`
+fn extract_xml_attr(tag: &str, attr: &str) -> Option<String> {
+    let search = format!("{}=\"", attr);
+    let start = tag.find(&search)? + search.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse a coverage report and compute the overall project-wide line coverage percentage.
+/// Supports lcov, JaCoCo XML, and Cobertura XML formats.
+///
+/// Returns `None` if the file cannot be read or contains no coverage data.
+pub fn overall_lcov_coverage(report_path: &Path) -> Option<f64> {
+    let file_coverages = per_file_lcov_coverage(report_path);
+    if file_coverages.is_empty() {
         return None;
     }
 
-    Some((covered_lines as f64 / total_lines as f64) * 100.0)
+    let total: u64 = file_coverages.iter().map(|fc| fc.total_lines).sum();
+    let covered: u64 = file_coverages.iter().map(|fc| fc.covered_lines).sum();
+
+    if total == 0 {
+        return None;
+    }
+
+    Some((covered as f64 / total as f64) * 100.0)
 }
 
 #[cfg(test)]
@@ -503,6 +667,41 @@ mod tests {
     }
 
     #[test]
+    fn test_find_lcov_report_with_hint_explicit_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = tmp.path().join("my-reports").join("jacoco.xml");
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::write(&report, "<report></report>").unwrap();
+        // Hint with relative path finds it
+        let result = find_lcov_report_with_hint(tmp.path(), Some("my-reports/jacoco.xml"));
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("my-reports/jacoco.xml"));
+    }
+
+    #[test]
+    fn test_find_lcov_report_with_hint_falls_back_to_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Hint points to nonexistent file, but standard path exists
+        let cov_dir = tmp.path().join("coverage");
+        fs::create_dir_all(&cov_dir).unwrap();
+        fs::write(cov_dir.join("lcov.info"), "SF:test.ts\nend_of_record\n").unwrap();
+        let result = find_lcov_report_with_hint(tmp.path(), Some("nope/jacoco.xml"));
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("coverage/lcov.info"));
+    }
+
+    #[test]
+    fn test_find_lcov_report_with_hint_none_uses_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cov_dir = tmp.path().join("coverage");
+        fs::create_dir_all(&cov_dir).unwrap();
+        fs::write(cov_dir.join("lcov.info"), "SF:test.ts\nend_of_record\n").unwrap();
+        let result = find_lcov_report_with_hint(tmp.path(), None);
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("coverage/lcov.info"));
+    }
+
+    #[test]
     fn test_check_local_coverage_full() {
         let tmp = tempfile::tempdir().unwrap();
         let lcov = tmp.path().join("lcov.info");
@@ -577,5 +776,119 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lcov = tmp.path().join("nonexistent.info");
         assert!(overall_lcov_coverage(&lcov).is_none());
+    }
+
+    #[test]
+    fn test_extract_xml_attr() {
+        assert_eq!(extract_xml_attr(r#"<line nr="10" ci="5"/>"#, "ci"), Some("5".to_string()));
+        assert_eq!(extract_xml_attr(r#"<line nr="10" ci="5"/>"#, "nr"), Some("10".to_string()));
+        assert_eq!(extract_xml_attr(r#"<package name="com/example">"#, "name"), Some("com/example".to_string()));
+        assert_eq!(extract_xml_attr(r#"<line nr="10"/>"#, "ci"), None);
+    }
+
+    #[test]
+    fn test_jacoco_xml_formatted() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<report name="test">
+<package name="com/example">
+<sourcefile name="Foo.java">
+<line nr="10" mi="3" ci="0" mb="0" cb="0"/>
+<line nr="11" mi="0" ci="5" mb="0" cb="0"/>
+<line nr="12" mi="2" ci="3" mb="0" cb="0"/>
+</sourcefile>
+<sourcefile name="Bar.java">
+<line nr="5" mi="0" ci="4" mb="0" cb="0"/>
+<line nr="6" mi="0" ci="2" mb="0" cb="0"/>
+</sourcefile>
+</package>
+</report>"#;
+        let results = per_file_jacoco_xml_coverage(xml);
+        assert_eq!(results.len(), 2);
+        // Foo.java: 3 lines, 2 covered (lines 11 and 12 have ci > 0)
+        let foo = results.iter().find(|r| r.file.contains("Foo.java")).unwrap();
+        assert_eq!(foo.total_lines, 3);
+        assert_eq!(foo.covered_lines, 2);
+        // Bar.java: 2 lines, 2 covered
+        let bar = results.iter().find(|r| r.file.contains("Bar.java")).unwrap();
+        assert_eq!(bar.total_lines, 2);
+        assert_eq!(bar.covered_lines, 2);
+    }
+
+    #[test]
+    fn test_jacoco_xml_minified() {
+        // Simulate minified JaCoCo XML (all on one line)
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><report name="test"><package name="com/example"><sourcefile name="Foo.java"><line nr="10" mi="3" ci="0" mb="0" cb="0"/><line nr="11" mi="0" ci="5" mb="0" cb="0"/><line nr="12" mi="2" ci="3" mb="0" cb="0"/></sourcefile></package></report>"#;
+        let results = per_file_jacoco_xml_coverage(xml);
+        assert_eq!(results.len(), 1);
+        let foo = &results[0];
+        assert_eq!(foo.file, "com/example/Foo.java");
+        assert_eq!(foo.total_lines, 3);
+        assert_eq!(foo.covered_lines, 2);
+    }
+
+    #[test]
+    fn test_jacoco_xml_zero_instructions_ignored() {
+        let xml = r#"<report name="test"><package name="pkg"><sourcefile name="Empty.java"><line nr="1" mi="0" ci="0" mb="0" cb="0"/></sourcefile></package></report>"#;
+        let results = per_file_jacoco_xml_coverage(xml);
+        // Line with mi=0 and ci=0 has no instructions — should not count
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_cobertura_xml_formatted() {
+        let xml = r#"<?xml version="1.0" ?>
+<coverage version="5.5">
+<packages>
+<package name="src">
+<classes>
+<class filename="src/foo.py" line-rate="0.5">
+<lines>
+<line number="1" hits="1"/>
+<line number="2" hits="0"/>
+<line number="3" hits="1"/>
+<line number="4" hits="0"/>
+</lines>
+</class>
+</classes>
+</package>
+</packages>
+</coverage>"#;
+        let results = per_file_cobertura_xml_coverage(xml);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file, "src/foo.py");
+        assert_eq!(results[0].total_lines, 4);
+        assert_eq!(results[0].covered_lines, 2);
+    }
+
+    #[test]
+    fn test_cobertura_xml_minified() {
+        let xml = r#"<coverage><packages><package name="src"><classes><class filename="src/bar.py"><lines><line number="1" hits="3"/><line number="2" hits="0"/></lines></class></classes></package></packages></coverage>"#;
+        let results = per_file_cobertura_xml_coverage(xml);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file, "src/bar.py");
+        assert_eq!(results[0].total_lines, 2);
+        assert_eq!(results[0].covered_lines, 1);
+    }
+
+    #[test]
+    fn test_per_file_lcov_coverage_jacoco_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xml_path = tmp.path().join("jacoco.xml");
+        let xml = r#"<report name="test"><package name="com/example"><sourcefile name="App.java"><line nr="1" mi="0" ci="5" mb="0" cb="0"/><line nr="2" mi="3" ci="0" mb="0" cb="0"/></sourcefile></package></report>"#;
+        fs::write(&xml_path, xml).unwrap();
+        let results = per_file_lcov_coverage(&xml_path);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].total_lines, 2);
+        assert_eq!(results[0].covered_lines, 1);
+    }
+
+    #[test]
+    fn test_overall_lcov_coverage_jacoco_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xml_path = tmp.path().join("jacoco.xml");
+        let xml = r#"<report name="test"><package name="com/example"><sourcefile name="App.java"><line nr="1" mi="0" ci="5" mb="0" cb="0"/><line nr="2" mi="3" ci="0" mb="0" cb="0"/></sourcefile></package></report>"#;
+        fs::write(&xml_path, xml).unwrap();
+        let cov = overall_lcov_coverage(&xml_path).unwrap();
+        assert!((cov - 50.0).abs() < 0.01);
     }
 }
