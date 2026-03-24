@@ -127,6 +127,10 @@ pub struct Config {
     #[arg(long, env = "REPARO_MAX_DEDUP", default_value = "10")]
     pub max_dedup: usize,
 
+    /// Skip the documentation quality step
+    #[arg(long, default_value = "false")]
+    pub skip_docs: bool,
+
     /// Protected files (populated from YAML, not a CLI flag)
     #[arg(skip)]
     pub protected_files: Vec<String>,
@@ -138,6 +142,10 @@ pub struct Config {
     /// Extra commit format variables (populated from YAML)
     #[arg(skip)]
     pub commit_vars: std::collections::HashMap<String, String>,
+
+    /// Documentation configuration (populated from YAML)
+    #[arg(skip)]
+    pub documentation: DocumentationConfig,
 }
 
 /// Validated, ready-to-use configuration.
@@ -198,6 +206,25 @@ pub struct ValidatedConfig {
     pub commit_format: String,
     /// Extra variables for commit format placeholders.
     pub commit_vars: std::collections::HashMap<String, String>,
+    /// Skip the documentation quality step
+    pub skip_docs: bool,
+    /// Documentation quality configuration
+    pub documentation: DocumentationConfig,
+}
+
+/// Resolved documentation configuration for runtime use.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentationConfig {
+    pub enabled: bool,
+    pub style: String,
+    pub standards: Vec<String>,
+    pub scope: Vec<String>,
+    pub rules: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub max_files: usize,
+    pub required_elements: Vec<String>,
+    pub docs_command: Option<String>,
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -333,6 +360,8 @@ impl Config {
             protected_files: self.protected_files,
             commit_format: if self.commit_format.is_empty() { "{type}({scope}): {message}".to_string() } else { self.commit_format },
             commit_vars: self.commit_vars,
+            skip_docs: self.skip_docs,
+            documentation: DocumentationConfig::default(),
         };
 
         validated.print_summary();
@@ -599,6 +628,8 @@ mod tests {
             protected_files: vec![],
             commit_format: "{type}({scope}): {message}".to_string(),
             commit_vars: std::collections::HashMap::new(),
+            skip_docs: false,
+            documentation: DocumentationConfig::default(),
         }
     }
 

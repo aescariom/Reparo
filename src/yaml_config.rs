@@ -18,6 +18,9 @@ pub struct YamlConfig {
     pub execution: ExecutionYaml,
     pub commands: CommandsYaml,
     pub prompts: PromptsYaml,
+    /// Documentation quality configuration (ISO 25000 / MDR compliance)
+    #[serde(default)]
+    pub documentation: DocumentationYaml,
     /// Files that Claude must never modify during fixes (reverted automatically).
     /// List of exact filenames (matched against the basename, case-insensitive).
     #[serde(default)]
@@ -89,6 +92,39 @@ pub struct CommandsYaml {
     pub lint: Option<String>,
     /// Path to the coverage report file (bypasses auto-detection)
     pub coverage_report: Option<String>,
+    /// Documentation generation/validation command (e.g., "npx typedoc", "javadoc", "pydoc")
+    pub docs: Option<String>,
+}
+
+/// Documentation quality standards configuration.
+/// Controls the final documentation compliance step (ISO 25000 / MDR).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DocumentationYaml {
+    /// Enable documentation quality step (default: false — opt-in)
+    pub enabled: Option<bool>,
+    /// Documentation style per language.
+    /// Values: "jsdoc", "tsdoc", "javadoc", "pydoc", "rustdoc", "godoc", "xmldoc", "doxygen"
+    pub style: Option<String>,
+    /// Standards to enforce. Values: "iso25000", "mdr", "custom"
+    #[serde(default)]
+    pub standards: Vec<String>,
+    /// What to document. Defaults: ["public_api", "classes", "methods", "parameters", "returns"]
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// Custom documentation rules/instructions (appended to the Claude prompt)
+    pub rules: Option<String>,
+    /// File patterns to include (e.g., ["src/**/*.ts", "src/**/*.java"])
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// File patterns to exclude (e.g., ["**/*.spec.ts", "**/*.test.ts"])
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Maximum files to process per run (0 = all)
+    pub max_files: Option<usize>,
+    /// Required documentation elements per method/function for compliance
+    #[serde(default)]
+    pub required_elements: Vec<String>,
 }
 
 /// Prompt customization per rule or category (US-019).
@@ -389,6 +425,46 @@ pub fn merge_yaml_into_config(
     if !yaml.git.commit_vars.is_empty() {
         config.commit_vars = yaml.git.commit_vars.clone();
     }
+    // documentation: resolve from YAML
+    let doc = &yaml.documentation;
+    config.documentation = crate::config::DocumentationConfig {
+        enabled: doc.enabled.unwrap_or(false),
+        style: doc.style.clone().unwrap_or_default(),
+        standards: doc.standards.clone(),
+        scope: if doc.scope.is_empty() {
+            vec![
+                "public_api".to_string(),
+                "classes".to_string(),
+                "methods".to_string(),
+                "parameters".to_string(),
+                "returns".to_string(),
+            ]
+        } else {
+            doc.scope.clone()
+        },
+        rules: doc.rules.clone(),
+        include: doc.include.clone(),
+        exclude: if doc.exclude.is_empty() {
+            vec![
+                "**/*.spec.*".to_string(),
+                "**/*.test.*".to_string(),
+                "**/node_modules/**".to_string(),
+            ]
+        } else {
+            doc.exclude.clone()
+        },
+        max_files: doc.max_files.unwrap_or(0),
+        required_elements: if doc.required_elements.is_empty() {
+            vec![
+                "description".to_string(),
+                "params".to_string(),
+                "returns".to_string(),
+            ]
+        } else {
+            doc.required_elements.clone()
+        },
+        docs_command: yaml.commands.docs.clone(),
+    };
 }
 
 /// Extract ProjectCommands from YAML, with CLI overrides.

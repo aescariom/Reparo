@@ -492,6 +492,89 @@ Fix the {error_type} error now."#
     )
 }
 
+/// Build a prompt for documentation quality improvement.
+///
+/// Generates instructions for Claude to add/improve code documentation
+/// to meet ISO 25000 and/or MDR standards.
+pub fn build_documentation_prompt(
+    file_path: &str,
+    file_content: &str,
+    style: &str,
+    standards: &[String],
+    scope: &[String],
+    required_elements: &[String],
+    custom_rules: Option<&str>,
+) -> String {
+    let standards_desc = if standards.is_empty() {
+        "general best practices".to_string()
+    } else {
+        standards.iter().map(|s| match s.as_str() {
+            "iso25000" => "ISO/IEC 25000 (SQuaRE) — software quality: maintainability, analyzability, modifiability",
+            "mdr" => "EU MDR 2017/745 — Medical Device Regulation: traceability, risk documentation, safety annotations",
+            other => other,
+        }).collect::<Vec<_>>().join(", ")
+    };
+
+    let scope_desc = scope.join(", ");
+
+    let style_desc = match style {
+        "jsdoc" => "JSDoc (/** @param {type} name - description */)",
+        "tsdoc" => "TSDoc (/** @param name - description */)",
+        "javadoc" => "Javadoc (/** @param name description */)",
+        "pydoc" => "Python docstrings (Google/NumPy style)",
+        "rustdoc" => "Rustdoc (/// and //! comments with # Examples)",
+        "godoc" => "Godoc (// FunctionName does X)",
+        "xmldoc" => "XML documentation comments (/// <summary>)",
+        "doxygen" => "Doxygen (/** @brief, @param, @return */)",
+        other if !other.is_empty() => other,
+        _ => "language-appropriate documentation comments",
+    };
+
+    let elements_desc = required_elements.join(", ");
+
+    let custom_section = if let Some(rules) = custom_rules {
+        format!("\n\n## Custom project rules:\n{}", rules)
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"Improve the documentation of the following source file to meet quality standards.
+
+## File: `{file_path}`
+
+## Documentation style: {style_desc}
+
+## Standards to comply with: {standards_desc}
+
+## Scope: {scope_desc}
+
+## Required elements per function/method/class: {elements_desc}
+
+## Current file content (`{file_path}`):
+```
+{file_content}
+```
+{custom_section}
+
+## Instructions:
+1. Add or improve documentation for ALL public classes, interfaces, types, functions, and methods
+2. Use the **{style_desc}** documentation style consistently
+3. Every function/method MUST have: {elements_desc}
+4. For classes/interfaces: add a description explaining purpose, responsibilities, and usage
+5. For complex logic: add inline comments explaining WHY, not WHAT
+6. Do NOT modify any logic, functionality, or test files
+7. Do NOT remove existing documentation — only improve or extend it
+8. If a parameter can be null/undefined, document that explicitly
+9. Document thrown exceptions/errors
+10. For MDR compliance: add @safety, @risk, or @regulatory annotations where applicable to safety-critical code
+11. For ISO 25000: ensure documentation supports analyzability (someone new can understand the code from docs alone)
+12. Keep documentation concise but complete — avoid redundant descriptions that just restate the name
+
+Apply the documentation improvements now."#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

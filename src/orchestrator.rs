@@ -5,6 +5,26 @@ use tracing::{error, info, warn};
 
 use crate::claude;
 use crate::config::ValidatedConfig;
+
+// ANSI color helpers for terminal output
+/// Check if stderr is a terminal (supports ANSI colors)
+fn supports_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+/// Blue text (for previous/reference coverage values)
+fn blue(s: &str) -> String {
+    if supports_color() { format!("\x1b[34m{}\x1b[0m", s) } else { s.to_string() }
+}
+/// Bold blue text (for new/current coverage values)
+fn bold_blue(s: &str) -> String {
+    if supports_color() { format!("\x1b[1;34m{}\x1b[0m", s) } else { s.to_string() }
+}
+/// Format a coverage percentage in bold blue
+fn cov_new(pct: f64) -> String { bold_blue(&format!("{:.1}%", pct)) }
+/// Format a coverage percentage in blue (previous/reference value)
+fn cov_prev(pct: f64) -> String { blue(&format!("{:.1}%", pct)) }
 use crate::git;
 use crate::report::{self, FixStatus, IssueResult};
 use crate::runner;
@@ -625,6 +645,15 @@ Apply the fix now."#,
             }
         }
 
+        // Step 5c: Documentation quality — ensure code documentation meets standards
+        if self.config.skip_docs {
+            info!("=== Step 5c: Documentation SKIPPED (--skip-docs) ===");
+        } else if self.config.documentation.enabled {
+            self.improve_documentation(&test_command).await?;
+        } else {
+            info!("=== Step 5c: Documentation SKIPPED (not enabled in YAML) ===");
+        }
+
         // Step 6: Generate report (on the fix branch)
         info!("=== Step 6: Generating report ===");
         let elapsed = start.elapsed().as_secs();
@@ -729,14 +758,14 @@ Apply the fix now."#,
 
         if !overall_needs_boost && files_below_file_threshold.is_empty() {
             info!(
-                "Project-wide coverage {:.1}% meets {:.0}% and all files meet per-file threshold — no boost needed",
-                overall_pct, self.config.min_coverage
+                "Project-wide coverage {} meets {:.0}% and all files meet per-file threshold — no boost needed",
+                cov_new(overall_pct), self.config.min_coverage
             );
             return Ok(());
         }
 
         if overall_needs_boost {
-            info!("Project-wide coverage {:.1}% is below {:.0}%", overall_pct, self.config.min_coverage);
+            info!("Project-wide coverage {} is below {:.0}%", cov_prev(overall_pct), self.config.min_coverage);
         }
         if !files_below_file_threshold.is_empty() {
             info!("{} file(s) below per-file threshold of {:.0}%", files_below_file_threshold.len(), self.config.min_file_coverage);
@@ -809,7 +838,7 @@ Apply the fix now."#,
                 // Re-measure coverage
                 match self.run_coverage_and_measure(&cov_cmd) {
                     Some(pct) => {
-                        info!("Project-wide coverage after boost: {:.1}% (was {:.1}%)", pct, current_pct);
+                        info!("Project-wide coverage after boost: {} (was {})", cov_new(pct), cov_prev(current_pct));
                         current_pct = pct;
                     }
                     None => {
@@ -834,14 +863,14 @@ Apply the fix now."#,
 
         if current_pct >= self.config.min_coverage && remaining_below.is_empty() {
             info!(
-                "Coverage boost complete: {:.1}% (target {:.0}%) — {} files boosted",
-                current_pct, self.config.min_coverage, files_boosted
+                "Coverage boost complete: {} (target {:.0}%) — {} files boosted",
+                cov_new(current_pct), self.config.min_coverage, files_boosted
             );
         } else {
             if current_pct < self.config.min_coverage {
                 warn!(
-                    "Coverage boost: overall {:.1}% still below target {:.0}%",
-                    current_pct, self.config.min_coverage
+                    "Coverage boost: overall {} still below target {:.0}%",
+                    cov_new(current_pct), self.config.min_coverage
                 );
             }
             if !remaining_below.is_empty() {
@@ -1027,7 +1056,7 @@ Apply the fix now."#,
         let lcov_path = runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref())?;
         let overall = runner::overall_lcov_coverage(&lcov_path);
         if let Some(pct) = overall {
-            info!("Project-wide test coverage: {:.1}%", pct);
+            info!("Project-wide test coverage: {}", cov_new(pct));
         }
         overall
     }
@@ -1137,8 +1166,8 @@ Apply the fix now."#,
 
             if !coverage.fully_covered && !coverage.uncovered_lines.is_empty() {
                 info!(
-                    "Coverage {:.1}% — generating tests for {} uncovered lines before dedup...",
-                    coverage.coverage_pct,
+                    "Coverage {} — generating tests for {} uncovered lines before dedup...",
+                    cov_prev(coverage.coverage_pct),
                     coverage.uncovered_lines.len()
                 );
 
@@ -1317,7 +1346,7 @@ Apply the fix now."#,
             }
 
             let new_dup_pct = self.client.get_duplication_percentage().await.unwrap_or(initial_dup_pct);
-            info!("Duplication after refactoring {}: {:.1}% (was {:.1}%)", dup_file.file_path, new_dup_pct, initial_dup_pct);
+            info!("Duplication after refactoring {}: {} (was {})", dup_file.file_path, cov_new(new_dup_pct), cov_prev(initial_dup_pct));
 
             // Commit the dedup changes
             let _ = git::add_all(&self.config.path);
@@ -1345,6 +1374,204 @@ Apply the fix now."#,
         info!(
             "Deduplication complete: {} files refactored, {} skipped/failed",
             dedup_fixed, dedup_failed
+        );
+
+        Ok(())
+    }
+
+    /// Step 5c: Improve code documentation to meet ISO 25000 / MDR standards.
+    ///
+    /// Scans source files, identifies those missing or with inadequate documentation,
+    /// and asks Claude to add/improve docs. Verifies build still passes after each file.
+    async fn improve_documentation(&self, test_command: &str) -> Result<()> {
+        info!("=== Step 5c: Documentation quality (standards: {:?}) ===", self.config.documentation.standards);
+
+        let doc_config = &self.config.documentation;
+
+        // Find source files to document
+        let mut files_to_doc: Vec<String> = Vec::new();
+        let include_patterns = if doc_config.include.is_empty() {
+            // Auto-detect based on project
+            vec!["src/**/*.ts", "src/**/*.js", "src/**/*.java", "src/**/*.py", "src/**/*.rs", "src/**/*.go", "src/**/*.cs"]
+                .into_iter().map(String::from).collect()
+        } else {
+            doc_config.include.clone()
+        };
+
+        for pattern in &include_patterns {
+            let full_pattern = format!("{}/{}", self.config.path.display(), pattern);
+            for entry in glob::glob(&full_pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
+                if let Ok(path) = entry {
+                    let rel_path = path.strip_prefix(&self.config.path)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    // Skip excluded patterns
+                    let excluded = doc_config.exclude.iter().any(|ex| {
+                        let ex_glob = glob::Pattern::new(ex);
+                        ex_glob.map(|p| p.matches(&rel_path)).unwrap_or(false)
+                    });
+                    if excluded { continue; }
+
+                    // Skip test files
+                    if is_test_file(&rel_path) { continue; }
+
+                    // Skip non-coverable files (CSS, HTML, etc.)
+                    if is_non_coverable_file(&rel_path) { continue; }
+
+                    files_to_doc.push(rel_path);
+                }
+            }
+        }
+
+        if files_to_doc.is_empty() {
+            info!("No source files found matching documentation patterns");
+            return Ok(());
+        }
+
+        let max_files = if doc_config.max_files > 0 {
+            doc_config.max_files.min(files_to_doc.len())
+        } else {
+            files_to_doc.len()
+        };
+
+        info!("Found {} source files to check documentation ({} max)", files_to_doc.len(), max_files);
+
+        let mut docs_improved = 0usize;
+        let mut docs_skipped = 0usize;
+
+        for (idx, file_path) in files_to_doc.iter().take(max_files).enumerate() {
+            info!("--- [doc {}/{}] {} ---", idx + 1, max_files, file_path);
+
+            let abs_path = self.config.path.join(file_path);
+            let file_content = match std::fs::read_to_string(&abs_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Cannot read {}: {} — skipping", file_path, e);
+                    docs_skipped += 1;
+                    continue;
+                }
+            };
+
+            let prompt = claude::build_documentation_prompt(
+                file_path,
+                &file_content,
+                &doc_config.style,
+                &doc_config.standards,
+                &doc_config.scope,
+                &doc_config.required_elements,
+                doc_config.rules.as_deref(),
+            );
+
+            let tier = claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7);
+
+            if self.config.show_prompts {
+                info!("Documentation prompt:\n{}", prompt);
+            }
+
+            match claude::run_claude_with_tier(
+                &self.config.path,
+                &prompt,
+                tier.effective_timeout(self.config.claude_timeout),
+                self.config.dangerously_skip_permissions,
+                false,
+                Some(&tier),
+            ) {
+                Ok(_) => {
+                    info!("Claude completed documentation for {}", file_path);
+                }
+                Err(e) => {
+                    warn!("Claude failed for docs of {}: {} — skipping", file_path, e);
+                    let _ = git::revert_changes(&self.config.path);
+                    docs_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Verify no test files were modified
+            let changed = git::changed_files(&self.config.path).unwrap_or_default();
+            let test_files_changed: Vec<_> = changed.iter().filter(|f| is_test_file(f)).collect();
+            if !test_files_changed.is_empty() {
+                warn!("Documentation modified test files {:?} — reverting", test_files_changed);
+                let _ = git::revert_changes(&self.config.path);
+                docs_skipped += 1;
+                continue;
+            }
+
+            // Check only source files were changed (no functionality changes)
+            if changed.is_empty() {
+                info!("No documentation changes needed for {}", file_path);
+                continue;
+            }
+
+            // Format if configured
+            if let Some(ref fmt_cmd) = self.config.commands.format {
+                let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
+            }
+
+            // Build must pass
+            if let Some(ref build_cmd) = self.config.commands.build {
+                match runner::run_shell_command(&self.config.path, build_cmd, "build") {
+                    Ok((true, _)) => {}
+                    _ => {
+                        warn!("Build failed after docs for {} — reverting", file_path);
+                        let _ = git::revert_changes(&self.config.path);
+                        docs_skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Tests must pass
+            if !test_command.is_empty() {
+                match runner::run_tests(&self.config.path, test_command, self.config.test_timeout) {
+                    Ok((true, _)) => {}
+                    _ => {
+                        warn!("Tests failed after docs for {} — reverting", file_path);
+                        let _ = git::revert_changes(&self.config.path);
+                        docs_skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Run docs validation command if configured
+            if let Some(ref docs_cmd) = doc_config.docs_command {
+                match runner::run_shell_command(&self.config.path, docs_cmd, "docs validation") {
+                    Ok((true, _)) => info!("Documentation validation passed"),
+                    Ok((false, output)) => {
+                        warn!("Documentation validation failed: {}", truncate(&output, 200));
+                        // Non-blocking — commit anyway
+                    }
+                    Err(e) => warn!("Documentation validation error: {}", e),
+                }
+            }
+
+            // Commit documentation changes
+            let _ = git::add_all(&self.config.path);
+            if git::has_staged_changes(&self.config.path).unwrap_or(false) {
+                let msg = format_commit_message(
+                    &self.config, "docs", "quality",
+                    &format!("improve documentation for {}", file_path),
+                    "", "", file_path,
+                );
+                match git::commit(&self.config.path, &msg) {
+                    Ok(()) => {
+                        info!("Committed documentation improvements for {}", file_path);
+                        docs_improved += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to commit docs: {}", e);
+                        docs_skipped += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Documentation quality complete: {} files improved, {} skipped",
+            docs_improved, docs_skipped
         );
 
         Ok(())
@@ -1404,8 +1631,8 @@ Apply the fix now."#,
                 }
                 CoverageCheck::NeedsCoverage { uncovered_lines, coverage_pct } => {
                     info!(
-                        "Coverage {:.1}% — generating tests for {} uncovered lines...",
-                        coverage_pct,
+                        "Coverage {} — generating tests for {} uncovered lines...",
+                        cov_prev(coverage_pct),
                         uncovered_lines.len()
                     );
 
@@ -2289,8 +2516,8 @@ Apply a different fix now."#,
                     match runner::check_local_coverage(lcov, file_path, start_line, end_line) {
                         Some(cov) if cov.fully_covered => {
                             info!(
-                                "100% local coverage achieved after {} attempt(s) for {}",
-                                attempt, issue.key
+                                "{} local coverage achieved after {} attempt(s) for {}",
+                                cov_new(100.0), attempt, issue.key
                             );
                             return TestGenResult::Success {
                                 test_files: all_test_files,
@@ -2298,8 +2525,8 @@ Apply a different fix now."#,
                         }
                         Some(cov) => {
                             info!(
-                                "Local coverage {:.1}% ({} lines still uncovered) after attempt {}",
-                                cov.coverage_pct,
+                                "Local coverage {} ({} lines still uncovered) after attempt {}",
+                                cov_prev(cov.coverage_pct),
                                 cov.uncovered.len(),
                                 attempt
                             );
