@@ -130,6 +130,14 @@ pub struct Config {
     /// Protected files (populated from YAML, not a CLI flag)
     #[arg(skip)]
     pub protected_files: Vec<String>,
+
+    /// Commit message format (populated from YAML)
+    #[arg(skip)]
+    pub commit_format: String,
+
+    /// Extra commit format variables (populated from YAML)
+    #[arg(skip)]
+    pub commit_vars: std::collections::HashMap<String, String>,
 }
 
 /// Validated, ready-to-use configuration.
@@ -185,6 +193,11 @@ pub struct ValidatedConfig {
     /// Files that Claude must never modify (reverted automatically after each fix).
     /// Matched case-insensitively against the basename of changed files.
     pub protected_files: Vec<String>,
+    /// Commit message format template. Placeholders: {type}, {scope}, {message}, {issue_key}, {rule}, {file}
+    /// Plus any custom vars from git.commit_vars.
+    pub commit_format: String,
+    /// Extra variables for commit format placeholders.
+    pub commit_vars: std::collections::HashMap<String, String>,
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -318,6 +331,8 @@ impl Config {
             skip_dedup: self.skip_dedup,
             max_dedup: self.max_dedup,
             protected_files: self.protected_files,
+            commit_format: if self.commit_format.is_empty() { "{type}({scope}): {message}".to_string() } else { self.commit_format },
+            commit_vars: self.commit_vars,
         };
 
         validated.print_summary();
@@ -582,6 +597,8 @@ mod tests {
             skip_dedup: false,
             max_dedup: 10,
             protected_files: vec![],
+            commit_format: "{type}({scope}): {message}".to_string(),
+            commit_vars: std::collections::HashMap::new(),
         }
     }
 

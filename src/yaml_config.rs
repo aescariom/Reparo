@@ -39,6 +39,13 @@ pub struct SonarYaml {
 pub struct GitYaml {
     pub branch: Option<String>,
     pub batch_size: Option<usize>,
+    /// Commit message template. Placeholders: {type}, {scope}, {message}, {issue_key}, {rule}, {file}
+    /// Example: "{type}({scope})[PROJ-123]: {message}"
+    /// Default: "{type}({scope}): {message}"
+    pub commit_format: Option<String>,
+    /// Extra variables for commit format placeholders (e.g., gitlab_issue: "PROJ-123")
+    #[serde(default)]
+    pub commit_vars: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -369,6 +376,14 @@ pub fn merge_yaml_into_config(
     // protected_files: always take from YAML (no CLI equivalent)
     if !yaml.protected_files.is_empty() {
         config.protected_files = yaml.protected_files.clone();
+    }
+    // commit_format: always take from YAML (no CLI equivalent)
+    if let Some(ref fmt) = yaml.git.commit_format {
+        config.commit_format = fmt.clone();
+    }
+    // commit_vars: always take from YAML
+    if !yaml.git.commit_vars.is_empty() {
+        config.commit_vars = yaml.git.commit_vars.clone();
     }
 }
 

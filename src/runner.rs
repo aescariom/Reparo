@@ -31,8 +31,16 @@ pub fn detect_test_command(project_path: &Path) -> Option<String> {
 
 /// Detect the coverage command for a project
 pub fn detect_coverage_command(project_path: &Path) -> Option<String> {
-    // Angular projects use `ng test --code-coverage` via npm
+    // Check for Angular projects — determine if using Jest or Karma
     if project_path.join("angular.json").exists() {
+        // Jest-based Angular projects have jest.config.js/ts
+        if project_path.join("jest.config.js").exists()
+            || project_path.join("jest.config.ts").exists()
+            || project_path.join("jest.config.mjs").exists()
+        {
+            return Some("npx jest --coverage".to_string());
+        }
+        // Karma-based Angular projects (default ng test)
         return Some("npm test -- --code-coverage --no-watch".to_string());
     }
 
@@ -60,14 +68,13 @@ pub fn detect_coverage_command(project_path: &Path) -> Option<String> {
 pub fn run_tests(project_path: &Path, test_command: &str, _timeout_secs: u64) -> Result<(bool, String)> {
     info!("Running tests: {}", test_command);
 
-    let parts: Vec<&str> = test_command.split_whitespace().collect();
-    if parts.is_empty() {
+    if test_command.is_empty() {
         anyhow::bail!("Empty test command");
     }
 
-    let output = Command::new(parts[0])
+    let output = Command::new("sh")
         .current_dir(project_path)
-        .args(&parts[1..])
+        .args(["-c", test_command])
         .output()
         .context(format!("Failed to execute test command: {}", test_command))?;
 
@@ -82,14 +89,13 @@ pub fn run_tests(project_path: &Path, test_command: &str, _timeout_secs: u64) ->
 pub fn run_coverage(project_path: &Path, coverage_command: &str, _timeout_secs: u64) -> Result<(bool, String)> {
     info!("Running coverage: {}", coverage_command);
 
-    let parts: Vec<&str> = coverage_command.split_whitespace().collect();
-    if parts.is_empty() {
+    if coverage_command.is_empty() {
         anyhow::bail!("Empty coverage command");
     }
 
-    let output = Command::new(parts[0])
+    let output = Command::new("sh")
         .current_dir(project_path)
-        .args(&parts[1..])
+        .args(["-c", coverage_command])
         .output()
         .context(format!("Failed to execute coverage command: {}", coverage_command))?;
 

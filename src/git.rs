@@ -202,6 +202,14 @@ pub fn revert_changes(project_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Delete a local branch (best-effort, ignores errors)
+pub fn delete_branch(project_path: &Path, branch: &str) {
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["branch", "-D", branch])
+        .output();
+}
+
 /// Check if a branch exists locally
 pub fn branch_exists(project_path: &Path, branch: &str) -> bool {
     Command::new("git")

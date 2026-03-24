@@ -120,6 +120,24 @@ impl Orchestrator {
     pub async fn run(&mut self) -> Result<i32> {
         let start = Instant::now();
 
+        // Step 0: Ensure clean git working tree
+        info!("=== Step 0: Checking git status ===");
+        match git::has_changes(&self.config.path) {
+            Ok(true) => {
+                anyhow::bail!(
+                    "Working tree has uncommitted changes. Commit or stash them before running Reparo.\n\
+                     Run `git status` in {} to see what's changed.",
+                    self.config.path.display()
+                );
+            }
+            Ok(false) => {
+                info!("Git working tree is clean");
+            }
+            Err(e) => {
+                warn!("Could not check git status: {} — proceeding anyway", e);
+            }
+        }
+
         // Step 1: Validate SonarQube connectivity (US-001, US-016: with retry)
         info!("=== Step 1: Checking SonarQube connectivity ===");
         crate::retry::retry_async(3, 3, "SonarQube connection check", || {
@@ -129,9 +147,10 @@ impl Orchestrator {
         self.client.detect_edition().await;
 
         // Detect test command early — needed for pre-flight and processing
-        let test_command = self.config.test_command.clone().or_else(|| {
-            runner::detect_test_command(&self.config.path)
-        });
+        // Priority: CLI --test-command > YAML commands.test > auto-detection
+        let test_command = self.config.test_command.clone()
+            .or_else(|| self.config.commands.test.clone())
+            .or_else(|| runner::detect_test_command(&self.config.path));
         let test_command = match test_command {
             Some(cmd) => cmd,
             None => {
@@ -160,10 +179,12 @@ impl Orchestrator {
                 Ok((true, _)) => info!("Setup completed successfully"),
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Setup command failed:\n{}", truncate(&output, 500));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Setup command error: {}", e);
                 }
             }
@@ -183,7 +204,7 @@ impl Orchestrator {
                             info!("Formatting produced changes — committing...");
                             if let Err(e) = git::commit_all(
                                 &self.config.path,
-                                "style: apply code formatting before sonar fixes",
+                                &format_commit_message(&self.config, "style", "sonar", "apply code formatting before sonar fixes", "", "", ""),
                             ) {
                                 warn!("Failed to commit formatting changes: {}", e);
                             } else {
@@ -215,10 +236,12 @@ impl Orchestrator {
                 Ok((true, _)) => info!("Pre-flight build passed"),
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Pre-flight build fails — fix the build before running Reparo:\n{}", truncate(&output, 500));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Pre-flight build error: {}", e);
                 }
             }
@@ -229,10 +252,12 @@ impl Orchestrator {
                 Ok((true, _)) => info!("Pre-flight tests passed"),
                 Ok((false, output)) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Pre-flight tests fail — fix tests before running Reparo:\n{}", truncate(&output, 500));
                 }
                 Err(e) => {
                     let _ = git::checkout(&self.config.path, &self.config.branch);
+                    git::delete_branch(&self.config.path, &branch_name);
                     anyhow::bail!("Pre-flight test error: {}", e);
                 }
             }
@@ -581,7 +606,8 @@ Apply the fix now."#,
             if final_ok {
                 let _ = git::add_all(&self.config.path);
                 if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-                    let _ = git::commit(&self.config.path, "fix: repair build/test issues from accumulated changes");
+                    let msg = format_commit_message(&self.config, "fix", "sonar", "repair build/test issues from accumulated changes", "", "", "");
+                    let _ = git::commit(&self.config.path, &msg);
                     info!("Committed final validation fixes");
                 }
             }
@@ -595,7 +621,8 @@ Apply the fix now."#,
         // Commit report files to the fix branch
         let _ = git::add_all(&self.config.path);
         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-            let _ = git::commit(&self.config.path, "docs: add REPORT.md and TECHDEBT_CHANGELOG.md");
+            let msg = format_commit_message(&self.config, "docs", "sonar", "add REPORT.md and TECHDEBT_CHANGELOG.md", "", "", "");
+            let _ = git::commit(&self.config.path, &msg);
         }
 
         // Step 7: Create PR if enabled and there are fixes
@@ -943,7 +970,11 @@ Apply the fix now."#,
             let _ = git::revert_changes(&self.config.path);
             return Ok(false);
         }
-        let commit_msg = format!("test(coverage): add tests for {} ({:.0}% → boost)", fc.file, fc.coverage_pct);
+        let commit_msg = format_commit_message(
+            &self.config, "test", "coverage",
+            &format!("add tests for {} ({:.0}% → boost)", fc.file, fc.coverage_pct),
+            "", "", &fc.file,
+        );
         if let Err(e) = git::commit(&self.config.path, &commit_msg) {
             warn!("Failed to commit tests for {}: {} — reverting", fc.file, e);
             let _ = git::revert_changes(&self.config.path);
@@ -1126,9 +1157,10 @@ Apply the fix now."#,
                         // Commit test files
                         let _ = git::add_all(&self.config.path);
                         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-                            let msg = format!(
-                                "test(dedup): add tests for {} before deduplication",
-                                dup_file.file_path
+                            let msg = format_commit_message(
+                                &self.config, "test", "dedup",
+                                &format!("add tests for {} before deduplication", dup_file.file_path),
+                                "", "", &dup_file.file_path,
                             );
                             let _ = git::commit(&self.config.path, &msg);
                             info!("Committed {} test file(s)", test_files.len());
@@ -1269,9 +1301,10 @@ Apply the fix now."#,
             // Commit the dedup changes
             let _ = git::add_all(&self.config.path);
             if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-                let msg = format!(
-                    "refactor(dedup): reduce code duplication in {}",
-                    dup_file.file_path
+                let msg = format_commit_message(
+                    &self.config, "refactor", "dedup",
+                    &format!("reduce code duplication in {}", dup_file.file_path),
+                    "", "", &dup_file.file_path
                 );
                 match git::commit(&self.config.path, &msg) {
                     Ok(()) => {
@@ -1379,9 +1412,10 @@ Apply the fix now."#,
                             );
                             // Commit the passing tests — more coverage is always welcome
                             if !test_files.is_empty() {
-                                let commit_msg = format!(
-                                    "test(coverage): add partial tests for {} (100% not reached, fix skipped)",
-                                    issue.component
+                                let commit_msg = format_commit_message(
+                                    &self.config, "test", "coverage",
+                                    &format!("add partial tests for {} (100% not reached, fix skipped)", file_path),
+                                    &issue.key, &issue.rule, &file_path,
                                 );
                                 let _ = git::add_all(&self.config.path);
                                 let _ = git::commit(&self.config.path, &commit_msg);
@@ -1412,9 +1446,10 @@ Apply the fix now."#,
                     if !result.tests_added.is_empty() {
                         let _ = git::add_all(&self.config.path);
                         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-                            let msg = format!(
-                                "test(sonar): add tests for {} coverage\n\nPreparing coverage for fix of {}",
-                                file_path, issue.key
+                            let msg = format_commit_message(
+                                &self.config, "test", "sonar",
+                                &format!("add tests for {} coverage", file_path),
+                                &issue.key, &issue.rule, &file_path,
                             );
                             let _ = git::commit(&self.config.path, &msg);
                         }
@@ -2006,15 +2041,19 @@ Apply a different fix now."#,
                 "{}/project/issues?id={}&open={}",
                 self.config.sonar_url, self.config.sonar_project_id, issue.key
             );
+            let subject = format_commit_message(
+                &self.config, "fix", "sonar",
+                &format!("{} - {}", issue.issue_type.to_lowercase(), truncate(&issue.message, 72)),
+                &issue.key, &issue.rule, &file_path,
+            );
             let msg = format!(
-                "fix(sonar): {} - {}\n\n\
+                "{}\n\n\
                  Rule: {}\n\
                  Severity: {}\n\
                  File: {}:{}\n\
                  Modified: {}\n\
                  Issue: {}",
-                issue.issue_type.to_lowercase(),
-                truncate(&issue.message, 72),
+                subject,
                 issue.rule,
                 issue.severity,
                 file_path,
@@ -2199,6 +2238,7 @@ Apply a different fix now."#,
 
             // Run coverage command to generate local lcov report
             let coverage_cmd = self.config.coverage_command.clone()
+                .or_else(|| self.config.commands.coverage.clone())
                 .or_else(|| runner::detect_coverage_command(&self.config.path));
             if let Some(ref cov_cmd) = coverage_cmd {
                 info!("Running coverage command: {}", cov_cmd);
@@ -2279,7 +2319,8 @@ Apply a different fix now."#,
         // Stage any remaining changes (changelog, etc.) and push
         let _ = git::add_all(&self.config.path);
         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-            let _ = git::commit(&self.config.path, "chore: include changelog and report updates");
+            let msg = format_commit_message(&self.config, "chore", "sonar", "include changelog and report updates", "", "", "");
+            let _ = git::commit(&self.config.path, &msg);
         }
 
         // US-016: Push with retry
@@ -2854,6 +2895,42 @@ fn truncate(s: &str, max: usize) -> String {
         let truncated: String = s.chars().take(max).collect();
         format!("{}...", truncated)
     }
+}
+
+/// Format a commit message using the configured template.
+///
+/// Supported placeholders:
+/// - `{type}`: conventional commit type (fix, test, refactor, style, docs, chore)
+/// - `{scope}`: scope (e.g., "sonar", "coverage", "dedup")
+/// - `{message}`: the commit description
+/// - `{issue_key}`: SonarQube issue key
+/// - `{rule}`: SonarQube rule ID
+/// - `{file}`: affected file path
+/// - Any custom key from `commit_vars` (e.g., `{gitlab_issue}`)
+fn format_commit_message(
+    config: &ValidatedConfig,
+    commit_type: &str,
+    scope: &str,
+    message: &str,
+    issue_key: &str,
+    rule: &str,
+    file: &str,
+) -> String {
+    let mut result = config.commit_format.clone();
+    result = result.replace("{type}", commit_type);
+    result = result.replace("{scope}", scope);
+    result = result.replace("{message}", message);
+    result = result.replace("{issue_key}", issue_key);
+    result = result.replace("{rule}", rule);
+    result = result.replace("{file}", file);
+
+    // Apply custom variables from commit_vars
+    for (key, value) in &config.commit_vars {
+        let placeholder = format!("{{{}}}", key);
+        result = result.replace(&placeholder, value);
+    }
+
+    result
 }
 
 #[cfg(test)]

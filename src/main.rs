@@ -107,6 +107,8 @@ fn classify_error(e: &anyhow::Error) -> i32 {
         || msg.contains("SonarQube")
         || msg.contains("not accessible")
         || msg.contains("sonar-scanner")
+        || msg.contains("Pre-flight")
+        || msg.contains("Setup command")
     {
         1
     } else {
