@@ -13,18 +13,43 @@ fn supports_color() -> bool {
     std::io::stderr().is_terminal()
 }
 
-/// Blue text (for previous/reference coverage values)
-fn blue(s: &str) -> String {
-    if supports_color() { format!("\x1b[34m{}\x1b[0m", s) } else { s.to_string() }
+/// ANSI color helpers — only emit escape codes when stderr is a real terminal.
+fn colored(s: &str, code: &str) -> String {
+    if supports_color() { format!("\x1b[{}m{}\x1b[0m", code, s) } else { s.to_string() }
 }
-/// Bold blue text (for new/current coverage values)
-fn bold_blue(s: &str) -> String {
-    if supports_color() { format!("\x1b[1;34m{}\x1b[0m", s) } else { s.to_string() }
+fn green(s: &str) -> String { colored(s, "1;32") }
+fn yellow(s: &str) -> String { colored(s, "1;33") }
+fn red(s: &str) -> String { colored(s, "1;31") }
+fn blue(s: &str) -> String { colored(s, "34") }
+
+/// Color a coverage percentage based on how close it is to the threshold.
+/// - Green + bold: at or above threshold
+/// - Yellow + bold: within 10% of threshold
+/// - Red + bold: more than 10% below threshold
+fn cov_colored(pct: f64, threshold: f64) -> String {
+    let label = format!("{:.1}%", pct);
+    if pct >= threshold {
+        green(&label)
+    } else if pct >= threshold - 10.0 {
+        yellow(&label)
+    } else {
+        red(&label)
+    }
 }
-/// Format a coverage percentage in bold blue
-fn cov_new(pct: f64) -> String { bold_blue(&format!("{:.1}%", pct)) }
-/// Format a coverage percentage in blue (previous/reference value)
+
+/// Format a previous/reference coverage value (always blue, neutral).
 fn cov_prev(pct: f64) -> String { blue(&format!("{:.1}%", pct)) }
+/// Format a coverage percentage colored by distance to threshold.
+/// Green if met, yellow if within 10%, red if > 10% below.
+fn cov_vs(pct: f64, threshold: f64) -> String { cov_colored(pct, threshold) }
+
+/// Print a colored info line directly to stderr, bypassing tracing's escaping.
+/// Falls back to plain text when piped.
+macro_rules! color_info {
+    ($($arg:tt)*) => {
+        eprintln!("{}", format!($($arg)*));
+    };
+}
 use crate::git;
 use crate::report::{self, FixStatus, IssueResult};
 use crate::runner;
@@ -331,7 +356,11 @@ impl Orchestrator {
         }
 
         // Fetch initial issues to get total count and dry-run info
-        let initial_issues = self.client.fetch_issues().await?;
+        let mut initial_issues = self.client.fetch_issues().await?;
+        if self.config.reverse_severity {
+            initial_issues.reverse();
+            info!("Reversed severity order: processing least severe issues first");
+        }
         self.total_issues_found = initial_issues.len();
         info!("Found {} issues", self.total_issues_found);
 
@@ -421,9 +450,14 @@ impl Orchestrator {
                 }
             }
 
-            // Fetch fresh issues from SonarQube (most critical first)
+            // Fetch fresh issues from SonarQube
             let issues = match self.client.fetch_issues().await {
-                Ok(issues) => issues,
+                Ok(mut issues) => {
+                    if self.config.reverse_severity {
+                        issues.reverse();
+                    }
+                    issues
+                }
                 Err(e) => {
                     error!("Failed to fetch issues: {}", e);
                     break;
@@ -530,10 +564,14 @@ impl Orchestrator {
             info!("=== Step 5b: Deduplication SKIPPED (no scanner) ===");
         }
 
-        // Step 5c: Final validation — ensure build + tests pass after all changes
-        info!("=== Step 5c: Final validation ===");
-        if !test_command.is_empty() {
-            let max_final_attempts = self.config.coverage_attempts;
+        // Step 5c: Final validation — run the FULL test suite; iterate with Claude until ALL tests pass
+        if self.config.skip_final_validation {
+            info!("=== Step 5c: Final validation SKIPPED (disabled) ===");
+        } else {
+        info!("=== Step 5c: Final validation (all tests must pass) ===");
+        }
+        if !self.config.skip_final_validation && !test_command.is_empty() {
+            let max_final_attempts = self.config.final_validation_attempts;
             let mut final_ok = false;
 
             for attempt in 1..=max_final_attempts {
@@ -585,19 +623,20 @@ Apply the fix now."#,
                     }
                 }
 
-                // Test check
+                // Full test suite check — ALL tests must pass, not just per-issue tests
+                info!("Running full test suite (attempt {}/{})...", attempt, max_final_attempts);
                 match runner::run_tests(&self.config.path, &test_command, self.config.test_timeout) {
                     Ok((true, _)) => {
-                        info!("Final test validation passed — all tests green");
+                        info!("Final validation PASSED — all tests green after {} attempt(s)", attempt);
                         final_ok = true;
                         break;
                     }
                     Ok((false, output)) => {
-                        warn!("Final test validation FAILED (attempt {}/{})", attempt, max_final_attempts);
+                        warn!("Full test suite FAILED (attempt {}/{})", attempt, max_final_attempts);
                         if attempt < max_final_attempts {
-                            info!("Asking Claude to fix the test failure (without modifying tests)...");
+                            info!("Iterating: asking Claude to fix failures without modifying test files...");
                             let repair_prompt = format!(
-                                r#"Tests are failing after applying SonarQube fixes. Fix the SOURCE CODE to make all tests pass. Do NOT modify any test files.
+                                r#"The full test suite is failing after applying SonarQube fixes. ALL tests must pass before we can accept the changes. Fix the SOURCE CODE to make every test pass. Do NOT modify any test files.
 
 ## Test output:
 ```
@@ -605,10 +644,11 @@ Apply the fix now."#,
 ```
 
 ## Instructions:
-1. Fix the source code to make all tests pass
-2. Do NOT modify any test files (*.spec.ts, *.test.ts, etc.)
-3. Do NOT change test logic or assertions — the tests define the expected behavior
-4. Ensure the fix compiles and all tests pass
+1. Analyze the failing tests and identify which source code changes broke them
+2. Fix the source code to make ALL tests pass — not just the ones related to the current fix
+3. Do NOT modify any test files (*.spec.ts, *.test.ts, *_test.go, test_*.py, etc.)
+4. Do NOT change test logic or assertions — the tests define the expected behavior
+5. Ensure the project compiles and the entire test suite passes
 
 Apply the fix now."#,
                                 truncate(&output, 3000)
@@ -624,11 +664,11 @@ Apply the fix now."#,
                                 let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
                             }
                         } else {
-                            error!("Tests still failing after {} repair attempts", max_final_attempts);
+                            error!("Full test suite still failing after {} repair attempts — manual intervention needed", max_final_attempts);
                         }
                     }
                     Err(e) => {
-                        error!("Test command error: {}", e);
+                        error!("Test command error during final validation: {}", e);
                         break;
                     }
                 }
@@ -757,15 +797,15 @@ Apply the fix now."#,
         };
 
         if !overall_needs_boost && files_below_file_threshold.is_empty() {
-            info!(
+            color_info!(
                 "Project-wide coverage {} meets {:.0}% and all files meet per-file threshold — no boost needed",
-                cov_new(overall_pct), self.config.min_coverage
+                cov_vs(overall_pct, self.config.min_coverage), self.config.min_coverage
             );
             return Ok(());
         }
 
         if overall_needs_boost {
-            info!("Project-wide coverage {} is below {:.0}%", cov_prev(overall_pct), self.config.min_coverage);
+            color_info!("Project-wide coverage {} is below {:.0}%", cov_prev(overall_pct), self.config.min_coverage);
         }
         if !files_below_file_threshold.is_empty() {
             info!("{} file(s) below per-file threshold of {:.0}%", files_below_file_threshold.len(), self.config.min_file_coverage);
@@ -785,6 +825,23 @@ Apply the fix now."#,
                 overall_needs_boost || (has_file_threshold && fc.coverage_pct < self.config.min_file_coverage)
             })
             .collect();
+
+        // Pre-filter: remove files that don't exist on disk (autogenerated classes, build artifacts)
+        let (files_needing_tests, missing): (Vec<_>, Vec<_>) = files_needing_tests
+            .into_iter()
+            .partition(|fc| {
+                let resolved = resolve_source_file(&self.config.path, &fc.file);
+                resolved.exists()
+            });
+
+        if !missing.is_empty() {
+            info!(
+                "Skipping {} files not found on disk (autogenerated/build artifacts): {}{}",
+                missing.len(),
+                missing.iter().take(5).map(|f| f.file.as_str()).collect::<Vec<_>>().join(", "),
+                if missing.len() > 5 { ", ..." } else { "" }
+            );
+        }
 
         if files_needing_tests.is_empty() {
             warn!("No source files with uncovered lines found in lcov report");
@@ -838,7 +895,7 @@ Apply the fix now."#,
                 // Re-measure coverage
                 match self.run_coverage_and_measure(&cov_cmd) {
                     Some(pct) => {
-                        info!("Project-wide coverage after boost: {} (was {})", cov_new(pct), cov_prev(current_pct));
+                        color_info!("Project-wide coverage after boost: {} (was {})", cov_vs(pct, self.config.min_coverage), cov_prev(current_pct));
                         current_pct = pct;
                     }
                     None => {
@@ -862,15 +919,15 @@ Apply the fix now."#,
         };
 
         if current_pct >= self.config.min_coverage && remaining_below.is_empty() {
-            info!(
+            color_info!(
                 "Coverage boost complete: {} (target {:.0}%) — {} files boosted",
-                cov_new(current_pct), self.config.min_coverage, files_boosted
+                cov_vs(current_pct, self.config.min_coverage), self.config.min_coverage, files_boosted
             );
         } else {
             if current_pct < self.config.min_coverage {
-                warn!(
-                    "Coverage boost: overall {} still below target {:.0}%",
-                    cov_new(current_pct), self.config.min_coverage
+                color_info!(
+                    "⚠ Coverage boost: overall {} still below target {:.0}%",
+                    cov_vs(current_pct, self.config.min_coverage), self.config.min_coverage
                 );
             }
             if !remaining_below.is_empty() {
@@ -905,6 +962,16 @@ Apply the fix now."#,
                 return Ok(false);
             }
         };
+
+        // Skip very large files — prompts > 50K chars tend to timeout
+        let line_count = source_content.lines().count();
+        if line_count > 500 {
+            warn!(
+                "File {} has {} lines — too large for coverage boost, skipping (max 500 lines)",
+                fc.file, line_count
+            );
+            return Ok(false);
+        }
 
         // Build uncovered lines description
         let uncovered_desc = format!(
@@ -965,7 +1032,7 @@ Apply the fix now."#,
         }
 
         let source_files_modified: Vec<&String> = changed.iter()
-            .filter(|f| !is_test_file(f) && !f.contains(".reparo") && !f.contains("TECHDEBT_CHANGELOG"))
+            .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
             .collect();
 
         if !source_files_modified.is_empty() {
@@ -1056,7 +1123,7 @@ Apply the fix now."#,
         let lcov_path = runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref())?;
         let overall = runner::overall_lcov_coverage(&lcov_path);
         if let Some(pct) = overall {
-            info!("Project-wide test coverage: {}", cov_new(pct));
+            color_info!("Project-wide test coverage: {}", cov_vs(pct, self.config.min_coverage));
         }
         overall
     }
@@ -1165,7 +1232,7 @@ Apply the fix now."#,
             coverage.log_summary(&dup_file.file_path, cov_start, cov_end);
 
             if !coverage.fully_covered && !coverage.uncovered_lines.is_empty() {
-                info!(
+                color_info!(
                     "Coverage {} — generating tests for {} uncovered lines before dedup...",
                     cov_prev(coverage.coverage_pct),
                     coverage.uncovered_lines.len()
@@ -1346,7 +1413,7 @@ Apply the fix now."#,
             }
 
             let new_dup_pct = self.client.get_duplication_percentage().await.unwrap_or(initial_dup_pct);
-            info!("Duplication after refactoring {}: {} (was {})", dup_file.file_path, cov_new(new_dup_pct), cov_prev(initial_dup_pct));
+            color_info!("Duplication after refactoring {}: {} (was {})", dup_file.file_path, cov_vs(new_dup_pct, initial_dup_pct), cov_prev(initial_dup_pct));
 
             // Commit the dedup changes
             let _ = git::add_all(&self.config.path);
@@ -1630,7 +1697,7 @@ Apply the fix now."#,
                     // All affected lines are covered — proceed to fix
                 }
                 CoverageCheck::NeedsCoverage { uncovered_lines, coverage_pct } => {
-                    info!(
+                    color_info!(
                         "Coverage {} — generating tests for {} uncovered lines...",
                         cov_prev(coverage_pct),
                         uncovered_lines.len()
@@ -1705,6 +1772,101 @@ Apply the fix now."#,
                 }
                 CoverageCheck::Unavailable => {
                     info!("No coverage data available for {}, proceeding with fix", file_path);
+                }
+            }
+        }
+
+        // Step A-1.5: Pact/contract testing (between coverage and fix)
+        if !self.config.skip_pact && self.config.pact.enabled {
+            match crate::pact::check_api_file(&file_path, &self.config.pact.api_patterns) {
+                crate::pact::ApiCheckResult::IsApiFile => {
+                    info!("File {} matches API patterns — running pact checks", file_path);
+
+                    // Sub-step 1: Check existing contracts
+                    if self.config.pact.check_contracts {
+                        if let Some(ref verify_cmd) = self.config.pact.verify_command {
+                            match crate::pact::verify_contracts(
+                                &self.config.path,
+                                verify_cmd,
+                                self.config.pact.pact_dir.as_deref(),
+                            ) {
+                                Ok(crate::pact::PactVerifyResult::Passed) => {
+                                    info!("Existing pact contracts pass");
+                                }
+                                Ok(crate::pact::PactVerifyResult::Failed { output }) => {
+                                    warn!("Pact contracts fail BEFORE fix: {}", truncate(&output, 200));
+                                    result.status = FixStatus::NeedsReview(
+                                        "Existing pact contracts already failing — fix skipped".into(),
+                                    );
+                                    return result;
+                                }
+                                Ok(crate::pact::PactVerifyResult::NoContracts) => {
+                                    info!("No pact contracts found for this provider/consumer");
+                                }
+                                Ok(crate::pact::PactVerifyResult::Unavailable { reason }) => {
+                                    info!("Pact verification unavailable: {}", reason);
+                                }
+                                Err(e) => warn!("Pact check error: {}", e),
+                            }
+                        }
+                    }
+
+                    // Sub-step 2: Generate contract tests if enabled
+                    if self.config.pact.generate_tests {
+                        let gen_result = self.generate_contract_tests_with_retry(
+                            issue, &file_path, &file_content,
+                        ).await;
+
+                        match gen_result {
+                            crate::pact::PactTestGenResult::Success { ref test_files } => {
+                                if !test_files.is_empty() {
+                                    let _ = git::add_all(&self.config.path);
+                                    if git::has_staged_changes(&self.config.path).unwrap_or(false) {
+                                        let msg = format_commit_message(
+                                            &self.config, "test", "pact",
+                                            &format!("add contract tests for {}", file_path),
+                                            &issue.key, &issue.rule, &file_path,
+                                        );
+                                        let _ = git::commit(&self.config.path, &msg);
+                                        info!("Committed contract tests for {}", file_path);
+                                    }
+                                }
+                            }
+                            crate::pact::PactTestGenResult::TestsFailed { ref output } => {
+                                warn!("Generated contract tests fail: {}", truncate(output, 200));
+                                let _ = git::revert_changes(&self.config.path);
+                            }
+                            crate::pact::PactTestGenResult::GenerationFailed { ref error } => {
+                                warn!("Failed to generate contract tests: {}", error);
+                            }
+                        }
+                    }
+
+                    // Sub-step 3: Verify before fix
+                    if self.config.pact.verify_before_fix {
+                        if let Some(ref verify_cmd) = self.config.pact.verify_command {
+                            match crate::pact::verify_contracts(
+                                &self.config.path,
+                                verify_cmd,
+                                self.config.pact.pact_dir.as_deref(),
+                            ) {
+                                Ok(crate::pact::PactVerifyResult::Failed { output }) => {
+                                    warn!("Pact verification fails before fix: {}", truncate(&output, 200));
+                                    result.status = FixStatus::NeedsReview(
+                                        "Pact contracts fail before fix".into(),
+                                    );
+                                    return result;
+                                }
+                                Ok(_) => {
+                                    info!("Pre-fix pact verification passed");
+                                }
+                                Err(e) => warn!("Pact pre-fix verification error: {}", e),
+                            }
+                        }
+                    }
+                }
+                crate::pact::ApiCheckResult::NotApiFile => {
+                    // Not an API file — skip pact steps silently
                 }
             }
         }
@@ -2050,6 +2212,41 @@ Apply the fix now."#,
                 max_fix_attempts
             ));
             return result;
+        }
+
+        // Step C-3.5: Verify pact contracts after fix
+        if !self.config.skip_pact && self.config.pact.enabled && self.config.pact.verify_after_fix {
+            if let crate::pact::ApiCheckResult::IsApiFile =
+                crate::pact::check_api_file(&file_path, &self.config.pact.api_patterns)
+            {
+                if let Some(ref verify_cmd) = self.config.pact.verify_command {
+                    match crate::pact::verify_contracts(
+                        &self.config.path,
+                        verify_cmd,
+                        self.config.pact.pact_dir.as_deref(),
+                    ) {
+                        Ok(crate::pact::PactVerifyResult::Passed) => {
+                            info!("Pact contracts still pass after fix");
+                        }
+                        Ok(crate::pact::PactVerifyResult::Failed { output }) => {
+                            warn!("Pact contracts FAIL after fix for {}", issue.key);
+                            let _ = git::revert_changes(&self.config.path);
+                            result.status = FixStatus::NeedsReview(format!(
+                                "Fix breaks pact contracts: {}",
+                                truncate(&output, 200),
+                            ));
+                            return result;
+                        }
+                        Ok(crate::pact::PactVerifyResult::NoContracts) => {
+                            info!("No pact contracts to verify after fix");
+                        }
+                        Ok(crate::pact::PactVerifyResult::Unavailable { reason }) => {
+                            info!("Post-fix pact verification unavailable: {}", reason);
+                        }
+                        Err(e) => warn!("Post-fix pact verification error: {}", e),
+                    }
+                }
+            }
         }
 
         // Step C-4: Lint if command defined — retry with Claude to fix lint errors
@@ -2515,16 +2712,16 @@ Apply a different fix now."#,
                 Some(ref lcov) => {
                     match runner::check_local_coverage(lcov, file_path, start_line, end_line) {
                         Some(cov) if cov.fully_covered => {
-                            info!(
+                            color_info!(
                                 "{} local coverage achieved after {} attempt(s) for {}",
-                                cov_new(100.0), attempt, issue.key
+                                cov_vs(100.0, 100.0), attempt, issue.key
                             );
                             return TestGenResult::Success {
                                 test_files: all_test_files,
                             };
                         }
                         Some(cov) => {
-                            info!(
+                            color_info!(
                                 "Local coverage {} ({} lines still uncovered) after attempt {}",
                                 cov_prev(cov.coverage_pct),
                                 cov.uncovered.len(),
@@ -2571,6 +2768,150 @@ Apply a different fix now."#,
             TestGenResult::PartialCoverage {
                 test_files: all_test_files,
             }
+        }
+    }
+
+    /// Generate contract tests with retry, following the same pattern as generate_tests_with_retry.
+    async fn generate_contract_tests_with_retry(
+        &self,
+        issue: &Issue,
+        file_path: &str,
+        file_content: &str,
+    ) -> crate::pact::PactTestGenResult {
+        let pact_framework = crate::pact::detect_pact_framework(&self.config.path);
+        let contract_examples = crate::pact::find_contract_test_examples(&self.config.path);
+        let examples_str = contract_examples.join("\n\n");
+        let existing_pact_files = crate::pact::find_existing_pact_files(
+            &self.config.path,
+            self.config.pact.pact_dir.as_deref(),
+        );
+        let pact_files_str = existing_pact_files.join("\n\n");
+
+        let provider = self.config.pact.provider_name.as_deref().unwrap_or("Provider");
+        let consumer = self.config.pact.consumer_name.as_deref().unwrap_or("Consumer");
+        let max_attempts = self.config.pact.attempts;
+        let mut last_output = String::new();
+
+        for attempt in 1..=max_attempts {
+            info!(
+                "Contract test generation attempt {}/{} for {}",
+                attempt, max_attempts, issue.key
+            );
+
+            let prompt = if attempt == 1 {
+                claude::build_contract_test_prompt(
+                    file_path,
+                    file_content,
+                    provider,
+                    consumer,
+                    &pact_framework,
+                    &examples_str,
+                    &pact_files_str,
+                )
+            } else {
+                claude::build_contract_test_retry_prompt(
+                    file_path,
+                    file_content,
+                    provider,
+                    consumer,
+                    &pact_framework,
+                    &examples_str,
+                    attempt,
+                    &last_output,
+                )
+            };
+
+            if self.config.show_prompts {
+                info!("Contract test generation prompt:\n{}", prompt);
+            }
+
+            // Use a moderate tier for contract test generation
+            let tier = claude::classify_contract_test_tier(5); // default estimate
+            let timeout = tier.effective_timeout(self.config.claude_timeout);
+
+            let claude_result = claude::run_claude_with_tier(
+                &self.config.path,
+                &prompt,
+                timeout,
+                self.config.dangerously_skip_permissions,
+                self.config.show_prompts,
+                Some(&tier),
+            );
+
+            match claude_result {
+                Ok(output) => {
+                    last_output = output;
+                }
+                Err(e) => {
+                    if attempt == 1 {
+                        return crate::pact::PactTestGenResult::GenerationFailed {
+                            error: format!("Claude failed: {}", e),
+                        };
+                    }
+                    warn!("Claude failed on contract test retry {}: {}", attempt, e);
+                    continue;
+                }
+            }
+
+            // Detect new files
+            let new_files = git::changed_files(&self.config.path)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| {
+                    let lower = f.to_lowercase();
+                    lower.contains("pact") || lower.contains("contract")
+                        || lower.contains("test") || lower.contains("spec")
+                })
+                .collect::<Vec<_>>();
+
+            if new_files.is_empty() && attempt == 1 {
+                return crate::pact::PactTestGenResult::GenerationFailed {
+                    error: "No contract test files were created".to_string(),
+                };
+            }
+
+            // Run contract tests if command is configured
+            if let Some(ref test_cmd) = self.config.pact.test_command {
+                match runner::run_shell_command(&self.config.path, test_cmd, "pact test") {
+                    Ok((true, _)) => {
+                        info!("Contract tests pass on attempt {}", attempt);
+                        return crate::pact::PactTestGenResult::Success {
+                            test_files: new_files,
+                        };
+                    }
+                    Ok((false, output)) => {
+                        last_output = output.clone();
+                        if attempt == max_attempts {
+                            let _ = git::revert_changes(&self.config.path);
+                            return crate::pact::PactTestGenResult::TestsFailed { output };
+                        }
+                        warn!(
+                            "Contract tests fail on attempt {}/{} — retrying",
+                            attempt, max_attempts
+                        );
+                        let _ = git::revert_changes(&self.config.path);
+                    }
+                    Err(e) => {
+                        last_output = e.to_string();
+                        if attempt == max_attempts {
+                            let _ = git::revert_changes(&self.config.path);
+                            return crate::pact::PactTestGenResult::TestsFailed {
+                                output: e.to_string(),
+                            };
+                        }
+                        let _ = git::revert_changes(&self.config.path);
+                    }
+                }
+            } else {
+                // No test command — assume generated tests are valid
+                return crate::pact::PactTestGenResult::Success {
+                    test_files: new_files,
+                };
+            }
+        }
+
+        crate::pact::PactTestGenResult::GenerationFailed {
+            error: "Contract test generation failed after all attempts".to_string(),
         }
     }
 
@@ -3118,6 +3459,34 @@ fn is_non_coverable_file(path: &str) -> bool {
 }
 
 /// Internal files that should be excluded from change detection.
+/// Check if a file is a generated artifact (coverage reports, build output, etc.)
+/// that should not be treated as source code modification.
+fn is_generated_artifact(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Coverage report directories and files
+    lower.starts_with("coverage/")
+        || lower.contains("/coverage/")
+        || lower.ends_with("lcov.info")
+        || lower.ends_with("clover.xml")
+        || lower.ends_with("coverage-final.json")
+        || lower.ends_with("coverage-summary.json")
+        || lower.ends_with("cobertura.xml")
+        || lower.ends_with("jacoco.xml")
+        || lower.ends_with("jacoco.csv")
+        // Build output directories
+        || lower.starts_with("dist/")
+        || lower.contains("/dist/")
+        || lower.starts_with("build/")
+        || lower.contains("/build/")
+        || lower.starts_with("target/")
+        || lower.contains("/target/")
+        || lower.starts_with(".nyc_output/")
+        || lower.contains("/.nyc_output/")
+        // Pact output
+        || lower.starts_with("pacts/")
+        || lower.contains("/pacts/")
+}
+
 fn is_internal_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".calendula-state.json")
@@ -3152,9 +3521,11 @@ fn resolve_source_file(project_path: &Path, relative_file: &str) -> PathBuf {
         "src/main/kotlin",
         "src/main/scala",
         "src/main/groovy",
+        "src/main/resources",
         "src",
         "app/src/main/java",
         "app/src/main/kotlin",
+        "lib/src/main/java",
     ];
     for root in &source_roots {
         let candidate = project_path.join(root).join(relative_file);
@@ -3162,6 +3533,20 @@ fn resolve_source_file(project_path: &Path, relative_file: &str) -> PathBuf {
             return candidate;
         }
     }
+
+    // Try searching in subdirectories (multi-module Maven projects)
+    // e.g., example-app/src/main/java/com/... when --path points to parent
+    if let Ok(entries) = std::fs::read_dir(project_path) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let sub = entry.path().join("src/main/java").join(relative_file);
+                if sub.exists() {
+                    return sub;
+                }
+            }
+        }
+    }
+
     direct
 }
 
@@ -3266,6 +3651,33 @@ mod tests {
         assert!(!is_test_file("src/calculator.py"));
         assert!(!is_test_file("lib/utils.js"));
         assert!(!is_test_file("Cargo.toml"));
+    }
+
+    // -- is_generated_artifact --
+
+    #[test]
+    fn test_is_generated_artifact_coverage() {
+        assert!(is_generated_artifact("coverage/lcov.info"));
+        assert!(is_generated_artifact("coverage/clover.xml"));
+        assert!(is_generated_artifact("coverage/coverage-final.json"));
+        assert!(is_generated_artifact("coverage/lcov-report/index.html"));
+        assert!(is_generated_artifact("projects/my-lib/coverage/lcov.info"));
+    }
+
+    #[test]
+    fn test_is_generated_artifact_build_output() {
+        assert!(is_generated_artifact("dist/main.js"));
+        assert!(is_generated_artifact("build/output.css"));
+        assert!(is_generated_artifact("target/debug/binary"));
+        assert!(is_generated_artifact(".nyc_output/data.json"));
+    }
+
+    #[test]
+    fn test_is_generated_artifact_not_source() {
+        assert!(!is_generated_artifact("src/main.ts"));
+        assert!(!is_generated_artifact("src/components/Button.tsx"));
+        assert!(!is_generated_artifact("package.json"));
+        assert!(!is_generated_artifact("tsconfig.json"));
     }
 
     // -- sanitize_branch --

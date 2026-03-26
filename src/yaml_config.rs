@@ -21,6 +21,9 @@ pub struct YamlConfig {
     /// Documentation quality configuration (ISO 25000 / MDR compliance)
     #[serde(default)]
     pub documentation: DocumentationYaml,
+    /// Pact/contract testing configuration (opt-in, all disabled by default)
+    #[serde(default)]
+    pub pact: PactYaml,
     /// Files that Claude must never modify during fixes (reverted automatically).
     /// List of exact filenames (matched against the basename, case-insensitive).
     #[serde(default)]
@@ -55,6 +58,8 @@ pub struct GitYaml {
 #[serde(default)]
 pub struct ExecutionYaml {
     pub max_issues: Option<usize>,
+    /// Process issues in reverse severity order: least severe first (default: false)
+    pub reverse_severity: Option<bool>,
     pub dry_run: Option<bool>,
     pub timeout: Option<u64>,
     pub log_format: Option<String>,
@@ -64,8 +69,14 @@ pub struct ExecutionYaml {
     pub min_file_coverage: Option<f64>,
     /// Run formatter and commit before starting fixes (default: true)
     pub format_on_start: Option<bool>,
+    /// Enable coverage boost step (default: true)
+    pub coverage_boost: Option<bool>,
     /// Number of test generation attempts for coverage per issue (default: 3)
     pub coverage_attempts: Option<u32>,
+    /// Enable final validation — run full test suite after all fixes (default: true)
+    pub final_validation: Option<bool>,
+    /// Maximum repair attempts during final validation — all tests must pass (default: 5)
+    pub final_validation_attempts: Option<u32>,
     /// Run deduplication step after fixes (default: true)
     pub dedup_on_completion: Option<bool>,
     /// Maximum deduplication iterations (default: 10)
@@ -125,6 +136,54 @@ pub struct DocumentationYaml {
     /// Required documentation elements per method/function for compliance
     #[serde(default)]
     pub required_elements: Vec<String>,
+}
+
+/// Pact/contract testing configuration.
+/// Controls the contract verification step between coverage check and fix.
+/// All sub-steps are opt-in and disabled by default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PactYaml {
+    /// Master switch — enable pact integration (default: false)
+    pub enabled: Option<bool>,
+    /// Path to pact files directory. Can be absolute or relative to project root.
+    /// Supports external/shared pact directories across projects.
+    pub pact_dir: Option<String>,
+    /// This project's provider name (for provider verification)
+    pub provider_name: Option<String>,
+    /// This project's consumer name (for consumer-driven contracts)
+    pub consumer_name: Option<String>,
+    /// Pact Broker URL for fetching/publishing contracts
+    pub broker_url: Option<String>,
+    /// Pact Broker token for authentication
+    pub broker_token: Option<String>,
+
+    // --- Sub-step toggles (all default false) ---
+
+    /// Check existing contracts before fix (default: false)
+    pub check_contracts: Option<bool>,
+    /// Generate contract tests with Claude if none exist (default: false)
+    pub generate_tests: Option<bool>,
+    /// Run contract verification before applying the fix (default: false)
+    pub verify_before_fix: Option<bool>,
+    /// Run contract verification after fix to ensure no regressions (default: false)
+    pub verify_after_fix: Option<bool>,
+
+    // --- Commands ---
+
+    /// Command to verify pact contracts (e.g., "npm run test:pact:verify")
+    pub verify_command: Option<String>,
+    /// Command specifically for running contract tests (e.g., "npm run test:pact")
+    pub test_command: Option<String>,
+
+    // --- Tuning ---
+
+    /// Retry count for contract test generation (default: 3)
+    pub attempts: Option<u32>,
+    /// File patterns that indicate API interaction (e.g., ["**/api/**", "**/services/**"]).
+    /// If empty, all files are considered candidates when pact is enabled.
+    #[serde(default)]
+    pub api_patterns: Vec<String>,
 }
 
 /// Prompt customization per rule or category (US-019).
@@ -349,6 +408,12 @@ pub fn merge_yaml_into_config(
             config.max_issues = v;
         }
     }
+    // reverse_severity: YAML can enable reverse order (CLI wins if set)
+    if !config.reverse_severity {
+        if let Some(true) = yaml.execution.reverse_severity {
+            config.reverse_severity = true;
+        }
+    }
     if config.log_format == "text" {
         if let Some(ref v) = yaml.execution.log_format {
             config.log_format = v.clone();
@@ -395,10 +460,28 @@ pub fn merge_yaml_into_config(
             config.skip_format = true;
         }
     }
+    // coverage_boost: YAML can disable coverage boost (default: true)
+    if !config.skip_coverage {
+        if let Some(false) = yaml.execution.coverage_boost {
+            config.skip_coverage = true;
+        }
+    }
     // coverage_attempts: only override if CLI is at default (3)
     if config.coverage_attempts == 3 {
         if let Some(v) = yaml.execution.coverage_attempts {
             config.coverage_attempts = v;
+        }
+    }
+    // final_validation: YAML can disable final validation (default: true)
+    if !config.skip_final_validation {
+        if let Some(false) = yaml.execution.final_validation {
+            config.skip_final_validation = true;
+        }
+    }
+    // final_validation_attempts: only override if CLI is at default (5)
+    if config.final_validation_attempts == 5 {
+        if let Some(v) = yaml.execution.final_validation_attempts {
+            config.final_validation_attempts = v;
         }
     }
     // dedup_on_completion: YAML can disable dedup (default: true)
@@ -464,6 +547,24 @@ pub fn merge_yaml_into_config(
             doc.required_elements.clone()
         },
         docs_command: yaml.commands.docs.clone(),
+    };
+    // pact: resolve from YAML (all disabled by default)
+    let pact = &yaml.pact;
+    config.pact = crate::config::PactConfig {
+        enabled: pact.enabled.unwrap_or(false),
+        pact_dir: pact.pact_dir.clone(),
+        provider_name: pact.provider_name.clone(),
+        consumer_name: pact.consumer_name.clone(),
+        broker_url: pact.broker_url.clone(),
+        broker_token: pact.broker_token.clone(),
+        check_contracts: pact.check_contracts.unwrap_or(false),
+        generate_tests: pact.generate_tests.unwrap_or(false),
+        verify_before_fix: pact.verify_before_fix.unwrap_or(false),
+        verify_after_fix: pact.verify_after_fix.unwrap_or(false),
+        verify_command: pact.verify_command.clone(),
+        test_command: pact.test_command.clone(),
+        attempts: pact.attempts.unwrap_or(3),
+        api_patterns: pact.api_patterns.clone(),
     };
 }
 
@@ -803,6 +904,73 @@ commands:
         let prompts = PromptsYaml::default();
         let hint = resolve_prompt_hint(&prompts, "java:S1234", "BUG");
         assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_parse_yaml_with_pact() {
+        let yaml_str = r#"
+sonar:
+  project_id: "test"
+pact:
+  enabled: true
+  pact_dir: "../shared-pacts"
+  provider_name: "UserService"
+  consumer_name: "WebApp"
+  broker_url: "https://broker.example.com"
+  broker_token: "tok123"
+  check_contracts: true
+  generate_tests: true
+  verify_before_fix: true
+  verify_after_fix: true
+  verify_command: "npm run test:pact:verify"
+  test_command: "npm run test:pact"
+  attempts: 5
+  api_patterns:
+    - "**/api/**"
+    - "**/services/**"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(config.pact.enabled, Some(true));
+        assert_eq!(config.pact.pact_dir.as_deref(), Some("../shared-pacts"));
+        assert_eq!(config.pact.provider_name.as_deref(), Some("UserService"));
+        assert_eq!(config.pact.consumer_name.as_deref(), Some("WebApp"));
+        assert_eq!(config.pact.broker_url.as_deref(), Some("https://broker.example.com"));
+        assert_eq!(config.pact.check_contracts, Some(true));
+        assert_eq!(config.pact.generate_tests, Some(true));
+        assert_eq!(config.pact.verify_before_fix, Some(true));
+        assert_eq!(config.pact.verify_after_fix, Some(true));
+        assert_eq!(config.pact.verify_command.as_deref(), Some("npm run test:pact:verify"));
+        assert_eq!(config.pact.test_command.as_deref(), Some("npm run test:pact"));
+        assert_eq!(config.pact.attempts, Some(5));
+        assert_eq!(config.pact.api_patterns.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_yaml_pact_minimal() {
+        let yaml_str = r#"
+pact:
+  enabled: true
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(config.pact.enabled, Some(true));
+        assert!(config.pact.pact_dir.is_none());
+        assert!(config.pact.provider_name.is_none());
+        assert!(config.pact.check_contracts.is_none());
+        assert!(config.pact.generate_tests.is_none());
+        assert!(config.pact.verify_before_fix.is_none());
+        assert!(config.pact.verify_after_fix.is_none());
+        assert!(config.pact.verify_command.is_none());
+        assert!(config.pact.test_command.is_none());
+        assert!(config.pact.attempts.is_none());
+        assert!(config.pact.api_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_pact_empty() {
+        let config: YamlConfig = serde_yaml::from_str("").unwrap();
+        assert!(config.pact.enabled.is_none());
+        assert!(config.pact.pact_dir.is_none());
+        assert!(config.pact.api_patterns.is_empty());
     }
 
     #[test]
