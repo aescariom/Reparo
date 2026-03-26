@@ -53,6 +53,10 @@ pub struct Config {
     #[arg(long, env = "REPARO_MAX_ISSUES", default_value = "0")]
     pub max_issues: usize,
 
+    /// Reverse severity order: process least severe issues first (INFO → BLOCKER)
+    #[arg(long, default_value = "false")]
+    pub reverse_severity: bool,
+
     /// Log format: text or json
     #[arg(long, env = "REPARO_LOG_FORMAT", default_value = "text")]
     pub log_format: String,
@@ -119,6 +123,14 @@ pub struct Config {
     #[arg(long, env = "REPARO_COVERAGE_ATTEMPTS", default_value = "3")]
     pub coverage_attempts: u32,
 
+    /// Skip the final validation step (run full test suite after all fixes)
+    #[arg(long, default_value = "false")]
+    pub skip_final_validation: bool,
+
+    /// Maximum repair attempts during final validation (all tests must pass)
+    #[arg(long, env = "REPARO_FINAL_VALIDATION_ATTEMPTS", default_value = "5")]
+    pub final_validation_attempts: u32,
+
     /// Skip the deduplication step after fixing issues
     #[arg(long, default_value = "false")]
     pub skip_dedup: bool,
@@ -130,6 +142,10 @@ pub struct Config {
     /// Skip the documentation quality step
     #[arg(long, default_value = "false")]
     pub skip_docs: bool,
+
+    /// Skip the pact/contract testing step
+    #[arg(long, default_value = "false")]
+    pub skip_pact: bool,
 
     /// Protected files (populated from YAML, not a CLI flag)
     #[arg(skip)]
@@ -146,6 +162,10 @@ pub struct Config {
     /// Documentation configuration (populated from YAML)
     #[arg(skip)]
     pub documentation: DocumentationConfig,
+
+    /// Pact/contract testing configuration (populated from YAML)
+    #[arg(skip)]
+    pub pact: PactConfig,
 }
 
 /// Validated, ready-to-use configuration.
@@ -165,6 +185,8 @@ pub struct ValidatedConfig {
     pub coverage_command: Option<String>,
     pub dry_run: bool,
     pub max_issues: usize,
+    /// Process issues in reverse severity order (least severe first)
+    pub reverse_severity: bool,
     pub log_format: String,
     pub test_timeout: u64,
     pub skip_scan: bool,
@@ -194,6 +216,10 @@ pub struct ValidatedConfig {
     pub skip_format: bool,
     /// Number of test generation attempts for coverage (per issue)
     pub coverage_attempts: u32,
+    /// Skip the final validation step (full test suite after all fixes)
+    pub skip_final_validation: bool,
+    /// Maximum repair attempts during final validation (all tests must pass)
+    pub final_validation_attempts: u32,
     /// Skip the deduplication step
     pub skip_dedup: bool,
     /// Maximum dedup iterations (0 = unlimited)
@@ -210,6 +236,10 @@ pub struct ValidatedConfig {
     pub skip_docs: bool,
     /// Documentation quality configuration
     pub documentation: DocumentationConfig,
+    /// Skip the pact/contract testing step
+    pub skip_pact: bool,
+    /// Pact/contract testing configuration
+    pub pact: PactConfig,
 }
 
 /// Resolved documentation configuration for runtime use.
@@ -225,6 +255,26 @@ pub struct DocumentationConfig {
     pub max_files: usize,
     pub required_elements: Vec<String>,
     pub docs_command: Option<String>,
+}
+
+/// Resolved pact/contract testing configuration for runtime use.
+/// All sub-steps default to disabled.
+#[derive(Debug, Clone, Default)]
+pub struct PactConfig {
+    pub enabled: bool,
+    pub pact_dir: Option<String>,
+    pub provider_name: Option<String>,
+    pub consumer_name: Option<String>,
+    pub broker_url: Option<String>,
+    pub broker_token: Option<String>,
+    pub check_contracts: bool,
+    pub generate_tests: bool,
+    pub verify_before_fix: bool,
+    pub verify_after_fix: bool,
+    pub verify_command: Option<String>,
+    pub test_command: Option<String>,
+    pub attempts: u32,
+    pub api_patterns: Vec<String>,
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -339,6 +389,7 @@ impl Config {
             coverage_command: self.coverage_command,
             dry_run: self.dry_run,
             max_issues: self.max_issues,
+            reverse_severity: self.reverse_severity,
             log_format: self.log_format,
             test_timeout: self.test_timeout,
             skip_scan: self.skip_scan,
@@ -355,6 +406,8 @@ impl Config {
             skip_coverage: self.skip_coverage,
             skip_format: self.skip_format,
             coverage_attempts: self.coverage_attempts,
+            skip_final_validation: self.skip_final_validation,
+            final_validation_attempts: self.final_validation_attempts,
             skip_dedup: self.skip_dedup,
             max_dedup: self.max_dedup,
             protected_files: self.protected_files,
@@ -362,6 +415,8 @@ impl Config {
             commit_vars: self.commit_vars,
             skip_docs: self.skip_docs,
             documentation: DocumentationConfig::default(),
+            skip_pact: self.skip_pact,
+            pact: self.pact,
         };
 
         validated.print_summary();
@@ -607,6 +662,7 @@ mod tests {
             coverage_command: None,
             dry_run: false,
             max_issues: 0,
+            reverse_severity: false,
             log_format: "text".to_string(),
             test_timeout: 600,
             skip_scan: true, // skip scan in tests (no scanner binary)
@@ -623,6 +679,8 @@ mod tests {
             skip_coverage: false,
             skip_format: false,
             coverage_attempts: 3,
+            skip_final_validation: false,
+            final_validation_attempts: 5,
             skip_dedup: false,
             max_dedup: 10,
             protected_files: vec![],
@@ -630,6 +688,8 @@ mod tests {
             commit_vars: std::collections::HashMap::new(),
             skip_docs: false,
             documentation: DocumentationConfig::default(),
+            skip_pact: false,
+            pact: PactConfig::default(),
         }
     }
 

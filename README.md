@@ -50,7 +50,7 @@ cargo build --release
 3. Pre-flight checks:
    a. Build must pass
    b. Tests must pass
-   c. Coverage boost (if below --min-coverage threshold):
+   c. Coverage boost (unless --skip-coverage):
       - Run coverage command and parse lcov report
       - Sort files by coverage ascending (least covered first)
       - For each file: generate tests → verify only test files created → run tests → commit
@@ -61,10 +61,14 @@ cargo build --release
    b. Skip non-coverable files (CSS/SCSS/HTML — no unit test coverage possible)
    c. Check line-level test coverage for affected code
    d. Generate unit tests if coverage < 100% (up to N retries)
-   e. Clean → Fix via claude -d → Format → Build (with retry) → Test (with retry) → Lint (with auto-fix)
-   f. If Claude modifies test files: auto-revert test changes, keep source fix if tests still pass
-   g. Re-scan with SonarQube to verify the specific issue is resolved (up to N retries)
-   h. Commit if verified, revert if not
+   e. Contract/pact testing (unless --skip-pact):
+      - Check if file involves API contracts
+      - Generate contract tests if needed
+      - Verify pact contracts before/after fix
+   f. Clean → Fix via claude -d → Format → Build (with retry) → Test (with retry) → Lint (with auto-fix)
+   g. If Claude modifies test files: auto-revert test changes, keep source fix if tests still pass
+   h. Re-scan with SonarQube to verify the specific issue is resolved (up to N retries)
+   i. Commit if verified, revert if not
 6. Deduplication (unless --skip-dedup):
    a. Fetch files with duplicated code from SonarQube (most duplicated first)
    b. Ensure 100% test coverage of duplicated ranges
@@ -72,8 +76,16 @@ cargo build --release
    d. Verify build + tests pass, no test files modified
    e. Re-scan with SonarQube to verify duplication is reduced
    f. Commit if verified, revert if not
-7. Create PR (unless --no-pr)
-8. Generate REPORT.md, TECHDEBT_CHANGELOG.md (committed on the fix branch)
+7. Final validation (unless --skip-final-validation):
+   a. Run the FULL test suite (all tests, not just per-issue)
+   b. If any test fails, ask Claude to fix source code (never test files)
+   c. Iterate up to final_validation_attempts times (default: 5)
+   d. Only accept when ALL tests pass in a single execution
+8. Documentation quality (if documentation.enabled):
+   a. Check code documentation against quality standards
+   b. Generate or improve documentation as needed
+9. Create PR (unless --no-pr)
+10. Generate REPORT.md, TECHDEBT_CHANGELOG.md (committed on the fix branch)
 ```
 
 ## Configuration
@@ -92,13 +104,12 @@ OPTIONS:
   --coverage-command <CMD>         Coverage command (auto-detected if omitted)
   --dry-run                        Analyze without fixing
   --max-issues <N>                 Max issues to process (0 = all) [default: 0]
+  --reverse-severity               Process least severe issues first (INFO → BLOCKER)
   --min-coverage <PCT>             Minimum project-wide test coverage before fixing [default: 80]
   --min-file-coverage <PCT>        Minimum per-file test coverage [default: 0]
-  --skip-coverage                  Skip the coverage boost step entirely
-  --skip-format                    Skip the initial format-and-commit step
-  --skip-dedup                     Skip the deduplication step after fixes
+  --coverage-attempts <N>          Test generation / fix retry attempts per issue [default: 3]
+  --final-validation-attempts <N>  Max repair attempts for final full-suite validation [default: 5]
   --max-dedup <N>                  Max deduplication iterations (0 = unlimited) [default: 10]
-  --coverage-attempts <N>          Test generation / fix retry attempts [default: 3]
   --no-pr                          Skip creating a pull request after fixes
   --dangerously-skip-permissions   Pass --dangerously-skip-permissions to Claude CLI
   --show-prompts                   Print prompts sent to Claude (for debugging)
@@ -110,6 +121,14 @@ OPTIONS:
   --scanner-path <PATH>            Scanner binary path (auto-detected)
   --config <PATH>                  YAML config file path
   --resume                         Resume a previously interrupted execution
+
+STEP FLAGS (each step can be enabled/disabled independently):
+  --skip-format                    Skip the initial format-and-commit step
+  --skip-coverage                  Skip the coverage boost step
+  --skip-pact                      Skip the pact/contract testing step
+  --skip-dedup                     Skip the deduplication step after fixes
+  --skip-final-validation          Skip the final full test suite validation
+  --skip-docs                      Skip the documentation quality step
 ```
 
 ### Environment Variables
@@ -136,6 +155,7 @@ All parameters can be set via environment variables:
 | `REPARO_SCANNER_PATH` | `--scanner-path` |
 | `REPARO_NO_PR` | `--no-pr` |
 | `REPARO_COVERAGE_ATTEMPTS` | `--coverage-attempts` |
+| `REPARO_FINAL_VALIDATION_ATTEMPTS` | `--final-validation-attempts` |
 | `REPARO_MAX_DEDUP` | `--max-dedup` |
 
 ### YAML Configuration (`reparo.yaml`)
@@ -153,18 +173,46 @@ sonar:
 git:
   branch: "develop"
   batch_size: 5
+  commit_format: "{type}({scope}): {message}"  # commit message template
+  commit_vars:                                   # custom variables for commit format
+    team: "platform"
 
 execution:
   max_issues: 20
-  min_coverage: 80          # project-wide % test coverage before fixing (0 = disabled)
-  min_file_coverage: 50     # per-file % — boost files individually below this (0 = disabled)
-  format_on_start: true     # run formatter and commit before fixes (default: true)
-  dedup_on_completion: true  # refactor duplicated code after fixes (default: true)
-  max_dedup: 10             # max dedup iterations (0 = unlimited, default: 10)
-  coverage_attempts: 3      # test gen / fix retry attempts per issue (default: 3)
-  timeout: 3600             # global timeout in seconds
-  test_timeout: 600         # per-test-run timeout
-  claude_timeout: 600       # per Claude call timeout
+  reverse_severity: false       # true = process least severe first (default: false)
+  min_coverage: 80              # project-wide % test coverage before fixing (0 = disabled)
+  min_file_coverage: 50         # per-file % — boost files individually below this (0 = disabled)
+  timeout: 3600                 # global timeout in seconds
+  test_timeout: 600             # per-test-run timeout
+  claude_timeout: 600           # per Claude call timeout
+  # Step switches (each step can be enabled/disabled independently)
+  format_on_start: true         # run formatter and commit before fixes (default: true)
+  coverage_boost: true          # run coverage boost step (default: true)
+  coverage_attempts: 3          # test gen / fix retry attempts per issue (default: 3)
+  final_validation: true        # run full test suite after all fixes (default: true)
+  final_validation_attempts: 5  # max repair attempts for final validation (default: 5)
+  dedup_on_completion: true     # refactor duplicated code after fixes (default: true)
+  max_dedup: 10                 # max dedup iterations (0 = unlimited, default: 10)
+
+# Contract/pact testing (default: all disabled)
+pact:
+  enabled: false                # master switch for pact testing
+  pact_dir: "./pacts"           # path to pact files (can be shared across projects)
+  broker_url: "${PACT_BROKER_URL}"    # pact broker URL (optional)
+  broker_token: "${PACT_BROKER_TOKEN}" # pact broker token (optional)
+  check_contracts: false        # check if file involves API contracts
+  generate_tests: false         # generate contract tests for API files
+  verify_before_fix: false      # verify contracts pass before applying fix
+  verify_after_fix: false       # verify contracts still pass after fix
+
+# Documentation quality (default: disabled)
+documentation:
+  enabled: false                # enable documentation quality checks
+
+# Protected files — Claude will never modify these (matched by basename)
+protected_files:
+  - "package-lock.json"
+  - "yarn.lock"
 
 # Project commands — executed directly, no LLM involved
 commands:
@@ -176,6 +224,20 @@ commands:
   format: "npx prettier --write ."
   lint: "npx eslint src --max-warnings=0"
 ```
+
+### Step Enable/Disable Reference
+
+Every optional step can be controlled via CLI flags and/or YAML. CLI flags always take priority over YAML.
+
+| Step | CLI flag | YAML field | Default |
+|------|----------|------------|---------|
+| Initial formatting | `--skip-format` | `execution.format_on_start: false` | enabled |
+| Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled |
+| Contract/pact testing | `--skip-pact` | `pact.enabled: true` | disabled |
+| Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled |
+| Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled |
+| Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled |
+| PR creation | `--no-pr` | — | enabled |
 
 **Command execution order** after each fix:
 
@@ -197,6 +259,13 @@ execution:
   max_issues: 10
   min_coverage: 60
   claude_timeout: 600
+  final_validation: true
+  final_validation_attempts: 5
+
+pact:
+  enabled: true
+  pact_dir: "/shared/pacts/my-angular-app"
+  verify_after_fix: true
 
 commands:
   setup: "npm install"
@@ -302,6 +371,72 @@ In YAML:
 execution:
   min_coverage: 60          # project-wide threshold (0 = disabled)
   min_file_coverage: 50     # per-file threshold (0 = disabled)
+```
+
+## Contract/Pact Testing
+
+Reparo can verify API contracts (pacts) during the fix process, ensuring that fixes don't break API integrations between services. This is disabled by default and must be explicitly enabled.
+
+**How it works:**
+
+1. Before/after each fix, Reparo checks if the affected file involves API contracts
+2. If the file is API-related, contract tests are generated or verified against existing pacts
+3. Pact verification must pass for the fix to be accepted
+
+**Key features:**
+
+- **Shared pact directory**: The `pact_dir` can point to a path outside the project (e.g., `/shared/pacts/`), allowing multiple projects to share the same contract definitions
+- **Granular sub-steps**: Each phase (check, generate, verify before, verify after) can be enabled independently
+- **Broker support**: Optional pact broker integration for centralized contract management
+
+**Configuration:**
+
+```yaml
+pact:
+  enabled: true
+  pact_dir: "/shared/pacts/my-service"   # can be outside the project
+  broker_url: "${PACT_BROKER_URL}"
+  broker_token: "${PACT_BROKER_TOKEN}"
+  check_contracts: true       # detect API-related files
+  generate_tests: true        # generate contract tests
+  verify_before_fix: true     # contracts must pass before fix
+  verify_after_fix: true      # contracts must still pass after fix
+```
+
+Or disable entirely via CLI:
+
+```bash
+reparo --path ./my-project --config ./reparo.yaml --skip-pact
+```
+
+## Final Validation
+
+After all individual fixes are applied, Reparo runs a final validation step that executes the **full test suite** in a single run. Individual per-issue tests passing is not sufficient — this step ensures no cross-issue regressions exist.
+
+**How it works:**
+
+1. Run the entire test suite (not per-issue — all tests at once)
+2. If any test fails, ask Claude to fix the source code (never test files)
+3. Iterate up to `final_validation_attempts` times (default: 5)
+4. Only accept the batch when **all tests pass in a single execution**
+5. Commit any accumulated repair fixes together
+
+**Configuration:**
+
+```yaml
+execution:
+  final_validation: true        # enable/disable (default: true)
+  final_validation_attempts: 5  # max repair iterations (default: 5)
+```
+
+Or via CLI:
+
+```bash
+# Skip final validation
+reparo --path ./my-project --config ./reparo.yaml --skip-final-validation
+
+# Increase repair attempts
+reparo --path ./my-project --config ./reparo.yaml --final-validation-attempts 10
 ```
 
 ## Self-Healing Fixes
@@ -430,11 +565,12 @@ src/
   main.rs           Entry point, timeout handling, exit codes
   config.rs         CLI parsing, validation, scanner detection
   yaml_config.rs    YAML config loading, env interpolation, merging
-  orchestrator.rs   Main workflow loop: format → coverage boost → fix loop → dedup
+  orchestrator.rs   Main workflow loop: format → coverage → pact → fix → dedup → final validation
   sonar.rs          SonarQube API client (issues, coverage, duplications, rules, scanner, edition)
   claude.rs         Claude CLI integration, prompt builders (fix, test gen, dedup, build/lint repair)
   git.rs            Git operations, PR creation via gh
   runner.rs         Test/build/lint/coverage execution, lcov parsing, framework detection
+  pact.rs           Pact/contract testing: API detection, contract test generation, verification
   report.rs         REPORT.md, TECHDEBT_CHANGELOG.md, REVIEW_NEEDED.md
   retry.rs          Retry with exponential backoff for network/CLI calls
   state.rs          Execution state persistence for --resume support

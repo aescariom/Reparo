@@ -7,6 +7,10 @@ use tracing::{info, warn};
 /// Default per-call timeout for Claude in seconds (US-015).
 pub const DEFAULT_CLAUDE_TIMEOUT: u64 = 300;
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+}
+
 /// Model and effort tier for a Claude invocation.
 #[derive(Debug, Clone)]
 pub struct ClaudeTier {
@@ -159,6 +163,17 @@ pub fn classify_repair_tier() -> ClaudeTier {
     ClaudeTier::with_timeout("sonnet", "medium", 0.5)
 }
 
+/// Classify contract test generation difficulty for tier selection.
+pub fn classify_contract_test_tier(api_interaction_count: usize) -> ClaudeTier {
+    if api_interaction_count > 10 {
+        ClaudeTier::with_timeout("sonnet", "high", 1.5)
+    } else if api_interaction_count > 5 {
+        ClaudeTier::with_timeout("sonnet", "high", 1.0)
+    } else {
+        ClaudeTier::with_timeout("sonnet", "medium", 0.7)
+    }
+}
+
 /// Parse cognitive complexity value from SonarQube message.
 /// Example: "Refactor this function to reduce its Cognitive Complexity from 45 to the 15 allowed."
 fn parse_complexity_from_message(message: &str) -> Option<u32> {
@@ -225,6 +240,19 @@ pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64
                 if !stderr.is_empty() {
                     warn!("claude stderr: {}", stderr);
                 }
+                // If Claude failed very quickly (< 10s), it's likely a CLI error, not a legitimate run
+                if elapsed < 10 {
+                    let error_detail = if !stderr.is_empty() {
+                        stderr.clone()
+                    } else if !stdout.is_empty() {
+                        truncate_str(&stdout, 500)
+                    } else {
+                        format!("exit status: {} (no output)", output.status)
+                    };
+                    anyhow::bail!("Claude CLI failed immediately ({}s): {}", elapsed, error_detail);
+                }
+                // Longer runs that exit non-zero may have done partial work — return stdout
+                warn!("Claude exited non-zero after {}s — checking for changes anyway", elapsed);
             } else {
                 info!("claude completed in {}s", elapsed);
             }
@@ -369,6 +397,98 @@ pub fn build_test_generation_retry_prompt(
 7. Make sure all tests (old and new) pass
 
 Write the additional tests now."#
+    )
+}
+
+/// Build a prompt for generating pact/contract tests.
+pub fn build_contract_test_prompt(
+    source_file: &str,
+    source_content: &str,
+    provider_name: &str,
+    consumer_name: &str,
+    pact_framework: &str,
+    existing_contract_examples: &str,
+    existing_pact_files: &str,
+) -> String {
+    format!(
+        r#"I need you to generate pact/contract tests for the following source file
+that interacts with APIs.
+
+## Source file: `{source_file}`
+```
+{source_content}
+```
+
+## Provider: {provider_name}
+## Consumer: {consumer_name}
+## Pact framework: {pact_framework}
+
+## Existing contract test examples in this project:
+{existing_contract_examples}
+
+## Existing pact contract files:
+{existing_pact_files}
+
+## CRITICAL RULES:
+1. Do NOT modify any existing source code or test files — only CREATE new contract test files
+2. Place new files alongside existing test files, following project conventions
+3. Use the {pact_framework} framework, following existing patterns shown above
+
+## Instructions:
+1. Identify all API interactions (HTTP calls, message queues, gRPC) in this file
+2. For each interaction, create a pact test that defines the expected contract
+3. Define provider states that match realistic scenarios
+4. Test both successful responses and key error scenarios (4xx, 5xx)
+5. Include proper type definitions for request/response bodies
+6. Ensure all contract tests pass independently
+
+Write the contract tests now."#
+    )
+}
+
+/// Build a retry prompt for contract test generation.
+pub fn build_contract_test_retry_prompt(
+    source_file: &str,
+    source_content: &str,
+    provider_name: &str,
+    consumer_name: &str,
+    pact_framework: &str,
+    existing_contract_examples: &str,
+    attempt: u32,
+    previous_output: &str,
+) -> String {
+    format!(
+        r#"The previous contract test generation attempt ({attempt}) failed verification.
+Please fix the issues.
+
+## Source file: `{source_file}`
+```
+{source_content}
+```
+
+## Provider: {provider_name}
+## Consumer: {consumer_name}
+## Pact framework: {pact_framework}
+
+## Existing contract test examples:
+{existing_contract_examples}
+
+## Output from the previous attempt:
+```
+{previous_output}
+```
+
+## CRITICAL RULES:
+1. Do NOT modify existing source code or test files
+2. Fix only the contract tests that were generated in the previous attempt
+
+## Instructions:
+1. Analyze the error output to understand what went wrong
+2. Fix the contract tests — ensure request/response bodies match the actual API schema
+3. Verify provider states are correctly defined
+4. Make sure all contract tests pass
+
+Fix the contract tests now."#
     )
 }
 
@@ -636,5 +756,56 @@ mod tests {
         assert!(prompt.contains("src/service.py"));
         assert!(prompt.contains("obj = None"));
         assert!(prompt.contains("NEVER modify test files"));
+    }
+
+    #[test]
+    fn test_build_contract_test_prompt_contains_context() {
+        let prompt = build_contract_test_prompt(
+            "src/api/users.ts",
+            "fetch('/api/users')",
+            "UserService",
+            "WebApp",
+            "pact-js",
+            "// existing pact test example",
+            "// existing pact file",
+        );
+        assert!(prompt.contains("src/api/users.ts"));
+        assert!(prompt.contains("UserService"));
+        assert!(prompt.contains("WebApp"));
+        assert!(prompt.contains("pact-js"));
+        assert!(prompt.contains("existing pact test example"));
+        assert!(prompt.contains("existing pact file"));
+        assert!(prompt.contains("Do NOT modify"));
+    }
+
+    #[test]
+    fn test_build_contract_test_retry_prompt_contains_attempt() {
+        let prompt = build_contract_test_retry_prompt(
+            "src/api/users.ts",
+            "fetch('/api/users')",
+            "UserService",
+            "WebApp",
+            "pact-js",
+            "",
+            2,
+            "Error: expected 200 got 404",
+        );
+        assert!(prompt.contains("(2)"));
+        assert!(prompt.contains("Error: expected 200 got 404"));
+        assert!(prompt.contains("Do NOT modify"));
+    }
+
+    #[test]
+    fn test_classify_contract_test_tier() {
+        let small = classify_contract_test_tier(3);
+        assert_eq!(small.model, "sonnet");
+        assert_eq!(small.effort, "medium");
+
+        let medium = classify_contract_test_tier(7);
+        assert_eq!(medium.effort, "high");
+
+        let large = classify_contract_test_tier(15);
+        assert_eq!(large.effort, "high");
+        assert!(large.timeout_multiplier > medium.timeout_multiplier);
     }
 }

@@ -4,6 +4,8 @@ mod config;
 #[allow(dead_code)]
 mod git;
 mod orchestrator;
+#[allow(dead_code)]
+mod pact;
 mod report;
 mod retry;
 #[allow(dead_code)]
