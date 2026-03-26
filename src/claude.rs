@@ -7,6 +7,64 @@ use tracing::{info, warn};
 /// Default per-call timeout for Claude in seconds (US-015).
 pub const DEFAULT_CLAUDE_TIMEOUT: u64 = 300;
 
+/// Shared robustness guidelines injected into every test-generation prompt.
+/// Ensures generated tests are self-contained, deterministic, and safe for
+/// parallel execution regardless of the project language or framework.
+const TEST_ROBUSTNESS_GUIDELINES: &str = r#"
+## Test Robustness — MANDATORY RULES
+Every test you generate MUST follow these rules. Tests that violate them will be
+rejected automatically.
+
+### 1. Full isolation — no shared mutable state
+- Each test MUST set up its own data and tear it down (or use framework
+  before/after hooks scoped to the single test, NOT the suite).
+- NEVER rely on database rows, files, caches, or environment variables left by
+  another test or by a previous run.
+- Use unique identifiers per test (e.g. UUID, timestamp suffix, or the test
+  name itself) for any resource that is created: DB records, temp files, queue
+  messages, API keys, usernames, etc.
+
+### 2. No dependency on external services or live data
+- Mock, stub, or fake ALL external I/O: HTTP APIs, databases, message brokers,
+  file systems outside a temp directory, mail servers, etc.
+- Use the project's existing mock/stub utilities and patterns when available.
+- If a database is truly required (integration test), use an in-memory or
+  ephemeral instance (e.g. SQLite :memory:, testcontainers, pg_tmp) and
+  populate it inside the test.
+
+### 3. Deterministic and repeatable
+- No dependency on wall-clock time (`Date.now()`, `time.time()`, etc.) —
+  freeze or inject time when the code under test uses it.
+- No randomness unless seeded. If the code under test uses randomness, seed it
+  or mock the RNG.
+- Fixed locale/timezone where formatting matters.
+
+### 4. Parallel-safe — no port or resource collisions
+- NEVER hard-code ports, file paths, or global singleton names that could
+  collide with another concurrent test run.
+- If a server is needed, bind to port 0 (OS-assigned) or use a unique temp
+  directory.
+
+### 5. Fast and focused
+- Each test should run in < 2 seconds unless it is explicitly an integration
+  test.
+- Prefer testing one behaviour per test function.
+- Avoid `sleep` / `setTimeout` unless testing real async behaviour, and keep
+  durations minimal.
+
+### 6. Clean assertions and failure messages
+- Use the framework's built-in matchers (expect().toBe, assert_eq!, assertEqual)
+  rather than raw `if` + `throw`.
+- Include a descriptive message or context so a failure is diagnosable without
+  reading the full test body.
+
+### 7. No test pollution
+- Restore any global state you touch (env vars, singletons, monkey-patches) in
+  an after/teardown hook.
+- Do NOT write to the working directory — use `os.tmpdir()`, `tempfile`, or
+  the framework's temp support.
+"#;
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
 }
@@ -340,7 +398,7 @@ pub fn build_test_generation_prompt(
 
 ## Examples of existing tests in this project:
 {existing_test_examples}
-
+{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Write unit tests that cover ALL the specified uncovered lines
 2. Follow the same style, conventions, and patterns as the existing tests
@@ -387,6 +445,7 @@ pub fn build_test_generation_retry_prompt(
 {previous_test_output}
 ```
 
+{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Analyze WHY the above lines are still uncovered — they likely require specific inputs, edge cases, or branch conditions
 2. Write ADDITIONAL unit tests that specifically target these uncovered lines
@@ -434,6 +493,7 @@ that interacts with APIs.
 2. Place new files alongside existing test files, following project conventions
 3. Use the {pact_framework} framework, following existing patterns shown above
 
+{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Identify all API interactions (HTTP calls, message queues, gRPC) in this file
 2. For each interaction, create a pact test that defines the expected contract
@@ -482,6 +542,7 @@ Please fix the issues.
 1. Do NOT modify existing source code or test files
 2. Fix only the contract tests that were generated in the previous attempt
 
+{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Analyze the error output to understand what went wrong
 2. Fix the contract tests — ensure request/response bodies match the actual API schema

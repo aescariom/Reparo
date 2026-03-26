@@ -123,6 +123,14 @@ pub struct Config {
     #[arg(long, env = "REPARO_COVERAGE_ATTEMPTS", default_value = "3")]
     pub coverage_attempts: u32,
 
+    /// Maximum coverage rounds per file during boost (0 = unlimited while improving)
+    #[arg(long, env = "REPARO_COVERAGE_ROUNDS", default_value = "3")]
+    pub coverage_rounds: u32,
+
+    /// Maximum file size (total lines) for coverage boost (0 = no limit) [default: 500]
+    #[arg(long, env = "REPARO_MAX_BOOST_FILE_LINES", default_value = "500")]
+    pub max_boost_file_lines: usize,
+
     /// Skip the final validation step (run full test suite after all fixes)
     #[arg(long, default_value = "false")]
     pub skip_final_validation: bool,
@@ -146,6 +154,10 @@ pub struct Config {
     /// Skip the pact/contract testing step
     #[arg(long, default_value = "false")]
     pub skip_pact: bool,
+
+    /// Glob patterns to exclude from coverage boost (populated from YAML)
+    #[arg(skip)]
+    pub coverage_exclude: Vec<String>,
 
     /// Protected files (populated from YAML, not a CLI flag)
     #[arg(skip)]
@@ -216,6 +228,12 @@ pub struct ValidatedConfig {
     pub skip_format: bool,
     /// Number of test generation attempts for coverage (per issue)
     pub coverage_attempts: u32,
+    /// Maximum coverage rounds per file during boost (0 = unlimited while improving)
+    pub coverage_rounds: u32,
+    /// Maximum file size (total lines) for coverage boost (0 = no limit, default: 500)
+    pub max_boost_file_lines: usize,
+    /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
+    pub coverage_exclude: Vec<String>,
     /// Skip the final validation step (full test suite after all fixes)
     pub skip_final_validation: bool,
     /// Maximum repair attempts during final validation (all tests must pass)
@@ -275,6 +293,61 @@ pub struct PactConfig {
     pub test_command: Option<String>,
     pub attempts: u32,
     pub api_patterns: Vec<String>,
+}
+
+impl PactConfig {
+    /// Validate pact configuration and return warnings for potential misconfigurations.
+    ///
+    /// Called at startup to alert the user about missing commands or incomplete setup
+    /// before processing any issues.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.enabled {
+            return warnings;
+        }
+
+        // Verify command required when any verification step is enabled
+        if (self.check_contracts || self.verify_before_fix || self.verify_after_fix)
+            && self.verify_command.as_ref().map_or(true, |c| c.trim().is_empty())
+        {
+            warnings.push(
+                "Pact verification steps enabled but 'verify_command' is not set — \
+                 verification will be skipped"
+                    .into(),
+            );
+        }
+
+        // Test command strongly recommended when generating tests
+        if self.generate_tests
+            && self.test_command.as_ref().map_or(true, |c| c.trim().is_empty())
+        {
+            warnings.push(
+                "Pact test generation enabled but 'test_command' is not set — \
+                 generated tests won't be validated"
+                    .into(),
+            );
+        }
+
+        // Provider/consumer names improve prompt quality
+        if self.provider_name.is_none() || self.consumer_name.is_none() {
+            warnings.push(
+                "Pact provider_name/consumer_name not set — \
+                 using generic defaults in prompts"
+                    .into(),
+            );
+        }
+
+        // Broker fields are parsed but not yet used
+        if self.broker_url.is_some() || self.broker_token.is_some() {
+            warnings.push(
+                "Pact broker_url/broker_token are configured but not yet supported — \
+                 they will be ignored"
+                    .into(),
+            );
+        }
+
+        warnings
+    }
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -406,6 +479,9 @@ impl Config {
             skip_coverage: self.skip_coverage,
             skip_format: self.skip_format,
             coverage_attempts: self.coverage_attempts,
+            coverage_rounds: self.coverage_rounds,
+            max_boost_file_lines: self.max_boost_file_lines,
+            coverage_exclude: self.coverage_exclude.clone(),
             skip_final_validation: self.skip_final_validation,
             final_validation_attempts: self.final_validation_attempts,
             skip_dedup: self.skip_dedup,
@@ -679,6 +755,9 @@ mod tests {
             skip_coverage: false,
             skip_format: false,
             coverage_attempts: 3,
+            coverage_rounds: 3,
+            max_boost_file_lines: 500,
+            coverage_exclude: vec![],
             skip_final_validation: false,
             final_validation_attempts: 5,
             skip_dedup: false,

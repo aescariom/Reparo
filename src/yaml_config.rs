@@ -73,6 +73,13 @@ pub struct ExecutionYaml {
     pub coverage_boost: Option<bool>,
     /// Number of test generation attempts for coverage per issue (default: 3)
     pub coverage_attempts: Option<u32>,
+    /// Maximum coverage rounds per file during boost (default: 3, 0 = unlimited while improving)
+    pub coverage_rounds: Option<u32>,
+    /// Maximum file size (total lines) for coverage boost (default: 500, 0 = no limit)
+    pub max_boost_file_lines: Option<usize>,
+    /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
+    #[serde(default)]
+    pub coverage_exclude: Vec<String>,
     /// Enable final validation — run full test suite after all fixes (default: true)
     pub final_validation: Option<bool>,
     /// Maximum repair attempts during final validation — all tests must pass (default: 5)
@@ -471,6 +478,22 @@ pub fn merge_yaml_into_config(
         if let Some(v) = yaml.execution.coverage_attempts {
             config.coverage_attempts = v;
         }
+    }
+    // coverage_rounds: only override if CLI is at default (3)
+    if config.coverage_rounds == 3 {
+        if let Some(v) = yaml.execution.coverage_rounds {
+            config.coverage_rounds = v;
+        }
+    }
+    // max_boost_file_lines: only override if CLI is at default (500)
+    if config.max_boost_file_lines == 500 {
+        if let Some(v) = yaml.execution.max_boost_file_lines {
+            config.max_boost_file_lines = v;
+        }
+    }
+    // coverage_exclude: YAML provides glob patterns (no CLI equivalent)
+    if config.coverage_exclude.is_empty() && !yaml.execution.coverage_exclude.is_empty() {
+        config.coverage_exclude = yaml.execution.coverage_exclude.clone();
     }
     // final_validation: YAML can disable final validation (default: true)
     if !config.skip_final_validation {

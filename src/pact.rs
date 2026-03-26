@@ -73,13 +73,17 @@ pub fn verify_contracts(
     cmd.current_dir(project_path)
         .args(["-c", verify_command]);
 
-    // Set PACT_DIR env var for external pact directories
+    // Set PACT_DIR env var for external pact directories, creating if needed
     if let Some(dir) = pact_dir {
         let resolved = if Path::new(dir).is_absolute() {
             std::path::PathBuf::from(dir)
         } else {
             project_path.join(dir)
         };
+        if !resolved.exists() {
+            std::fs::create_dir_all(&resolved)?;
+            info!("Created pact directory: {}", resolved.display());
+        }
         cmd.env("PACT_DIR", &resolved);
         info!("PACT_DIR set to {}", resolved.display());
     }
@@ -257,6 +261,14 @@ pub fn find_existing_pact_files(project_path: &Path, pact_dir: Option<&str>) -> 
     };
 
     if !search_dir.is_dir() {
+        // Auto-create when explicitly configured via pact_dir
+        if pact_dir.is_some() {
+            if let Err(e) = std::fs::create_dir_all(&search_dir) {
+                warn!("Could not create pact directory {}: {}", search_dir.display(), e);
+            } else {
+                info!("Created pact directory: {}", search_dir.display());
+            }
+        }
         return Vec::new();
     }
 
@@ -277,6 +289,197 @@ pub fn find_existing_pact_files(project_path: &Path, pact_dir: Option<&str>) -> 
         }
     }
     files
+}
+
+/// Detected project role in a consumer-driven contract testing context.
+#[derive(Debug, PartialEq)]
+pub enum ProjectRole {
+    /// Backend/API server — provides endpoints.
+    Provider,
+    /// Frontend/API client — consumes endpoints.
+    Consumer,
+    /// Full-stack project with both provider and consumer signals.
+    Both,
+    /// Could not determine the role.
+    Unknown,
+}
+
+/// Detect whether a project is a provider (backend), consumer (frontend), or both.
+///
+/// Inspects dependency files and directory structures for framework signals.
+/// Used to improve Claude prompt quality when provider_name/consumer_name are not configured.
+pub fn detect_project_role(project_path: &Path) -> ProjectRole {
+    let mut provider_signals = 0;
+    let mut consumer_signals = 0;
+
+    // Check package.json for JS/TS frameworks
+    let pkg_json = project_path.join("package.json");
+    if pkg_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+            // Provider signals: Express, Fastify, NestJS, Koa, Hapi
+            if content.contains("\"express\"")
+                || content.contains("\"fastify\"")
+                || content.contains("\"@nestjs/")
+                || content.contains("\"koa\"")
+                || content.contains("\"@hapi/")
+            {
+                provider_signals += 1;
+            }
+            // Consumer signals: React, Angular, Vue, Next.js, axios, fetch wrappers
+            if content.contains("\"react\"")
+                || content.contains("\"@angular/")
+                || content.contains("\"vue\"")
+                || content.contains("\"next\"")
+                || content.contains("\"axios\"")
+                || content.contains("\"@tanstack/react-query\"")
+            {
+                consumer_signals += 1;
+            }
+        }
+    }
+
+    // Check for Python backend frameworks
+    for dep_file in &["requirements.txt", "pyproject.toml", "setup.py", "Pipfile"] {
+        let path = project_path.join(dep_file);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.contains("django")
+                    || content.contains("flask")
+                    || content.contains("fastapi")
+                    || content.contains("starlette")
+                {
+                    provider_signals += 1;
+                }
+                if content.contains("requests")
+                    || content.contains("httpx")
+                    || content.contains("aiohttp")
+                {
+                    consumer_signals += 1;
+                }
+            }
+        }
+    }
+
+    // Check pom.xml / build.gradle for JVM frameworks
+    let pom = project_path.join("pom.xml");
+    if pom.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pom) {
+            if content.contains("spring-boot")
+                || content.contains("javax.ws.rs")
+                || content.contains("jakarta.ws.rs")
+            {
+                provider_signals += 1;
+            }
+            if content.contains("spring-cloud-openfeign")
+                || content.contains("retrofit")
+                || content.contains("okhttp")
+            {
+                consumer_signals += 1;
+            }
+        }
+    }
+
+    for gradle_file in &["build.gradle", "build.gradle.kts"] {
+        let gradle = project_path.join(gradle_file);
+        if gradle.exists() {
+            if let Ok(content) = std::fs::read_to_string(&gradle) {
+                if content.contains("spring-boot") || content.contains("ktor-server") {
+                    provider_signals += 1;
+                }
+                if content.contains("retrofit") || content.contains("ktor-client") {
+                    consumer_signals += 1;
+                }
+            }
+        }
+    }
+
+    // Check Go modules
+    let gomod = project_path.join("go.mod");
+    if gomod.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gomod) {
+            if content.contains("gin-gonic") || content.contains("gorilla/mux") || content.contains("go-chi") {
+                provider_signals += 1;
+            }
+        }
+    }
+
+    // Check Cargo.toml for Rust frameworks
+    let cargo = project_path.join("Cargo.toml");
+    if cargo.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cargo) {
+            if content.contains("actix-web") || content.contains("axum") || content.contains("rocket") {
+                provider_signals += 1;
+            }
+            if content.contains("reqwest") {
+                consumer_signals += 1;
+            }
+        }
+    }
+
+    match (provider_signals > 0, consumer_signals > 0) {
+        (true, true) => ProjectRole::Both,
+        (true, false) => ProjectRole::Provider,
+        (false, true) => ProjectRole::Consumer,
+        (false, false) => ProjectRole::Unknown,
+    }
+}
+
+/// Extended framework detection result with installation status.
+#[derive(Debug)]
+pub struct PactFrameworkInfo {
+    /// Framework name (e.g., "pact-js (@pact-foundation/pact)")
+    pub name: String,
+    /// Whether the framework appears to be installed (not just declared)
+    pub installed: bool,
+    /// Hint command to install the framework if not installed
+    pub install_hint: String,
+}
+
+/// Detect pact framework and check if it's actually installed.
+///
+/// Goes beyond `detect_pact_framework()` by verifying that dependencies
+/// are resolved (e.g., node_modules exists for JS projects).
+pub fn detect_pact_framework_info(project_path: &Path) -> PactFrameworkInfo {
+    let name = detect_pact_framework(project_path);
+
+    let (installed, install_hint) = match name.as_str() {
+        n if n.contains("pact-js") => {
+            let installed = project_path
+                .join("node_modules/@pact-foundation/pact")
+                .exists();
+            (
+                installed,
+                "npm install @pact-foundation/pact --save-dev".to_string(),
+            )
+        }
+        n if n.contains("pact-python") => {
+            // Check common venv/site-packages locations
+            let venv_check = project_path.join(".venv").exists()
+                || project_path.join("venv").exists();
+            // If there's a virtualenv, trust that pip install happened
+            (venv_check, "pip install pact-python".to_string())
+        }
+        n if n.contains("pact-jvm") => {
+            // Maven/Gradle download deps at build time — trust declaration
+            (true, "Dependencies are managed by Maven/Gradle".to_string())
+        }
+        "pact-rust" => {
+            // Cargo fetches at build time — trust declaration
+            (true, "Dependencies are managed by Cargo".to_string())
+        }
+        "pact-go" => {
+            // Check if pact-go CLI tool is available
+            let installed = which::which("pact-go").is_ok();
+            (installed, "go install github.com/pact-foundation/pact-go/v2@latest".to_string())
+        }
+        _ => (false, "Install your language's pact library".to_string()),
+    };
+
+    PactFrameworkInfo {
+        name,
+        installed,
+        install_hint,
+    }
 }
 
 #[cfg(test)]
@@ -481,5 +684,224 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, PactVerifyResult::Passed));
+    }
+
+    // --- Tests for PactConfig::validate ---
+
+    #[test]
+    fn test_pact_config_validate_disabled_returns_empty() {
+        let config = crate::config::PactConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_pact_config_validate_verify_steps_without_command() {
+        let config = crate::config::PactConfig {
+            enabled: true,
+            check_contracts: true,
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("verify_command")));
+    }
+
+    #[test]
+    fn test_pact_config_validate_generate_tests_without_test_command() {
+        let config = crate::config::PactConfig {
+            enabled: true,
+            generate_tests: true,
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("test_command")));
+    }
+
+    #[test]
+    fn test_pact_config_validate_missing_names() {
+        let config = crate::config::PactConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("provider_name")));
+    }
+
+    #[test]
+    fn test_pact_config_validate_broker_warning() {
+        let config = crate::config::PactConfig {
+            enabled: true,
+            broker_url: Some("https://broker.example.com".into()),
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("broker")));
+    }
+
+    #[test]
+    fn test_pact_config_validate_fully_configured() {
+        let config = crate::config::PactConfig {
+            enabled: true,
+            verify_command: Some("npm run pact:verify".into()),
+            test_command: Some("npm run pact:test".into()),
+            provider_name: Some("MyAPI".into()),
+            consumer_name: Some("MyFrontend".into()),
+            check_contracts: true,
+            generate_tests: true,
+            verify_before_fix: true,
+            verify_after_fix: true,
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert!(warnings.is_empty());
+    }
+
+    // --- Tests for detect_project_role ---
+
+    #[test]
+    fn test_detect_project_role_provider_express() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies": {"express": "^4.18.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Provider);
+    }
+
+    #[test]
+    fn test_detect_project_role_consumer_react() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies": {"react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Consumer);
+    }
+
+    #[test]
+    fn test_detect_project_role_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies": {"express": "^4.18.0", "react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Both);
+    }
+
+    #[test]
+    fn test_detect_project_role_python_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            "fastapi==0.100.0\nuvicorn==0.23.0\n",
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Provider);
+    }
+
+    #[test]
+    fn test_detect_project_role_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Unknown);
+    }
+
+    #[test]
+    fn test_detect_project_role_rust_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\nactix-web = \"4\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Provider);
+    }
+
+    #[test]
+    fn test_detect_project_role_rust_consumer() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\nreqwest = \"0.11\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_project_role(tmp.path()), ProjectRole::Consumer);
+    }
+
+    // --- Tests for detect_pact_framework_info ---
+
+    #[test]
+    fn test_detect_pact_framework_info_js_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies": {"@pact-foundation/pact": "^12.0.0"}}"#,
+        )
+        .unwrap();
+        let info = detect_pact_framework_info(tmp.path());
+        assert!(info.name.contains("pact-js"));
+        assert!(!info.installed);
+        assert!(info.install_hint.contains("npm install"));
+    }
+
+    #[test]
+    fn test_detect_pact_framework_info_js_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies": {"@pact-foundation/pact": "^12.0.0"}}"#,
+        )
+        .unwrap();
+        let pact_dir = tmp.path().join("node_modules/@pact-foundation/pact");
+        std::fs::create_dir_all(&pact_dir).unwrap();
+        let info = detect_pact_framework_info(tmp.path());
+        assert!(info.name.contains("pact-js"));
+        assert!(info.installed);
+    }
+
+    #[test]
+    fn test_detect_pact_framework_info_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = detect_pact_framework_info(tmp.path());
+        assert_eq!(info.name, "unknown");
+        assert!(!info.installed);
+    }
+
+    // --- Tests for pact_dir auto-creation ---
+
+    #[test]
+    fn test_verify_contracts_creates_pact_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pact_dir = tmp.path().join("new-pacts");
+        assert!(!pact_dir.exists());
+        let _ = verify_contracts(
+            tmp.path(),
+            "echo 'no pacts found'",
+            Some("new-pacts"),
+        );
+        assert!(pact_dir.exists());
+    }
+
+    #[test]
+    fn test_find_existing_pact_files_creates_configured_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pact_dir = tmp.path().join("my-pacts");
+        assert!(!pact_dir.exists());
+        let files = find_existing_pact_files(tmp.path(), Some("my-pacts"));
+        assert!(files.is_empty());
+        assert!(pact_dir.exists());
+    }
+
+    #[test]
+    fn test_find_existing_pact_files_does_not_create_default_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = find_existing_pact_files(tmp.path(), None);
+        // Default candidates should NOT be auto-created
+        assert!(!tmp.path().join("pacts").exists());
+        assert!(!tmp.path().join("contracts").exists());
     }
 }

@@ -53,7 +53,9 @@ cargo build --release
    c. Coverage boost (unless --skip-coverage):
       - Run coverage command and parse lcov report
       - Sort files by coverage ascending (least covered first)
-      - For each file: generate tests → verify only test files created → run tests → commit
+      - For each file: multi-round loop (up to coverage_rounds per file):
+        - Generate tests → verify only test files created → run tests → commit
+        - Re-measure coverage → stop if threshold met or no improvement
       - Repeat until project-wide and per-file thresholds are met
 4. Run coverage command, then initial SonarQube scan
 5. Fix loop (until --max-issues reached or no issues left):
@@ -108,6 +110,8 @@ OPTIONS:
   --min-coverage <PCT>             Minimum project-wide test coverage before fixing [default: 80]
   --min-file-coverage <PCT>        Minimum per-file test coverage [default: 0]
   --coverage-attempts <N>          Test generation / fix retry attempts per issue [default: 3]
+  --coverage-rounds <N>            Max rounds per file during coverage boost (0 = unlimited while improving) [default: 3]
+  --max-boost-file-lines <N>       Max file size (total lines) for coverage boost (0 = no limit) [default: 500]
   --final-validation-attempts <N>  Max repair attempts for final full-suite validation [default: 5]
   --max-dedup <N>                  Max deduplication iterations (0 = unlimited) [default: 10]
   --no-pr                          Skip creating a pull request after fixes
@@ -155,6 +159,8 @@ All parameters can be set via environment variables:
 | `REPARO_SCANNER_PATH` | `--scanner-path` |
 | `REPARO_NO_PR` | `--no-pr` |
 | `REPARO_COVERAGE_ATTEMPTS` | `--coverage-attempts` |
+| `REPARO_COVERAGE_ROUNDS` | `--coverage-rounds` |
+| `REPARO_MAX_BOOST_FILE_LINES` | `--max-boost-file-lines` |
 | `REPARO_FINAL_VALIDATION_ATTEMPTS` | `--final-validation-attempts` |
 | `REPARO_MAX_DEDUP` | `--max-dedup` |
 
@@ -189,6 +195,11 @@ execution:
   format_on_start: true         # run formatter and commit before fixes (default: true)
   coverage_boost: true          # run coverage boost step (default: true)
   coverage_attempts: 3          # test gen / fix retry attempts per issue (default: 3)
+  coverage_rounds: 3            # max rounds per file during boost, 0 = unlimited while improving (default: 3)
+  max_boost_file_lines: 500    # max total lines per file for boost, 0 = no limit (default: 500)
+  coverage_exclude:              # glob patterns — skip these files during coverage boost (default: none)
+    - "*.html"
+    - "**/generated/**"
   final_validation: true        # run full test suite after all fixes (default: true)
   final_validation_attempts: 5  # max repair attempts for final validation (default: 5)
   dedup_on_completion: true     # refactor duplicated code after fixes (default: true)
@@ -343,20 +354,40 @@ This means you can enforce, for example, "80% overall and no file below 50%".
 2. Parses per-file coverage from the lcov report
 3. Sorts files by coverage ascending (least covered first — most efficient for boosting overall %)
 4. For each file that needs boosting (overall too low OR file below per-file threshold):
-   - Asks Claude to generate unit tests
+   - **Multi-round loop** controlled by `coverage_rounds` (default: 3):
+     - Round 1: asks Claude to generate unit tests for uncovered lines
+     - Round 2+: uses a retry prompt with previous test output, targeting lines still uncovered
+     - Each round: verify only test files were created → run tests → commit if passing → re-measure coverage
+   - **Stops when**: the per-file threshold is met, max rounds exhausted, or (in unlimited mode) coverage stops improving
    - **Strictly enforces**: only test files may be created/modified. If source code is touched, all changes are reverted
-   - Runs tests — if they fail, reverts and moves to the next file
-   - Commits passing tests and re-measures coverage
 5. Stops processing "overall boost" files once the project-wide threshold is reached, but continues boosting files below the per-file threshold
+
+**Coverage rounds (`--coverage-rounds`):**
+
+Controls how many full generate-test-measure rounds are attempted per file:
+
+| Value | Behavior |
+|-------|----------|
+| `3` (default) | Up to 3 rounds per file |
+| `N > 0` | Up to N rounds per file |
+| `0` | Unlimited — keeps generating tests as long as coverage improves between rounds (safety cap: 50 rounds) |
+
+This is separate from `--coverage-attempts`, which controls retry attempts for test generation within the per-issue fix loop.
 
 **Configuration:**
 
 ```bash
-# Default: 80% project-wide, no per-file threshold
+# Default: 80% project-wide, no per-file threshold, 3 rounds per file
 reparo --path ./my-project --config ./reparo.yaml
 
 # Custom thresholds
 reparo --path ./my-project --config ./reparo.yaml --min-coverage 60 --min-file-coverage 30
+
+# Unlimited rounds — keep generating until coverage stops improving
+reparo --path ./my-project --config ./reparo.yaml --coverage-rounds 0
+
+# More rounds per file for stubborn coverage gaps
+reparo --path ./my-project --config ./reparo.yaml --coverage-rounds 10
 
 # Per-file only (no overall requirement)
 reparo --path ./my-project --config ./reparo.yaml --min-coverage 0 --min-file-coverage 50
@@ -371,6 +402,25 @@ In YAML:
 execution:
   min_coverage: 60          # project-wide threshold (0 = disabled)
   min_file_coverage: 50     # per-file threshold (0 = disabled)
+  coverage_rounds: 3        # rounds per file (0 = unlimited while improving)
+  max_boost_file_lines: 1000  # skip files larger than this (0 = no limit, default: 500)
+  coverage_exclude:           # skip these file patterns during boost (default: none)
+    - "*.html"
+    - "**/generated/**"
+```
+
+**File exclusions (`coverage_exclude`):**
+
+No file formats are excluded by default — what's coverable varies by project (e.g., Angular templates have Istanbul coverage). Use glob patterns to skip files that shouldn't receive generated tests:
+
+```yaml
+execution:
+  coverage_exclude:
+    - "*.html"            # Angular templates
+    - "*.htm"
+    - "**/generated/**"   # auto-generated code
+    - "**/mocks/**"       # mock files
+    - "**/*.module.ts"    # Angular modules (no logic to test)
 ```
 
 ## Contract/Pact Testing
@@ -534,7 +584,7 @@ jobs:
 
 Reparo applies strict rules to protect existing code:
 
-1. **Coverage boost phase**: Only test files may be created. If Claude modifies any source file, all changes are reverted immediately.
+1. **Coverage boost phase**: Each file gets up to `coverage_rounds` attempts to reach the threshold. Only test files may be created. If Claude modifies any source file, all changes are reverted immediately. In unlimited mode (`coverage_rounds: 0`), rounds continue as long as coverage improves.
 2. **Fix phase**: If Claude modifies test files during a fix, those test changes are automatically reverted. If the source fix still passes tests, the fix is accepted. Otherwise it's flagged as **NeedsReview**.
 3. After every fix, the full test suite runs. If tests fail, Claude is asked to fix the code (up to N retries). If all retries fail, the fix is **reverted**.
 4. After every fix, SonarQube is re-scanned to **verify the specific issue is resolved**. If not, the fix can be retried up to N times.
