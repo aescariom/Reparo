@@ -183,6 +183,31 @@ impl Orchestrator {
             }
         }
 
+        // Step 0.5: Validate pact configuration if enabled
+        if !self.config.skip_pact && self.config.pact.enabled {
+            let pact_warnings = self.config.pact.validate();
+            for w in &pact_warnings {
+                warn!("Pact config: {}", w);
+            }
+
+            // Detect and log framework info
+            let fw_info = crate::pact::detect_pact_framework_info(&self.config.path);
+            if fw_info.name == "unknown" {
+                warn!("Could not detect pact framework — Claude will infer from project context");
+            } else if !fw_info.installed {
+                warn!(
+                    "Pact framework '{}' declared but may not be installed. Run: {}",
+                    fw_info.name, fw_info.install_hint
+                );
+            } else {
+                info!("Detected pact framework: {} (installed)", fw_info.name);
+            }
+
+            // Detect project role for better prompts
+            let role = crate::pact::detect_project_role(&self.config.path);
+            info!("Detected project role: {:?}", role);
+        }
+
         // Step 1: Validate SonarQube connectivity (US-001, US-016: with retry)
         info!("=== Step 1: Checking SonarQube connectivity ===");
         crate::retry::retry_async(3, 3, "SonarQube connection check", || {
@@ -821,6 +846,18 @@ Apply the fix now."#,
                 if fc.coverage_pct >= 100.0 {
                     return false;
                 }
+                // Skip files matching user-configured exclusion patterns
+                if !self.config.coverage_exclude.is_empty() {
+                    if self.config.coverage_exclude.iter().any(|pat| {
+                        glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+                    }) {
+                        return false;
+                    }
+                }
+                // Skip files with 0 uncovered lines (rounding artifacts)
+                if fc.total_lines <= fc.covered_lines {
+                    return false;
+                }
                 // Include if needed for overall boost OR below per-file threshold
                 overall_needs_boost || (has_file_threshold && fc.coverage_pct < self.config.min_file_coverage)
             })
@@ -841,6 +878,23 @@ Apply the fix now."#,
                 missing.iter().take(5).map(|f| f.file.as_str()).collect::<Vec<_>>().join(", "),
                 if missing.len() > 5 { ", ..." } else { "" }
             );
+        }
+
+        // Log excluded patterns if any are configured
+        if !self.config.coverage_exclude.is_empty() {
+            let excluded_count = file_coverages.iter()
+                .filter(|fc| {
+                    self.config.coverage_exclude.iter().any(|pat| {
+                        glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+                    })
+                })
+                .count();
+            if excluded_count > 0 {
+                info!(
+                    "Excluded {} file(s) from coverage boost matching patterns: {:?}",
+                    excluded_count, self.config.coverage_exclude
+                );
+            }
         }
 
         if files_needing_tests.is_empty() {
@@ -945,14 +999,36 @@ Apply the fix now."#,
         Ok(())
     }
 
-    /// Generate tests for a single file and commit them.
-    /// Returns true if tests were generated, pass, and committed successfully.
+    /// Generate tests for a single file in a multi-round loop until the
+    /// coverage threshold is met or the maximum rounds are exhausted.
+    ///
+    /// `coverage_rounds` (from config):
+    ///   - N > 0 → at most N rounds per file
+    ///   - 0     → unlimited rounds, keep going while coverage still improves
+    ///
+    /// Returns `true` if at least one round produced passing tests that were committed.
     fn boost_file_coverage(
         &self,
         fc: &runner::FileCoverage,
         test_framework: &str,
         test_examples_str: &str,
     ) -> Result<bool> {
+        // Skip files matching user-configured exclusion patterns (safety net)
+        if !self.config.coverage_exclude.is_empty() {
+            if self.config.coverage_exclude.iter().any(|pat| {
+                glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+            }) {
+                info!("Skipping excluded file: {}", fc.file);
+                return Ok(false);
+            }
+        }
+
+        // Skip files with 0 uncovered lines — nothing to boost
+        if fc.total_lines <= fc.covered_lines {
+            info!("File {} has 0 uncovered lines — nothing to boost", fc.file);
+            return Ok(false);
+        }
+
         // Read the source file — try direct path first, then common source roots
         let full_path = resolve_source_file(&self.config.path, &fc.file);
         let source_content = match std::fs::read_to_string(&full_path) {
@@ -963,138 +1039,280 @@ Apply the fix now."#,
             }
         };
 
-        // Skip very large files — prompts > 50K chars tend to timeout
+        // Skip very large files — prompts with too many lines tend to timeout
         let line_count = source_content.lines().count();
-        if line_count > 500 {
+        let max_lines = self.config.max_boost_file_lines;
+        if max_lines > 0 && line_count > max_lines {
             warn!(
-                "File {} has {} lines — too large for coverage boost, skipping (max 500 lines)",
-                fc.file, line_count
+                "File {} has {} lines — exceeds max_boost_file_lines ({}), skipping",
+                fc.file, line_count, max_lines
             );
             return Ok(false);
         }
 
-        // Build uncovered lines description
-        let uncovered_desc = format!(
-            "Lines 1-{} (file has {:.1}% coverage, {} uncovered lines out of {} coverable)",
-            source_content.lines().count(),
-            fc.coverage_pct,
-            fc.total_lines - fc.covered_lines,
-            fc.total_lines
-        );
+        let max_rounds = self.config.coverage_rounds;
+        let unlimited = max_rounds == 0;
+        let mut round: u32 = 0;
+        let mut any_committed = false;
+        let mut previous_coverage_pct = fc.coverage_pct;
+        let mut current_uncovered_count = fc.total_lines.saturating_sub(fc.covered_lines);
+        let mut last_test_output = String::new();
 
-        let prompt = claude::build_test_generation_prompt(
-            &fc.file,
-            &source_content,
-            &uncovered_desc,
-            test_framework,
-            test_examples_str,
-        );
+        loop {
+            round += 1;
 
-        if self.config.show_prompts {
-            info!("Coverage boost prompt:\n{}", prompt);
-        }
-
-        let uncovered_count = (fc.total_lines - fc.covered_lines) as usize;
-        let test_tier = claude::classify_test_gen_tier(uncovered_count, fc.total_lines as usize);
-        let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
-        info!("Generating tests for {} [{}]...", fc.file, test_tier);
-        match claude::run_claude_with_tier(
-            &self.config.path,
-            &prompt,
-            test_timeout,
-            self.config.dangerously_skip_permissions,
-            false,
-            Some(&test_tier),
-        ) {
-            Ok(_) => {
-                info!("Claude completed test generation for {}", fc.file);
+            // Check round limit (0 = unlimited)
+            if !unlimited && round > max_rounds {
+                info!(
+                    "Reached max coverage rounds ({}) for {} — coverage at {:.1}%",
+                    max_rounds, fc.file, previous_coverage_pct
+                );
+                break;
             }
-            Err(e) => {
-                warn!("Failed to generate tests for {}: {} — skipping", fc.file, e);
-                let _ = git::revert_changes(&self.config.path);
-                return Ok(false);
+
+            // Safety cap for unlimited mode — prevent truly infinite loops
+            if unlimited && round > 50 {
+                warn!("Safety cap: 50 rounds reached for {} — stopping", fc.file);
+                break;
             }
-        }
 
-        // Verify no source files were modified
-        let changed = match git::changed_files(&self.config.path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Cannot check changed files: {} — reverting", e);
-                let _ = git::revert_changes(&self.config.path);
-                return Ok(false);
-            }
-        };
+            let round_label = if unlimited {
+                format!("round {} (unlimited)", round)
+            } else {
+                format!("round {}/{}", round, max_rounds)
+            };
 
-        if changed.is_empty() {
-            warn!("No files changed after test generation for {} — skipping", fc.file);
-            return Ok(false);
-        }
-
-        let source_files_modified: Vec<&String> = changed.iter()
-            .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
-            .collect();
-
-        if !source_files_modified.is_empty() {
-            warn!(
-                "Source files were modified during test generation for {}: {:?} — reverting all changes",
-                fc.file, source_files_modified
+            info!(
+                "Coverage boost {} for {} — current {:.1}%, {} uncovered lines",
+                round_label, fc.file, previous_coverage_pct, current_uncovered_count
             );
-            let _ = git::revert_changes(&self.config.path);
-            return Ok(false);
-        }
 
-        // Run tests
-        info!("Running tests to validate generated tests...");
-        match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
-            Ok((true, _)) => {
-                info!("Tests pass after generating tests for {}", fc.file);
+            // Re-read source in case previous rounds changed it indirectly
+            let current_source = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|_| source_content.clone());
+
+            // Build prompt — first round or retry with context
+            let uncovered_desc = if round == 1 {
+                format!(
+                    "Lines 1-{} (file has {:.1}% coverage, {} uncovered lines out of {} coverable)",
+                    current_source.lines().count(),
+                    previous_coverage_pct,
+                    current_uncovered_count,
+                    fc.total_lines
+                )
+            } else {
+                format!(
+                    "Lines still uncovered — file has {:.1}% coverage after {} previous round(s), {} lines remain uncovered out of {} coverable",
+                    previous_coverage_pct,
+                    round - 1,
+                    current_uncovered_count,
+                    fc.total_lines
+                )
+            };
+
+            let prompt = if round == 1 {
+                claude::build_test_generation_prompt(
+                    &fc.file,
+                    &current_source,
+                    &uncovered_desc,
+                    test_framework,
+                    test_examples_str,
+                )
+            } else {
+                claude::build_test_generation_retry_prompt(
+                    &fc.file,
+                    &current_source,
+                    &uncovered_desc,
+                    test_framework,
+                    test_examples_str,
+                    round,
+                    &truncate(&last_test_output, 1000),
+                )
+            };
+
+            if self.config.show_prompts {
+                info!("Coverage boost prompt ({}):\n{}", round_label, prompt);
             }
-            Ok((false, output)) => {
-                warn!("Tests FAIL after generating tests for {} — reverting:\n{}", fc.file, truncate(&output, 300));
+
+            let uncovered = current_uncovered_count as usize;
+            let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize);
+            let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
+            info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
+            match claude::run_claude_with_tier(
+                &self.config.path,
+                &prompt,
+                test_timeout,
+                self.config.dangerously_skip_permissions,
+                false,
+                Some(&test_tier),
+            ) {
+                Ok(_) => {
+                    info!("Claude completed test generation for {} ({})", fc.file, round_label);
+                }
+                Err(e) => {
+                    warn!("Failed to generate tests for {} ({}): {} — stopping rounds", fc.file, round_label, e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
+            }
+
+            // Verify no source files were modified
+            let changed = match git::changed_files(&self.config.path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("Cannot check changed files: {} — reverting", e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
+            };
+
+            if changed.is_empty() {
+                warn!("No files changed in {} for {} — stopping rounds", round_label, fc.file);
+                break;
+            }
+
+            let source_files_modified: Vec<&String> = changed.iter()
+                .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
+                .collect();
+
+            if !source_files_modified.is_empty() {
+                warn!(
+                    "Source files were modified during test generation for {} ({}): {:?} — reverting",
+                    fc.file, round_label, source_files_modified
+                );
                 let _ = git::revert_changes(&self.config.path);
-                return Ok(false);
+                break;
             }
-            Err(e) => {
-                warn!("Test execution error for {} — reverting: {}", fc.file, e);
+
+            // Run tests
+            info!("Running tests to validate generated tests ({})...", round_label);
+            match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                Ok((true, output)) => {
+                    info!("Tests pass after {} for {}", round_label, fc.file);
+                    last_test_output = output;
+                }
+                Ok((false, output)) => {
+                    warn!("Tests FAIL after {} for {} — reverting:\n{}", round_label, fc.file, truncate(&output, 300));
+                    last_test_output = output;
+                    let _ = git::revert_changes(&self.config.path);
+                    // Don't break — try again next round if rounds remain
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Test execution error in {} for {} — reverting: {}", round_label, fc.file, e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
+            }
+
+            // Commit test files only
+            let test_files_changed: Vec<&str> = changed.iter()
+                .filter(|f| is_test_file(f))
+                .map(|s| s.as_str())
+                .collect();
+
+            if test_files_changed.is_empty() {
                 let _ = git::revert_changes(&self.config.path);
-                return Ok(false);
+                break;
+            }
+
+            // Also stage generated artifacts (coverage reports, etc.) so they don't
+            // pollute the next diff, but only commit the test files.
+            let generated_artifacts: Vec<&str> = changed.iter()
+                .filter(|f| is_generated_artifact(f))
+                .map(|s| s.as_str())
+                .collect();
+
+            if let Err(e) = git::add_files(&self.config.path, &test_files_changed) {
+                warn!("Failed to stage test files: {} — reverting", e);
+                let _ = git::revert_changes(&self.config.path);
+                break;
+            }
+
+            // Revert non-test, non-artifact leftover changes before committing
+            let _ = git::revert_changes(&self.config.path);
+            // Re-stage generated artifacts so they don't show as dirty
+            if !generated_artifacts.is_empty() {
+                let _ = git::add_files(&self.config.path, &generated_artifacts);
+            }
+
+            let commit_msg = format_commit_message(
+                &self.config, "test", "coverage",
+                &format!("add tests for {} ({:.0}% → boost, {})", fc.file, previous_coverage_pct, round_label),
+                "", "", &fc.file,
+            );
+            if let Err(e) = git::commit(&self.config.path, &commit_msg) {
+                warn!("Failed to commit tests for {} ({}): {} — reverting", fc.file, round_label, e);
+                let _ = git::revert_changes(&self.config.path);
+                break;
+            }
+
+            info!("Committed tests for {} ({})", fc.file, round_label);
+            any_committed = true;
+
+            // Revert any remaining leftover changes
+            let _ = git::revert_changes(&self.config.path);
+
+            // Re-measure file coverage to decide if we need another round
+            let coverage_cmd = self.config.coverage_command.clone()
+                .or_else(|| self.config.commands.coverage.clone())
+                .or_else(|| runner::detect_coverage_command(&self.config.path));
+            if let Some(ref cov_cmd) = coverage_cmd {
+                let _ = runner::run_shell_command(&self.config.path, cov_cmd, "coverage");
+            }
+
+            let lcov_path = runner::find_lcov_report_with_hint(
+                &self.config.path,
+                self.config.commands.coverage_report.as_deref(),
+            );
+            if let Some(ref lcov) = lcov_path {
+                let file_coverages = runner::per_file_lcov_coverage(lcov);
+                if let Some(updated_fc) = file_coverages.iter().find(|f| f.file == fc.file) {
+                    let new_pct = updated_fc.coverage_pct;
+                    let new_uncovered = updated_fc.total_lines.saturating_sub(updated_fc.covered_lines);
+                    color_info!(
+                        "Coverage for {} after {}: {:.1}% → {:.1}% ({} uncovered lines remaining)",
+                        fc.file, round_label, previous_coverage_pct, new_pct, new_uncovered
+                    );
+
+                    // Check if threshold met
+                    let threshold = if self.config.min_file_coverage > 0.0 {
+                        self.config.min_file_coverage
+                    } else {
+                        self.config.min_coverage
+                    };
+
+                    if new_pct >= threshold {
+                        color_info!(
+                            "Coverage threshold {:.0}% met for {} — done after {} round(s)",
+                            threshold, fc.file, round
+                        );
+                        break;
+                    }
+
+                    // In unlimited mode: stop if no improvement
+                    if unlimited && new_pct <= previous_coverage_pct {
+                        info!(
+                            "No coverage improvement for {} ({:.1}% → {:.1}%) — stopping rounds",
+                            fc.file, previous_coverage_pct, new_pct
+                        );
+                        break;
+                    }
+
+                    previous_coverage_pct = new_pct;
+                    current_uncovered_count = new_uncovered;
+                } else {
+                    warn!("File {} not found in lcov after {} — stopping rounds", fc.file, round_label);
+                    break;
+                }
+            } else {
+                // No lcov report — can't measure progress, stop looping
+                warn!("No lcov report found after {} — cannot verify improvement, stopping", round_label);
+                break;
             }
         }
 
-        // Commit test files only
-        let test_files_changed: Vec<&str> = changed.iter()
-            .filter(|f| is_test_file(f))
-            .map(|s| s.as_str())
-            .collect();
-
-        if test_files_changed.is_empty() {
-            let _ = git::revert_changes(&self.config.path);
-            return Ok(false);
-        }
-
-        if let Err(e) = git::add_files(&self.config.path, &test_files_changed) {
-            warn!("Failed to stage test files: {} — reverting", e);
-            let _ = git::revert_changes(&self.config.path);
-            return Ok(false);
-        }
-        let commit_msg = format_commit_message(
-            &self.config, "test", "coverage",
-            &format!("add tests for {} ({:.0}% → boost)", fc.file, fc.coverage_pct),
-            "", "", &fc.file,
-        );
-        if let Err(e) = git::commit(&self.config.path, &commit_msg) {
-            warn!("Failed to commit tests for {}: {} — reverting", fc.file, e);
-            let _ = git::revert_changes(&self.config.path);
-            return Ok(false);
-        }
-
-        info!("Committed tests for {}", fc.file);
-
-        // Revert any non-test leftover changes
-        let _ = git::revert_changes(&self.config.path);
-
-        Ok(true)
+        Ok(any_committed)
     }
 
     /// Run the coverage command and return the overall project coverage percentage.
