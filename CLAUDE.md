@@ -110,6 +110,53 @@ main.rs → Config::validate() → Orchestrator::run()
 
 **Change prompt strategy**: Edit `claude.rs::build_fix_prompt()` or `build_test_generation_prompt()`.
 
+## Step Enable/Disable Reference
+
+Every optional step can be enabled or disabled via CLI flags and/or YAML configuration. Default: all disabled except core workflow steps which default to enabled.
+
+| Step | CLI flag | YAML field | Default | Notes |
+|------|----------|------------|---------|-------|
+| Initial formatting | `--skip-format` | `execution.format_on_start: false` | enabled | Format & commit before fixes |
+| Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled | Generate tests until min_coverage |
+| Contract/pact testing | `--skip-pact` | `pact.enabled: true` | disabled | Must enable via YAML `pact.enabled` |
+| Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled | Remove duplicate fixes |
+| Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled | Run full suite after all fixes |
+| Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled | Must enable via YAML |
+| PR creation | `--no-pr` | — | enabled | Create PR via `gh` |
+
+**Priority**: CLI flags > ENV vars > YAML > defaults.
+
+**Pact sub-steps** (all default `false`, set in YAML `pact:` section):
+- `check_contracts` — check if file is API-related
+- `generate_tests` — generate contract tests
+- `verify_before_fix` — verify contracts before applying fix
+- `verify_after_fix` — verify contracts after applying fix
+
+**YAML example** (all steps explicit):
+```yaml
+execution:
+  format_on_start: true
+  coverage_boost: true
+  coverage_attempts: 3
+  coverage_rounds: 3
+  coverage_exclude: []
+  final_validation: true
+  final_validation_attempts: 5
+  dedup_on_completion: true
+  max_dedup: 10
+
+pact:
+  enabled: false
+  pact_dir: "./pacts"
+  check_contracts: false
+  generate_tests: false
+  verify_before_fix: false
+  verify_after_fix: false
+
+documentation:
+  enabled: false
+```
+
 ## Exit Codes
 
 | Code | Meaning |

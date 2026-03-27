@@ -6,7 +6,8 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Top-level YAML config structure.
@@ -30,7 +31,7 @@ pub struct YamlConfig {
     pub protected_files: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct SonarYaml {
     pub project_id: Option<String>,
@@ -40,7 +41,7 @@ pub struct SonarYaml {
     pub scanner_path: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct GitYaml {
     pub branch: Option<String>,
@@ -54,7 +55,7 @@ pub struct GitYaml {
     pub commit_vars: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExecutionYaml {
     pub max_issues: Option<usize>,
@@ -647,9 +648,176 @@ pub fn validate_commands(commands: &ProjectCommands, project_path: &Path) -> Vec
     warnings
 }
 
+// ---------------------------------------------------------------------------
+// Personal configuration (~/.config/reparo/config.yaml)
+// ---------------------------------------------------------------------------
+
+/// Personal config structure stored in ~/.config/reparo/config.yaml.
+///
+/// Contains engine routing and user-level defaults that apply across all projects.
+/// Priority: CLI > ENV > project YAML > personal YAML > defaults.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct PersonalConfig {
+    /// Version of Reparo that last wrote this file
+    pub reparo_version: Option<String>,
+    /// AI engine definitions
+    pub engines: HashMap<String, crate::engine::EngineConfig>,
+    /// Tier-to-engine routing
+    pub routing: crate::engine::RoutingConfig,
+    /// Personal execution defaults
+    pub execution: ExecutionYaml,
+    /// Personal sonar defaults
+    pub sonar: SonarYaml,
+    /// Personal git defaults
+    pub git: GitYaml,
+}
+
+/// Get the path to the personal config file: ~/.config/reparo/config.yaml
+pub fn personal_config_path() -> Result<PathBuf> {
+    let config_dir = dirs::config_dir()
+        .context("Could not determine user config directory")?;
+    Ok(config_dir.join("reparo").join("config.yaml"))
+}
+
+/// Build the default personal config.
+pub fn default_personal_config() -> PersonalConfig {
+    PersonalConfig {
+        reparo_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        engines: crate::engine::default_engines(),
+        routing: crate::engine::default_routing(),
+        execution: ExecutionYaml::default(),
+        sonar: SonarYaml::default(),
+        git: GitYaml::default(),
+    }
+}
+
+/// Load the personal config from ~/.config/reparo/config.yaml.
+///
+/// - If the file does not exist, creates it with defaults and returns the defaults.
+/// - If the file exists but is missing fields, `serde(default)` fills them in.
+/// - If `reparo_version` doesn't match the current version, emits a warning.
+/// - If `reparo_version` was missing, stamps it and rewrites the file.
+pub fn load_personal_config() -> Result<PersonalConfig> {
+    let path = personal_config_path()?;
+
+    if !path.exists() {
+        // Create with defaults
+        let config = default_personal_config();
+        write_personal_config(&path, &config)?;
+        info!("Created personal config at {}", path.display());
+        return Ok(config);
+    }
+
+    // Load and parse
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read personal config: {}", path.display()))?;
+
+    let mut config: PersonalConfig = serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse personal config: {}", path.display()))?;
+
+    // Version check
+    let current_version = env!("CARGO_PKG_VERSION");
+    match &config.reparo_version {
+        Some(stored) if stored != current_version => {
+            warn!(
+                "Personal config {} was created by Reparo v{}, \
+                 but you are running v{}. Run --restore-personal-yaml to update defaults.",
+                path.display(), stored, current_version
+            );
+        }
+        None => {
+            // Stamp version and rewrite
+            config.reparo_version = Some(current_version.to_string());
+            write_personal_config(&path, &config)?;
+            info!("Stamped version {} in personal config", current_version);
+        }
+        _ => {}
+    }
+
+    Ok(config)
+}
+
+/// Restore the personal config to defaults for the current program version.
+pub fn restore_personal_config() -> Result<()> {
+    let path = personal_config_path()?;
+    let config = default_personal_config();
+    write_personal_config(&path, &config)?;
+    Ok(())
+}
+
+/// Write the personal config to disk, creating parent directories if needed.
+fn write_personal_config(path: &Path, config: &PersonalConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+    }
+    let yaml = serde_yaml::to_string(config)
+        .context("Failed to serialize personal config")?;
+    std::fs::write(path, yaml)
+        .with_context(|| format!("Failed to write personal config: {}", path.display()))?;
+    Ok(())
+}
+
+/// Merge personal config values into Config at lower priority than project YAML.
+///
+/// Uses the same "only if at default" logic as merge_yaml_into_config.
+/// Called BEFORE merge_yaml_into_config so project values win.
+pub fn merge_personal_into_config(config: &mut crate::config::Config, personal: &PersonalConfig) {
+    // Merge execution defaults
+    let exec = &personal.execution;
+    if let Some(timeout) = exec.timeout {
+        if config.timeout == 0 {
+            config.timeout = timeout;
+        }
+    }
+    if let Some(ct) = exec.claude_timeout {
+        if config.claude_timeout == crate::claude::DEFAULT_CLAUDE_TIMEOUT {
+            config.claude_timeout = ct;
+        }
+    }
+    if let Some(max) = exec.max_issues {
+        if config.max_issues == 0 {
+            config.max_issues = max;
+        }
+    }
+    if let Some(tt) = exec.test_timeout {
+        if config.test_timeout == 600 {
+            config.test_timeout = tt;
+        }
+    }
+    if let Some(ref lf) = exec.log_format {
+        if config.log_format == "text" {
+            config.log_format = lf.clone();
+        }
+    }
+
+    // Merge sonar defaults
+    let sonar = &personal.sonar;
+    if let Some(ref url) = sonar.url {
+        if config.sonar_url == "http://localhost:9000" {
+            config.sonar_url = url.clone();
+        }
+    }
+    if let Some(ref token) = sonar.token {
+        if config.sonar_token.is_empty() {
+            config.sonar_token = token.clone();
+        }
+    }
+
+    // Merge git defaults
+    let git = &personal.git;
+    if let Some(bs) = git.batch_size {
+        if config.batch_size == 1 {
+            config.batch_size = bs;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_interpolate_env_vars() {
@@ -1036,5 +1204,102 @@ prompts:
         assert_eq!(config.prompts.rules.len(), 2);
         assert!(config.prompts.rules.contains_key("java:S3776"));
         assert!(config.prompts.categories.contains_key("vulnerability"));
+    }
+
+    // --- Personal config tests ---
+
+    #[test]
+    fn test_default_personal_config_has_version() {
+        let config = default_personal_config();
+        assert_eq!(
+            config.reparo_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn test_default_personal_config_has_all_engines() {
+        let config = default_personal_config();
+        assert!(config.engines.contains_key("claude"));
+        assert!(config.engines.contains_key("gemini"));
+        assert!(config.engines.contains_key("aider"));
+        assert!(config.engines["claude"].enabled);
+        assert!(!config.engines["gemini"].enabled);
+        assert!(!config.engines["aider"].enabled);
+    }
+
+    #[test]
+    fn test_default_personal_config_routing_all_claude() {
+        let config = default_personal_config();
+        assert_eq!(config.routing.tier1.as_ref().unwrap().engine, "claude");
+        assert_eq!(config.routing.tier4.as_ref().unwrap().engine, "claude");
+    }
+
+    #[test]
+    fn test_personal_config_serialization_roundtrip() {
+        let config = default_personal_config();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: PersonalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.reparo_version, config.reparo_version);
+        assert_eq!(parsed.engines.len(), config.engines.len());
+        assert!(parsed.routing.tier1.is_some());
+    }
+
+    #[test]
+    fn test_personal_config_missing_fields_get_defaults() {
+        let yaml = "reparo_version: \"0.1.0\"\n";
+        let config: PersonalConfig = serde_yaml::from_str(yaml).unwrap();
+        // engines should default to empty (no engines auto-created from partial YAML)
+        // routing should default to None tiers
+        assert_eq!(config.reparo_version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn test_write_and_read_personal_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        let config = default_personal_config();
+        write_personal_config(&path, &config).unwrap();
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: PersonalConfig = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(parsed.reparo_version, config.reparo_version);
+    }
+
+    #[test]
+    fn test_write_personal_config_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deep").join("nested").join("config.yaml");
+        let config = default_personal_config();
+        write_personal_config(&path, &config).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_merge_personal_into_config_sonar_url() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+        ]);
+        let mut personal = default_personal_config();
+        personal.sonar.url = Some("https://sonar.example.com".to_string());
+
+        // Default sonar_url is "http://localhost:9000"
+        merge_personal_into_config(&mut config, &personal);
+        assert_eq!(config.sonar_url, "https://sonar.example.com");
+    }
+
+    #[test]
+    fn test_merge_personal_into_config_cli_wins() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+            "--sonar-url", "https://cli-value.com",
+        ]);
+        let mut personal = default_personal_config();
+        personal.sonar.url = Some("https://personal-value.com".to_string());
+
+        // CLI value should NOT be overwritten by personal config
+        merge_personal_into_config(&mut config, &personal);
+        assert_eq!(config.sonar_url, "https://cli-value.com");
     }
 }
