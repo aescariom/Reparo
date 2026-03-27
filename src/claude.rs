@@ -1,8 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, Instant};
-use tracing::{info, warn};
 
 /// Default per-call timeout for Claude in seconds (US-015).
 pub const DEFAULT_CLAUDE_TIMEOUT: u64 = 300;
@@ -65,8 +62,14 @@ rejected automatically.
   the framework's temp support.
 "#;
 
+/// UTF-8-safe string truncation.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+    let truncated: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
 }
 
 /// Model and effort tier for a Claude invocation.
@@ -244,134 +247,26 @@ fn parse_complexity_from_message(message: &str) -> Option<u32> {
 
 /// Run `claude -d` with a prompt and a per-call timeout (US-015).
 ///
-/// Spawns Claude as a child process and kills it if it exceeds `timeout_secs`.
-/// Returns the stdout output from claude.
+/// Delegates to `engine::run_engine` with a Claude invocation.
 pub fn run_claude(project_path: &Path, prompt: &str, timeout_secs: u64, skip_permissions: bool, show_prompt: bool) -> Result<String> {
     run_claude_with_tier(project_path, prompt, timeout_secs, skip_permissions, show_prompt, None)
 }
 
 /// Run `claude -d` with a specific model+effort tier.
+///
+/// Delegates to `engine::run_engine` with a Claude invocation. Kept for backward
+/// compatibility — new code should use `engine::run_engine` directly.
 pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64, skip_permissions: bool, show_prompt: bool, tier: Option<&ClaudeTier>) -> Result<String> {
-    let tier_desc = tier.map(|t| format!(" [{}]", t)).unwrap_or_default();
-    info!("Running claude -d (prompt: {} chars, timeout: {}s{})", prompt.len(), timeout_secs, tier_desc);
-    if show_prompt {
-        info!("Claude prompt:\n{}", prompt);
-    }
-    let start = Instant::now();
-
-    let mut args = vec!["-d", "--output-format", "text"];
-    if skip_permissions {
-        args.push("--dangerously-skip-permissions");
-    }
-
-    // Add model and effort from tier
-    let model_str;
-    let effort_str;
-    if let Some(t) = tier {
-        model_str = t.model.to_string();
-        effort_str = t.effort.to_string();
-        args.extend(["--model", &model_str, "--effort", &effort_str]);
-    }
-
-    args.extend(["-p", prompt]);
-
-    let mut child = Command::new("claude")
-        .current_dir(project_path)
-        .args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to spawn 'claude' CLI. Is it installed and in PATH?")?;
-
-    // Wait with timeout
-    let timeout = Duration::from_secs(timeout_secs);
-    let result = wait_with_timeout(&mut child, timeout);
-
-    match result {
-        WaitResult::Completed(output) => {
-            let elapsed = start.elapsed().as_secs();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-            if !output.status.success() {
-                warn!("claude exited with status: {} ({}s)", output.status, elapsed);
-                if !stderr.is_empty() {
-                    warn!("claude stderr: {}", stderr);
-                }
-                // If Claude failed very quickly (< 10s), it's likely a CLI error, not a legitimate run
-                if elapsed < 10 {
-                    let error_detail = if !stderr.is_empty() {
-                        stderr.clone()
-                    } else if !stdout.is_empty() {
-                        truncate_str(&stdout, 500)
-                    } else {
-                        format!("exit status: {} (no output)", output.status)
-                    };
-                    anyhow::bail!("Claude CLI failed immediately ({}s): {}", elapsed, error_detail);
-                }
-                // Longer runs that exit non-zero may have done partial work — return stdout
-                warn!("Claude exited non-zero after {}s — checking for changes anyway", elapsed);
-            } else {
-                info!("claude completed in {}s", elapsed);
-            }
-
-            Ok(stdout)
-        }
-        WaitResult::TimedOut => {
-            // Kill the process
-            let _ = child.kill();
-            let _ = child.wait(); // reap zombie
-            let elapsed = start.elapsed().as_secs();
-            anyhow::bail!(
-                "Claude timed out after {}s (limit: {}s). The process was killed.",
-                elapsed,
-                timeout_secs
-            );
-        }
-    }
-}
-
-enum WaitResult {
-    Completed(std::process::Output),
-    TimedOut,
-}
-
-/// Wait for a child process with a timeout, polling every 500ms.
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> WaitResult {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process finished — collect output
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = err.read_to_end(&mut stderr);
-                }
-                return WaitResult::Completed(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                // Still running
-                if start.elapsed() >= timeout {
-                    return WaitResult::TimedOut;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => {
-                // Error checking — treat as timeout
-                return WaitResult::TimedOut;
-            }
-        }
-    }
+    let invocation = crate::engine::EngineInvocation {
+        engine_kind: crate::engine::EngineKind::Claude,
+        command: "claude".to_string(),
+        base_args: vec!["-d".to_string(), "--output-format".to_string(), "text".to_string()],
+        model: tier.map(|t| t.model.to_string()),
+        effort: tier.map(|t| t.effort.to_string()),
+        prompt_flag: "-p".to_string(),
+        prompt_via_stdin: false,
+    };
+    crate::engine::run_engine(project_path, prompt, timeout_secs, skip_permissions, show_prompt, &invocation)
 }
 
 /// Build a prompt for generating unit tests (US-005).

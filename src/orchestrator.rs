@@ -95,6 +95,8 @@ pub struct Orchestrator {
     exec_state: Option<crate::state::ExecutionState>,
     /// Rule description cache (US-020): rule_key → description
     rule_cache: std::collections::HashMap<String, String>,
+    /// Engine routing configuration for multi-engine AI dispatch
+    engine_routing: crate::engine::EngineRoutingConfig,
 }
 
 impl Orchestrator {
@@ -133,6 +135,8 @@ impl Orchestrator {
             None
         };
 
+        let engine_routing = config.engine_routing.clone();
+
         Ok(Self {
             config,
             client,
@@ -141,6 +145,7 @@ impl Orchestrator {
             prompt_config,
             exec_state,
             rule_cache: std::collections::HashMap::new(),
+            engine_routing,
         })
     }
 
@@ -154,6 +159,23 @@ impl Orchestrator {
             self.total_issues_found,
             0, // elapsed unknown in timeout case
         );
+    }
+
+    /// Run an AI engine with the given prompt, routing based on the tier.
+    ///
+    /// Resolves which engine to use from the routing config, computes timeout,
+    /// and dispatches to `engine::run_engine`.
+    fn run_ai(&self, prompt: &str, tier: &claude::ClaudeTier) -> anyhow::Result<String> {
+        let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
+        let timeout = tier.effective_timeout(self.config.claude_timeout);
+        crate::engine::run_engine(
+            &self.config.path,
+            prompt,
+            timeout,
+            self.config.dangerously_skip_permissions,
+            self.config.show_prompts,
+            &invocation,
+        )
     }
 
     /// Run the full Reparo flow (US-010).
@@ -626,12 +648,7 @@ Apply the fix now."#,
                                     truncate(&output, 3000)
                                 );
                                 let repair_tier = claude::classify_repair_tier();
-                                let _ = claude::run_claude_with_tier(
-                                    &self.config.path, &repair_prompt,
-                                    repair_tier.effective_timeout(self.config.claude_timeout),
-                                    self.config.dangerously_skip_permissions, self.config.show_prompts,
-                                    Some(&repair_tier),
-                                );
+                                let _ = self.run_ai(&repair_prompt, &repair_tier);
                                 if let Some(ref fmt_cmd) = self.config.commands.format {
                                     let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
                                 }
@@ -679,12 +696,7 @@ Apply the fix now."#,
                                 truncate(&output, 3000)
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            let _ = claude::run_claude_with_tier(
-                                &self.config.path, &repair_prompt,
-                                repair_tier.effective_timeout(self.config.claude_timeout),
-                                self.config.dangerously_skip_permissions, self.config.show_prompts,
-                                Some(&repair_tier),
-                            );
+                            let _ = self.run_ai(&repair_prompt, &repair_tier);
                             if let Some(ref fmt_cmd) = self.config.commands.format {
                                 let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
                             }
@@ -1136,16 +1148,8 @@ Apply the fix now."#,
 
             let uncovered = current_uncovered_count as usize;
             let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize);
-            let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
             info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
-            match claude::run_claude_with_tier(
-                &self.config.path,
-                &prompt,
-                test_timeout,
-                self.config.dangerously_skip_permissions,
-                false,
-                Some(&test_tier),
-            ) {
+            match self.run_ai(&prompt, &test_tier) {
                 Ok(_) => {
                     info!("Claude completed test generation for {} ({})", fc.file, round_label);
                 }
@@ -1542,16 +1546,8 @@ Apply the fix now."#,
             }
 
             let dedup_tier = claude::classify_dedup_tier(dup_file.duplicated_lines, dup_file.duplication_pct);
-            let dedup_timeout = dedup_tier.effective_timeout(self.config.claude_timeout);
-            info!("Asking Claude to refactor {} to reduce duplication... [{}]", dup_file.file_path, dedup_tier);
-            match claude::run_claude_with_tier(
-                &self.config.path,
-                &prompt,
-                dedup_timeout,
-                self.config.dangerously_skip_permissions,
-                self.config.show_prompts,
-                Some(&dedup_tier),
-            ) {
+            info!("Asking AI to refactor {} to reduce duplication... [{}]", dup_file.file_path, dedup_tier);
+            match self.run_ai(&prompt, &dedup_tier) {
                 Ok(_output) => {
                     info!("Claude completed dedup refactoring for {}", dup_file.file_path);
                 }
@@ -1755,14 +1751,7 @@ Apply the fix now."#,
                 info!("Documentation prompt:\n{}", prompt);
             }
 
-            match claude::run_claude_with_tier(
-                &self.config.path,
-                &prompt,
-                tier.effective_timeout(self.config.claude_timeout),
-                self.config.dangerously_skip_permissions,
-                false,
-                Some(&tier),
-            ) {
+            match self.run_ai(&prompt, &tier) {
                 Ok(_) => {
                     info!("Claude completed documentation for {}", file_path);
                 }
@@ -2150,8 +2139,7 @@ Apply the fix now."#,
         );
         info!("Issue {} classified as tier {} (rule: {}, severity: {})", issue.key, tier, issue.rule, issue.severity);
 
-        let effective_timeout = tier.effective_timeout(self.config.claude_timeout);
-        let claude_output = match claude::run_claude_with_tier(&self.config.path, &prompt, effective_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts, Some(&tier)) {
+        let claude_output = match self.run_ai(&prompt, &tier) {
             Ok(output) => output,
             Err(e) => {
                 result.status = FixStatus::Failed(format!("Claude failed: {}", e));
@@ -2284,14 +2272,7 @@ Apply the fix now."#,
                                 &issue.message,
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            match claude::run_claude_with_tier(
-                                &self.config.path,
-                                &repair_prompt,
-                                repair_tier.effective_timeout(self.config.claude_timeout),
-                                self.config.dangerously_skip_permissions,
-                                self.config.show_prompts,
-                                Some(&repair_tier),
-                            ) {
+                            match self.run_ai(&repair_prompt, &repair_tier) {
                                 Ok(_) => {
                                     info!("Claude applied build fix — retrying...");
                                     continue;
@@ -2340,14 +2321,7 @@ Apply the fix now."#,
                                 &issue.message,
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            match claude::run_claude_with_tier(
-                                &self.config.path,
-                                &repair_prompt,
-                                repair_tier.effective_timeout(self.config.claude_timeout),
-                                self.config.dangerously_skip_permissions,
-                                self.config.show_prompts,
-                                Some(&repair_tier),
-                            ) {
+                            match self.run_ai(&repair_prompt, &repair_tier) {
                                 Ok(_) => {
                                     // Check Claude didn't modify test files
                                     let repair_changed = git::changed_files(&self.config.path).unwrap_or_default();
@@ -2500,14 +2474,7 @@ Apply the fixes now."#,
                                 truncate(&output, 3000)
                             );
                             let lint_tier = claude::classify_repair_tier();
-                            match claude::run_claude_with_tier(
-                                &self.config.path,
-                                &lint_prompt,
-                                lint_tier.effective_timeout(self.config.claude_timeout),
-                                self.config.dangerously_skip_permissions,
-                                self.config.show_prompts,
-                                Some(&lint_tier),
-                            ) {
+                            match self.run_ai(&lint_prompt, &lint_tier) {
                                 Ok(_) => {
                                     // Format after lint fix
                                     if let Some(ref fmt_cmd) = self.config.commands.format {
@@ -2630,14 +2597,7 @@ Apply a different fix now."#,
                                         if tier.effort == "low" { "medium" } else { tier.effort },
                                         tier.timeout_multiplier.max(1.0),
                                     );
-                                    match claude::run_claude_with_tier(
-                                        &self.config.path,
-                                        &retry_prompt,
-                                        retry_tier.effective_timeout(self.config.claude_timeout),
-                                        self.config.dangerously_skip_permissions,
-                                        self.config.show_prompts,
-                                        Some(&retry_tier),
-                                    ) {
+                                    match self.run_ai(&retry_prompt, &retry_tier) {
                                         Ok(_) => {
                                             info!("Claude applied retry fix — verifying build+tests...");
                                             // Quick build+test check before re-scanning
@@ -2848,8 +2808,7 @@ Apply a different fix now."#,
 
             // Run claude to generate tests
             let test_tier = claude::classify_test_gen_tier(current_uncovered.len(), file_content.lines().count());
-            let test_timeout = test_tier.effective_timeout(self.config.claude_timeout);
-            match claude::run_claude_with_tier(&self.config.path, &prompt, test_timeout, self.config.dangerously_skip_permissions, self.config.show_prompts, Some(&test_tier)) {
+            match self.run_ai(&prompt, &test_tier) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 1 {
@@ -3045,16 +3004,8 @@ Apply a different fix now."#,
 
             // Use a moderate tier for contract test generation
             let tier = claude::classify_contract_test_tier(5); // default estimate
-            let timeout = tier.effective_timeout(self.config.claude_timeout);
 
-            let claude_result = claude::run_claude_with_tier(
-                &self.config.path,
-                &prompt,
-                timeout,
-                self.config.dangerously_skip_permissions,
-                self.config.show_prompts,
-                Some(&tier),
-            );
+            let claude_result = self.run_ai(&prompt, &tier);
 
             match claude_result {
                 Ok(output) => {

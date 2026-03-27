@@ -155,6 +155,10 @@ pub struct Config {
     #[arg(long, default_value = "false")]
     pub skip_pact: bool,
 
+    /// Reset personal config (~/.config/reparo/config.yaml) to defaults and exit
+    #[arg(long, default_value = "false")]
+    pub restore_personal_yaml: bool,
+
     /// Glob patterns to exclude from coverage boost (populated from YAML)
     #[arg(skip)]
     pub coverage_exclude: Vec<String>,
@@ -258,6 +262,8 @@ pub struct ValidatedConfig {
     pub skip_pact: bool,
     /// Pact/contract testing configuration
     pub pact: PactConfig,
+    /// Resolved engine routing configuration for AI dispatch
+    pub engine_routing: crate::engine::EngineRoutingConfig,
 }
 
 /// Resolved documentation configuration for runtime use.
@@ -398,7 +404,11 @@ impl Config {
             );
         }
 
-        // -- load YAML config (US-014) --
+        // -- load personal config (~/.config/reparo/config.yaml) --
+        let personal_config = crate::yaml_config::load_personal_config()?;
+        crate::yaml_config::merge_personal_into_config(&mut self, &personal_config);
+
+        // -- load project YAML config (US-014) --
         let yaml_config = crate::yaml_config::load_yaml_config(&path, self.config.as_deref())?;
         if let Some(ref yaml) = yaml_config {
             crate::yaml_config::merge_yaml_into_config(&mut self, yaml);
@@ -493,7 +503,14 @@ impl Config {
             documentation: DocumentationConfig::default(),
             skip_pact: self.skip_pact,
             pact: self.pact,
+            engine_routing: crate::engine::EngineRoutingConfig {
+                engines: personal_config.engines.clone(),
+                routing: personal_config.routing.clone(),
+            },
         };
+
+        // Validate that all routed engines are available
+        crate::engine::validate_engines(&validated.engine_routing)?;
 
         validated.print_summary();
         Ok(validated)
@@ -769,6 +786,7 @@ mod tests {
             documentation: DocumentationConfig::default(),
             skip_pact: false,
             pact: PactConfig::default(),
+            restore_personal_yaml: false,
         }
     }
 

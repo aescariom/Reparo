@@ -3,6 +3,30 @@ use std::path::Path;
 use std::process::Command;
 use tracing::{info, warn};
 
+/// Git hosting platform detected from the remote URL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GitPlatform {
+    GitHub,
+    GitLab,
+}
+
+/// Detect the git hosting platform by inspecting the `origin` remote URL.
+/// Falls back to [`GitPlatform::GitHub`] if the URL cannot be read or is unrecognised.
+pub fn detect_platform(project_path: &Path) -> GitPlatform {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["remote", "get-url", "origin"])
+        .output();
+
+    if let Ok(out) = output {
+        let url = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if url.contains("gitlab") {
+            return GitPlatform::GitLab;
+        }
+    }
+    GitPlatform::GitHub
+}
+
 /// Get the current branch name
 pub fn current_branch(project_path: &Path) -> Result<String> {
     let output = Command::new("git")
@@ -132,11 +156,27 @@ pub fn push(project_path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a pull request using gh CLI (US-008).
+/// Create a pull/merge request using the appropriate CLI for the detected platform.
 ///
-/// `labels` is a slice of label names to apply. Labels that don't exist
-/// on the repo will cause a warning but won't fail the PR creation.
+/// - GitHub → `gh pr create`
+/// - GitLab → `glab mr create`
+///
+/// `labels` is a slice of label names to apply. Labels that don't exist on the
+/// repo will cause a warning but won't fail the MR/PR creation.
 pub fn create_pr(
+    project_path: &Path,
+    title: &str,
+    body: &str,
+    base_branch: &str,
+    labels: &[&str],
+) -> Result<String> {
+    match detect_platform(project_path) {
+        GitPlatform::GitHub => create_pr_github(project_path, title, body, base_branch, labels),
+        GitPlatform::GitLab => create_mr_gitlab(project_path, title, body, base_branch, labels),
+    }
+}
+
+fn create_pr_github(
     project_path: &Path,
     title: &str,
     body: &str,
@@ -169,7 +209,6 @@ pub fn create_pr(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // If it's just a label warning, still try to get the PR URL
         if stderr.contains("label") && !stderr.contains("fatal") {
             warn!("PR label warning: {}", stderr.trim());
         } else {
@@ -180,6 +219,53 @@ pub fn create_pr(
     let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     info!("Created PR: {}", pr_url);
     Ok(pr_url)
+}
+
+fn create_mr_gitlab(
+    project_path: &Path,
+    title: &str,
+    body: &str,
+    base_branch: &str,
+    labels: &[&str],
+) -> Result<String> {
+    let mut args = vec![
+        "mr".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--description".to_string(),
+        body.to_string(),
+        "--target-branch".to_string(),
+        base_branch.to_string(),
+        "--yes".to_string(), // non-interactive
+    ];
+
+    if !labels.is_empty() {
+        args.push("--label".to_string());
+        args.push(labels.join(","));
+    }
+
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let output = Command::new("glab")
+        .current_dir(project_path)
+        .args(&args_ref)
+        .output()
+        .context("Failed to create MR (is glab CLI installed and authenticated?)")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("label") && !stderr.contains("fatal") {
+            warn!("MR label warning: {}", stderr.trim());
+        } else {
+            anyhow::bail!("glab mr create failed: {}", stderr);
+        }
+    }
+
+    // glab outputs the MR URL on stdout
+    let mr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    info!("Created MR: {}", mr_url);
+    Ok(mr_url)
 }
 
 /// Revert all uncommitted changes in the working directory
@@ -374,5 +460,56 @@ mod tests {
         let staged = String::from_utf8_lossy(&output.stdout);
         assert!(staged.contains("a.txt"));
         assert!(!staged.contains("b.txt"));
+    }
+
+    #[test]
+    fn test_detect_platform_defaults_to_github_without_remote() {
+        let tmp = git_repo();
+        // No remote set — should default to GitHub
+        assert_eq!(detect_platform(tmp.path()), GitPlatform::GitHub);
+    }
+
+    #[test]
+    fn test_detect_platform_github() {
+        let tmp = git_repo();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["remote", "add", "origin", "https://github.com/org/repo.git"])
+            .output()
+            .unwrap();
+        assert_eq!(detect_platform(tmp.path()), GitPlatform::GitHub);
+    }
+
+    #[test]
+    fn test_detect_platform_gitlab_https() {
+        let tmp = git_repo();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["remote", "add", "origin", "https://gitlab.com/org/repo.git"])
+            .output()
+            .unwrap();
+        assert_eq!(detect_platform(tmp.path()), GitPlatform::GitLab);
+    }
+
+    #[test]
+    fn test_detect_platform_gitlab_ssh() {
+        let tmp = git_repo();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["remote", "add", "origin", "git@gitlab.com:org/repo.git"])
+            .output()
+            .unwrap();
+        assert_eq!(detect_platform(tmp.path()), GitPlatform::GitLab);
+    }
+
+    #[test]
+    fn test_detect_platform_self_hosted_gitlab() {
+        let tmp = git_repo();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["remote", "add", "origin", "https://gitlab.mycompany.com/org/repo.git"])
+            .output()
+            .unwrap();
+        assert_eq!(detect_platform(tmp.path()), GitPlatform::GitLab);
     }
 }

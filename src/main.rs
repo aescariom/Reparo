@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod claude;
 mod config;
+mod engine;
 #[allow(dead_code)]
 mod git;
 mod orchestrator;
@@ -46,6 +47,23 @@ async fn main() {
                     .add_directive("reparo=info".parse().unwrap()),
             )
             .init();
+    }
+
+    // Handle --restore-personal-yaml before validation
+    if config.restore_personal_yaml {
+        match yaml_config::restore_personal_config() {
+            Ok(()) => {
+                println!(
+                    "Personal config (~/.config/reparo/config.yaml) restored to defaults for v{}",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Failed to restore personal config: {:#}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // US-001: Validate all local configuration
