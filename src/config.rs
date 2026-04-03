@@ -131,6 +131,23 @@ pub struct Config {
     #[arg(long, env = "REPARO_MAX_BOOST_FILE_LINES", default_value = "500")]
     pub max_boost_file_lines: usize,
 
+    /// Files to process per wave before running the test suite once (default: 3).
+    /// Larger values = fewer test runs but more wasted work if a wave fails.
+    #[arg(long, alias = "coverage_wave_size", env = "REPARO_COVERAGE_WAVE_SIZE", default_value = "3")]
+    pub coverage_wave_size: u32,
+
+    /// Files per coverage boost commit (0 = same as coverage_wave_size, 1 = one commit per file)
+    #[arg(long, env = "REPARO_COVERAGE_COMMIT_BATCH", default_value = "0")]
+    pub coverage_commit_batch: u32,
+
+    /// Stop coverage boost after N consecutive wave failures (0 = disabled)
+    #[arg(long, env = "REPARO_MAX_BOOST_FAILURES", default_value = "5")]
+    pub max_boost_failures: usize,
+
+    /// Disable retry of failed wave files with error context in per-file fallback
+    #[arg(long, default_value = "false")]
+    pub skip_retry_failed_wave_files: bool,
+
     /// Skip the final validation step (run full test suite after all fixes)
     #[arg(long, default_value = "false")]
     pub skip_final_validation: bool,
@@ -155,9 +172,18 @@ pub struct Config {
     #[arg(long, default_value = "false")]
     pub skip_pact: bool,
 
+    /// Skip the pre-push rebase onto the latest base branch
+    #[arg(long, default_value = "false")]
+    pub skip_rebase: bool,
+
     /// Reset personal config (~/.config/reparo/config.yaml) to defaults and exit
     #[arg(long, default_value = "false")]
     pub restore_personal_yaml: bool,
+
+    /// External issue/ticket reference to embed in commit messages via {ticket} placeholder
+    /// (e.g., JIRA-123, #42, LINEAR-456). CLI-only — not configurable via YAML.
+    #[arg(long)]
+    pub commit_issue: Option<String>,
 
     /// Glob patterns to exclude from coverage boost (populated from YAML)
     #[arg(skip)]
@@ -182,6 +208,10 @@ pub struct Config {
     /// Pact/contract testing configuration (populated from YAML)
     #[arg(skip)]
     pub pact: PactConfig,
+
+    /// Test generation configuration (populated from YAML, US-040)
+    #[arg(skip)]
+    pub test_generation: TestGenerationConfig,
 }
 
 /// Validated, ready-to-use configuration.
@@ -238,6 +268,14 @@ pub struct ValidatedConfig {
     pub max_boost_file_lines: usize,
     /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
     pub coverage_exclude: Vec<String>,
+    /// Files per wave before running the test suite once (default: 3)
+    pub coverage_wave_size: u32,
+    /// Files per coverage boost commit (resolved: never 0 at runtime)
+    pub coverage_commit_batch: u32,
+    /// Stop coverage boost after N consecutive wave failures (0 = disabled)
+    pub max_boost_failures: usize,
+    /// Retry failed wave files with error context in per-file fallback
+    pub retry_failed_wave_files: bool,
     /// Skip the final validation step (full test suite after all fixes)
     pub skip_final_validation: bool,
     /// Maximum repair attempts during final validation (all tests must pass)
@@ -249,11 +287,13 @@ pub struct ValidatedConfig {
     /// Files that Claude must never modify (reverted automatically after each fix).
     /// Matched case-insensitively against the basename of changed files.
     pub protected_files: Vec<String>,
-    /// Commit message format template. Placeholders: {type}, {scope}, {message}, {issue_key}, {rule}, {file}
+    /// Commit message format template. Placeholders: {type}, {scope}, {message}, {issue_key}, {rule}, {file}, {ticket}
     /// Plus any custom vars from git.commit_vars.
     pub commit_format: String,
     /// Extra variables for commit format placeholders.
     pub commit_vars: std::collections::HashMap<String, String>,
+    /// External issue/ticket reference (CLI-only). Available as {ticket} in commit format.
+    pub commit_issue: Option<String>,
     /// Skip the documentation quality step
     pub skip_docs: bool,
     /// Documentation quality configuration
@@ -262,8 +302,12 @@ pub struct ValidatedConfig {
     pub skip_pact: bool,
     /// Pact/contract testing configuration
     pub pact: PactConfig,
+    /// Skip the pre-push rebase onto the latest base branch
+    pub skip_rebase: bool,
     /// Resolved engine routing configuration for AI dispatch
     pub engine_routing: crate::engine::EngineRoutingConfig,
+    /// Resolved test generation configuration for framework-aware prompts (US-040)
+    pub test_generation: TestGenerationConfig,
 }
 
 /// Resolved documentation configuration for runtime use.
@@ -354,6 +398,16 @@ impl PactConfig {
 
         warnings
     }
+}
+
+/// Resolved test generation configuration for framework-aware prompts (US-040).
+#[derive(Debug, Clone, Default)]
+pub struct TestGenerationConfig {
+    pub framework: Option<String>,
+    pub mock_framework: Option<String>,
+    pub assertion_library: Option<String>,
+    pub avoid_spring_context: bool,
+    pub custom_instructions: Option<String>,
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -492,6 +546,14 @@ impl Config {
             coverage_rounds: self.coverage_rounds,
             max_boost_file_lines: self.max_boost_file_lines,
             coverage_exclude: self.coverage_exclude.clone(),
+            coverage_wave_size: std::cmp::max(1, self.coverage_wave_size),
+            coverage_commit_batch: if self.coverage_commit_batch == 0 {
+                std::cmp::max(1, self.coverage_wave_size)
+            } else {
+                self.coverage_commit_batch
+            },
+            max_boost_failures: self.max_boost_failures,
+            retry_failed_wave_files: !self.skip_retry_failed_wave_files,
             skip_final_validation: self.skip_final_validation,
             final_validation_attempts: self.final_validation_attempts,
             skip_dedup: self.skip_dedup,
@@ -499,14 +561,17 @@ impl Config {
             protected_files: self.protected_files,
             commit_format: if self.commit_format.is_empty() { "{type}({scope}): {message}".to_string() } else { self.commit_format },
             commit_vars: self.commit_vars,
+            commit_issue: self.commit_issue,
             skip_docs: self.skip_docs,
             documentation: DocumentationConfig::default(),
             skip_pact: self.skip_pact,
+            skip_rebase: self.skip_rebase,
             pact: self.pact,
             engine_routing: crate::engine::EngineRoutingConfig {
                 engines: personal_config.engines.clone(),
                 routing: personal_config.routing.clone(),
             },
+            test_generation: self.test_generation,
         };
 
         // Validate that all routed engines are available
@@ -775,6 +840,10 @@ mod tests {
             coverage_rounds: 3,
             max_boost_file_lines: 500,
             coverage_exclude: vec![],
+            coverage_wave_size: 3,
+            coverage_commit_batch: 0,
+            max_boost_failures: 5,
+            skip_retry_failed_wave_files: false,
             skip_final_validation: false,
             final_validation_attempts: 5,
             skip_dedup: false,
@@ -785,8 +854,11 @@ mod tests {
             skip_docs: false,
             documentation: DocumentationConfig::default(),
             skip_pact: false,
+            skip_rebase: false,
             pact: PactConfig::default(),
             restore_personal_yaml: false,
+            commit_issue: None,
+            test_generation: TestGenerationConfig::default(),
         }
     }
 
@@ -961,5 +1033,63 @@ mod tests {
 
         let g = ScannerKind::Gradle(PathBuf::from("./gradlew"));
         assert!(g.display_name().contains("gradle"));
+    }
+
+    #[test]
+    fn test_max_boost_failures_default() {
+        let config = Config::parse_from([
+            "reparo", "--path", ".",
+            "--sonar-url", "http://localhost:9000",
+            "--sonar-token", "tok",
+            "--sonar-project-id", "proj",
+        ]);
+        assert_eq!(config.max_boost_failures, 5);
+    }
+
+    #[test]
+    fn test_max_boost_failures_custom() {
+        let config = Config::parse_from([
+            "reparo", "--path", ".",
+            "--sonar-url", "http://localhost:9000",
+            "--sonar-token", "tok",
+            "--sonar-project-id", "proj",
+            "--max-boost-failures", "10",
+        ]);
+        assert_eq!(config.max_boost_failures, 10);
+    }
+
+    #[test]
+    fn test_max_boost_failures_disabled() {
+        let config = Config::parse_from([
+            "reparo", "--path", ".",
+            "--sonar-url", "http://localhost:9000",
+            "--sonar-token", "tok",
+            "--sonar-project-id", "proj",
+            "--max-boost-failures", "0",
+        ]);
+        assert_eq!(config.max_boost_failures, 0);
+    }
+
+    #[test]
+    fn test_retry_failed_wave_files_default() {
+        let config = Config::parse_from([
+            "reparo", "--path", ".",
+            "--sonar-url", "http://localhost:9000",
+            "--sonar-token", "tok",
+            "--sonar-project-id", "proj",
+        ]);
+        assert!(!config.skip_retry_failed_wave_files);
+    }
+
+    #[test]
+    fn test_retry_failed_wave_files_disabled() {
+        let config = Config::parse_from([
+            "reparo", "--path", ".",
+            "--sonar-url", "http://localhost:9000",
+            "--sonar-token", "tok",
+            "--sonar-project-id", "proj",
+            "--skip-retry-failed-wave-files",
+        ]);
+        assert!(config.skip_retry_failed_wave_files);
     }
 }

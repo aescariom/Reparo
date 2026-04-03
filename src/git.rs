@@ -140,6 +140,23 @@ pub fn commit(project_path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a commit bypassing pre-commit hooks (`--no-verify`).
+///
+/// Used for temporary WIP commits that will be squashed later, so they
+/// don't need to satisfy Conventional Commits or other hook validations.
+pub fn commit_no_verify(project_path: &Path, message: &str) -> Result<()> {
+    let status = Command::new("git")
+        .current_dir(project_path)
+        .args(["commit", "--no-verify", "-m", message])
+        .status()
+        .context("Failed to create commit (--no-verify)")?;
+
+    if !status.success() {
+        anyhow::bail!("git commit --no-verify failed");
+    }
+    Ok(())
+}
+
 /// Push the current branch to origin
 pub fn push(project_path: &Path, branch: &str) -> Result<()> {
     let status = Command::new("git")
@@ -268,6 +285,15 @@ fn create_mr_gitlab(
     Ok(mr_url)
 }
 
+/// Unstage all staged files (git reset), keeping working tree changes.
+pub fn reset_index(project_path: &Path) -> Result<()> {
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["reset"])
+        .output();
+    Ok(())
+}
+
 /// Revert all uncommitted changes in the working directory
 pub fn revert_changes(project_path: &Path) -> Result<()> {
     let status = Command::new("git")
@@ -285,6 +311,28 @@ pub fn revert_changes(project_path: &Path) -> Result<()> {
     if !status.success() {
         anyhow::bail!("Failed to revert changes");
     }
+    Ok(())
+}
+
+/// Ensure the working tree is completely clean: revert tracked changes,
+/// remove untracked files, and unstage everything. Returns Ok(()) even
+/// if the tree was already clean.
+pub fn ensure_clean_state(project_path: &Path) -> Result<()> {
+    // Reset index (unstage)
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["reset", "HEAD", "--", "."])
+        .status();
+    // Revert tracked changes (best-effort — may be nothing to revert)
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["checkout", "."])
+        .status();
+    // Clean untracked files
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["clean", "-fd"])
+        .status();
     Ok(())
 }
 
@@ -352,6 +400,283 @@ pub fn commit_all(project_path: &Path, message: &str) -> Result<()> {
     commit(project_path, message)
 }
 
+/// Fetch a branch from origin.
+pub fn fetch_branch(project_path: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["fetch", "origin", branch])
+        .output()
+        .context("Failed to fetch from origin")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git fetch origin {} failed: {}", branch, stderr);
+    }
+    info!("Fetched origin/{}", branch);
+    Ok(())
+}
+
+/// Rebase the current branch onto `origin/<base>`.
+///
+/// Returns `Ok(true)` if the rebase completed cleanly, `Ok(false)` if there
+/// are conflicts that need resolution.
+pub fn rebase_onto(project_path: &Path, base: &str) -> Result<bool> {
+    let target = format!("origin/{}", base);
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["rebase", &target])
+        .output()
+        .context("Failed to start rebase")?;
+
+    if output.status.success() {
+        info!("Rebase onto {} completed cleanly", target);
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Git exits with status 1 and mentions "CONFLICT" or "could not apply" on conflicts
+    if stderr.contains("CONFLICT") || stderr.contains("could not apply") || stderr.contains("Merge conflict") {
+        warn!("Rebase onto {} has conflicts", target);
+        return Ok(false);
+    }
+
+    anyhow::bail!("git rebase {} failed: {}", target, stderr);
+}
+
+/// List files with unresolved merge conflicts.
+pub fn conflict_files(project_path: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .context("Failed to list conflict files")?;
+
+    let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    Ok(files)
+}
+
+/// Abort an in-progress rebase.
+pub fn abort_rebase(project_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["rebase", "--abort"])
+        .output()
+        .context("Failed to abort rebase")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git rebase --abort failed: {}", stderr);
+    }
+    info!("Rebase aborted");
+    Ok(())
+}
+
+/// Stage all changes and continue an in-progress rebase.
+///
+/// Returns `Ok(true)` if the rebase is now complete, `Ok(false)` if there
+/// are more conflicts on subsequent commits.
+pub fn mark_resolved_and_continue(project_path: &Path) -> Result<bool> {
+    // Stage resolved files
+    add_all(project_path)?;
+
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["rebase", "--continue"])
+        .env("GIT_EDITOR", "true") // skip editor for commit messages
+        .output()
+        .context("Failed to continue rebase")?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("CONFLICT") || stderr.contains("could not apply") || stderr.contains("Merge conflict") {
+        return Ok(false);
+    }
+
+    anyhow::bail!("git rebase --continue failed: {}", stderr);
+}
+
+/// Stash specific files with a descriptive message.
+///
+/// Uses `git stash push -m <message> -- <files>` to save only the specified
+/// files to the stash, leaving other changes in the working tree.
+pub fn stash_push(project_path: &Path, message: &str, files: &[&str]) -> Result<()> {
+    let mut args = vec!["stash", "push", "-m", message, "--"];
+    args.extend(files);
+
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(&args)
+        .output()
+        .context("Failed to stash files")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git stash push failed: {}", stderr);
+    }
+    Ok(())
+}
+
+/// Pop the most recent stash entry.
+pub fn stash_pop(project_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["stash", "pop"])
+        .output()
+        .context("Failed to pop stash")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git stash pop failed: {}", stderr);
+    }
+    Ok(())
+}
+
+/// Apply and drop all stash entries whose message starts with the given prefix.
+///
+/// Uses `apply` + `drop` instead of `pop` so that stashes are preserved on
+/// failure. Stages applied changes between iterations to keep the working tree
+/// clean for the next apply. Returns the number of stashes restored.
+pub fn stash_pop_matching(project_path: &Path, prefix: &str) -> Result<u32> {
+    let mut popped = 0u32;
+    loop {
+        let indices = stash_indices_matching(project_path, prefix)?;
+        if indices.is_empty() {
+            break;
+        }
+        let idx = indices[0];
+        let stash_ref = format!("stash@{{{}}}", idx);
+
+        // Apply (does not remove the stash entry)
+        let output = Command::new("git")
+            .current_dir(project_path)
+            .args(["stash", "apply", &stash_ref])
+            .output()
+            .context("Failed to apply stash by index")?;
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Check if the failure is due to merge conflicts (e.g. add/add on
+            // test files generated by different waves).  In that case we can
+            // resolve automatically by accepting the incoming (stash) version.
+            if stdout.contains("CONFLICT") {
+                warn!(
+                    "git stash apply {} produced conflicts — resolving automatically by accepting incoming changes",
+                    stash_ref
+                );
+                // Collect unmerged (conflicted) file paths
+                let ls_output = Command::new("git")
+                    .current_dir(project_path)
+                    .args(["diff", "--name-only", "--diff-filter=U"])
+                    .output()
+                    .context("Failed to list unmerged files")?;
+                let unmerged: Vec<&str> = std::str::from_utf8(&ls_output.stdout)
+                    .unwrap_or("")
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if !unmerged.is_empty() {
+                    // Accept incoming (stash) version for each conflicted file
+                    let mut args = vec!["checkout", "--theirs", "--"];
+                    args.extend(unmerged.iter());
+                    let _ = Command::new("git")
+                        .current_dir(project_path)
+                        .args(&args)
+                        .output();
+                    // Mark conflicts as resolved
+                    let mut add_args = vec!["add", "--"];
+                    add_args.extend(unmerged.iter());
+                    let _ = Command::new("git")
+                        .current_dir(project_path)
+                        .args(&add_args)
+                        .output();
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "git stash apply {} failed:\nstderr: {}\nstdout: {}",
+                    stash_ref, stderr, stdout
+                );
+            }
+        }
+
+        // Drop the stash entry now that apply succeeded
+        let _ = Command::new("git")
+            .current_dir(project_path)
+            .args(["stash", "drop", &stash_ref])
+            .output();
+
+        popped += 1;
+
+        // Stage applied changes so subsequent applies don't conflict
+        // with overlapping files (e.g., shared test utilities).
+        let _ = Command::new("git")
+            .current_dir(project_path)
+            .args(["add", "-A"])
+            .output();
+    }
+    Ok(popped)
+}
+
+/// Drop all stash entries whose message starts with the given prefix.
+///
+/// Best-effort cleanup — logs warnings but does not fail.
+pub fn stash_drop_matching(project_path: &Path, prefix: &str) -> Result<()> {
+    loop {
+        let indices = stash_indices_matching(project_path, prefix)?;
+        if indices.is_empty() {
+            break;
+        }
+        // Drop from highest index first to avoid shifting
+        let idx = indices.last().unwrap();
+        let output = Command::new("git")
+            .current_dir(project_path)
+            .args(["stash", "drop", &format!("stash@{{{}}}", idx)])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                warn!("Failed to drop stash@{{{}}}", idx);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find stash indices whose message contains the given prefix.
+pub fn stash_indices_matching(project_path: &Path, prefix: &str) -> Result<Vec<usize>> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["stash", "list"])
+        .output()
+        .context("Failed to list stashes")?;
+
+    let list = String::from_utf8_lossy(&output.stdout);
+    let mut indices = Vec::new();
+
+    for line in list.lines() {
+        // Format: stash@{0}: On branch: message
+        if line.contains(prefix) {
+            if let Some(idx_str) = line.strip_prefix("stash@{") {
+                if let Some(idx_end) = idx_str.find('}') {
+                    if let Ok(idx) = idx_str[..idx_end].parse::<usize>() {
+                        indices.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +738,25 @@ mod tests {
 
         commit(tmp.path(), "add file").unwrap();
         assert!(!has_staged_changes(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn test_commit_no_verify() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+        add_all(tmp.path()).unwrap();
+
+        commit_no_verify(tmp.path(), "wip: temp commit").unwrap();
+        assert!(!has_staged_changes(tmp.path()).unwrap());
+
+        // Verify the commit message is present in the log
+        let output = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(log.contains("wip: temp commit"));
     }
 
     #[test]
@@ -511,5 +855,299 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(detect_platform(tmp.path()), GitPlatform::GitLab);
+    }
+
+    #[test]
+    fn test_stash_push_and_pop() {
+        let tmp = git_repo();
+        // Create and commit a file first (stash requires a tracked file or untracked)
+        fs::write(tmp.path().join("tracked.txt"), "original").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add tracked").unwrap();
+
+        // Modify it
+        fs::write(tmp.path().join("tracked.txt"), "modified").unwrap();
+
+        // Stash the file
+        stash_push(tmp.path(), "test-stash", &["tracked.txt"]).unwrap();
+
+        // File should be reverted
+        let content = fs::read_to_string(tmp.path().join("tracked.txt")).unwrap();
+        assert_eq!(content, "original");
+
+        // Pop should restore it
+        stash_pop(tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("tracked.txt")).unwrap();
+        assert_eq!(content, "modified");
+    }
+
+    #[test]
+    fn test_stash_pop_matching() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add a").unwrap();
+
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add b").unwrap();
+
+        // Create two stashes with matching prefix
+        fs::write(tmp.path().join("a.txt"), "a-modified").unwrap();
+        stash_push(tmp.path(), "reparo-boost-a", &["a.txt"]).unwrap();
+
+        fs::write(tmp.path().join("b.txt"), "b-modified").unwrap();
+        stash_push(tmp.path(), "reparo-boost-b", &["b.txt"]).unwrap();
+
+        // Pop all matching "reparo-boost"
+        let count = stash_pop_matching(tmp.path(), "reparo-boost").unwrap();
+        assert_eq!(count, 2);
+
+        // Both files should be restored
+        assert_eq!(fs::read_to_string(tmp.path().join("a.txt")).unwrap(), "a-modified");
+        assert_eq!(fs::read_to_string(tmp.path().join("b.txt")).unwrap(), "b-modified");
+    }
+
+    #[test]
+    fn test_stash_drop_matching() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("file.txt"), "content").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add file").unwrap();
+
+        // Create a stash
+        fs::write(tmp.path().join("file.txt"), "modified").unwrap();
+        stash_push(tmp.path(), "reparo-boost-test", &["file.txt"]).unwrap();
+
+        // Verify stash exists
+        let indices = stash_indices_matching(tmp.path(), "reparo-boost").unwrap();
+        assert_eq!(indices.len(), 1);
+
+        // Drop it
+        stash_drop_matching(tmp.path(), "reparo-boost").unwrap();
+
+        // Should be gone
+        let indices = stash_indices_matching(tmp.path(), "reparo-boost").unwrap();
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_stash_pop_matching_no_matches() {
+        let tmp = git_repo();
+        let count = stash_pop_matching(tmp.path(), "nonexistent-prefix").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_stash_indices_matching() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("f.txt"), "v").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "init file").unwrap();
+
+        // Create stashes with different messages
+        fs::write(tmp.path().join("f.txt"), "v1").unwrap();
+        stash_push(tmp.path(), "reparo-boost-1", &["f.txt"]).unwrap();
+
+        fs::write(tmp.path().join("f.txt"), "v2").unwrap();
+        stash_push(tmp.path(), "other-stash", &["f.txt"]).unwrap();
+
+        // Only "reparo-boost" should match
+        let indices = stash_indices_matching(tmp.path(), "reparo-boost").unwrap();
+        assert_eq!(indices.len(), 1);
+
+        // "other-stash" should match separately
+        let indices = stash_indices_matching(tmp.path(), "other-stash").unwrap();
+        assert_eq!(indices.len(), 1);
+
+        // Clean up
+        stash_drop_matching(tmp.path(), "reparo-boost").unwrap();
+        stash_drop_matching(tmp.path(), "other-stash").unwrap();
+    }
+
+    #[test]
+    fn test_rebase_onto_clean() {
+        let tmp = git_repo();
+        let base = current_branch(tmp.path()).unwrap();
+
+        // Add a commit on the base branch
+        fs::write(tmp.path().join("base.txt"), "base content").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "base commit").unwrap();
+
+        // Create a fix branch from before that commit
+        create_branch(tmp.path(), "fix/test", &base).unwrap();
+        fs::write(tmp.path().join("fix.txt"), "fix content").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "fix commit").unwrap();
+
+        // Simulate origin by adding a local ref (rebase_onto uses origin/<base>)
+        // For testing without a remote, we update the ref manually
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["update-ref", &format!("refs/remotes/origin/{}", base),
+                   &base])
+            .output()
+            .unwrap();
+
+        let result = rebase_onto(tmp.path(), &base).unwrap();
+        assert!(result, "Rebase should succeed cleanly (no conflicts)");
+    }
+
+    #[test]
+    fn test_rebase_onto_with_conflict() {
+        let tmp = git_repo();
+        let base = current_branch(tmp.path()).unwrap();
+
+        // Create a shared file
+        fs::write(tmp.path().join("shared.txt"), "original").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add shared").unwrap();
+
+        // Create fix branch and modify shared.txt
+        create_branch(tmp.path(), "fix/conflict", &base).unwrap();
+        fs::write(tmp.path().join("shared.txt"), "fix version").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "fix shared").unwrap();
+
+        // Go back to base and create a divergent commit
+        checkout(tmp.path(), &base).unwrap();
+        fs::write(tmp.path().join("shared.txt"), "base version").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "update shared on base").unwrap();
+
+        // Point origin/<base> to the updated base
+        let rev = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", &base])
+            .output()
+            .unwrap();
+        let rev_str = String::from_utf8_lossy(&rev.stdout).trim().to_string();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["update-ref", &format!("refs/remotes/origin/{}", base), &rev_str])
+            .output()
+            .unwrap();
+
+        // Switch to fix branch and attempt rebase
+        checkout(tmp.path(), "fix/conflict").unwrap();
+        let result = rebase_onto(tmp.path(), &base).unwrap();
+        assert!(!result, "Rebase should detect conflicts");
+
+        // Verify conflict files
+        let conflicts = conflict_files(tmp.path()).unwrap();
+        assert!(conflicts.contains(&"shared.txt".to_string()));
+
+        // Abort should succeed
+        abort_rebase(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn test_conflict_files_empty_when_clean() {
+        let tmp = git_repo();
+        let files = conflict_files(tmp.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_mark_resolved_and_continue() {
+        let tmp = git_repo();
+        let base = current_branch(tmp.path()).unwrap();
+
+        // Setup conflict scenario
+        fs::write(tmp.path().join("shared.txt"), "original").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "add shared").unwrap();
+
+        create_branch(tmp.path(), "fix/resolve", &base).unwrap();
+        fs::write(tmp.path().join("shared.txt"), "fix version").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "fix shared").unwrap();
+
+        checkout(tmp.path(), &base).unwrap();
+        fs::write(tmp.path().join("shared.txt"), "base version").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "update shared on base").unwrap();
+
+        let rev = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", &base])
+            .output()
+            .unwrap();
+        let rev_str = String::from_utf8_lossy(&rev.stdout).trim().to_string();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["update-ref", &format!("refs/remotes/origin/{}", base), &rev_str])
+            .output()
+            .unwrap();
+
+        checkout(tmp.path(), "fix/resolve").unwrap();
+        let has_conflict = !rebase_onto(tmp.path(), &base).unwrap();
+        assert!(has_conflict);
+
+        // Resolve by writing a merged version
+        fs::write(tmp.path().join("shared.txt"), "resolved content").unwrap();
+        let done = mark_resolved_and_continue(tmp.path()).unwrap();
+        assert!(done, "Rebase should complete after resolving the single conflict");
+    }
+
+    #[test]
+    fn test_stash_pop_matching_resolves_add_add_conflict() {
+        let tmp = git_repo();
+
+        // Create a file so the repo is non-empty (stash needs at least one commit)
+        fs::write(tmp.path().join("base.txt"), "base").unwrap();
+        add_all(tmp.path()).unwrap();
+        commit(tmp.path(), "initial").unwrap();
+
+        // Stash 1: adds "shared.txt" with content "version-a"
+        fs::write(tmp.path().join("shared.txt"), "version-a").unwrap();
+        fs::write(tmp.path().join("only-a.txt"), "a").unwrap();
+        add_files(tmp.path(), &["shared.txt", "only-a.txt"]).unwrap();
+        stash_push(tmp.path(), "reparo-boost:fileA", &["shared.txt", "only-a.txt"]).unwrap();
+
+        // Stash 2: adds "shared.txt" with different content (add/add conflict)
+        fs::write(tmp.path().join("shared.txt"), "version-b").unwrap();
+        fs::write(tmp.path().join("only-b.txt"), "b").unwrap();
+        add_files(tmp.path(), &["shared.txt", "only-b.txt"]).unwrap();
+        stash_push(tmp.path(), "reparo-boost:fileB", &["shared.txt", "only-b.txt"]).unwrap();
+
+        // Pop both — should resolve the conflict automatically instead of bailing
+        let count = stash_pop_matching(tmp.path(), "reparo-boost").unwrap();
+        assert_eq!(count, 2);
+
+        // Both unique files should be present
+        assert!(tmp.path().join("only-a.txt").exists());
+        assert!(tmp.path().join("only-b.txt").exists());
+
+        // shared.txt should exist without conflict markers
+        let shared = fs::read_to_string(tmp.path().join("shared.txt")).unwrap();
+        assert!(!shared.contains("<<<<<<<"), "shared.txt should not contain conflict markers");
+    }
+
+    #[test]
+    fn test_ensure_clean_state_removes_untracked() {
+        let tmp = git_repo();
+        // Create an untracked file
+        fs::write(tmp.path().join("untracked.txt"), "garbage").unwrap();
+        assert!(tmp.path().join("untracked.txt").exists());
+
+        ensure_clean_state(tmp.path()).unwrap();
+        assert!(!tmp.path().join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn test_ensure_clean_state_reverts_tracked() {
+        let tmp = git_repo();
+        // Create and commit a tracked file
+        fs::write(tmp.path().join("hello.txt"), "original").unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["add", "hello.txt"]).output().unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["commit", "-m", "add hello"]).output().unwrap();
+        // Modify tracked file
+        fs::write(tmp.path().join("hello.txt"), "modified").unwrap();
+        assert!(has_changes(tmp.path()).unwrap());
+
+        ensure_clean_state(tmp.path()).unwrap();
+        assert!(!has_changes(tmp.path()).unwrap());
     }
 }

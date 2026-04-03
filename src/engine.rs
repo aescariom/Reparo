@@ -687,18 +687,25 @@ mod tests {
     #[test]
     fn test_run_engine_timeout() {
         let tmp = tempfile::tempdir().unwrap();
+        // Use `sh -c sleep\ 30` via stdin mode so no extra CLI args disrupt the command.
+        // sleep ignores stdin, so it will genuinely sleep until the 1s timeout fires.
         let invocation = EngineInvocation {
             engine_kind: EngineKind::Claude,
-            command: "sleep".to_string(),
-            base_args: vec!["30".to_string()],
+            command: "sh".to_string(),
+            base_args: vec!["-c".to_string(), "sleep 30".to_string()],
             model: None,
             effort: None,
-            prompt_flag: "-p".to_string(),
-            prompt_via_stdin: false,
+            prompt_flag: String::new(),
+            prompt_via_stdin: true,
         };
         let result = run_engine(tmp.path(), "test", 1, false, false, &invocation);
         assert!(result.is_err());
-        assert!(format!("{}", result.unwrap_err()).contains("timed out"));
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("timed out"),
+            "Expected 'timed out' in error but got: {}",
+            err_msg
+        );
     }
 
     #[test]
