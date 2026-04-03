@@ -83,6 +83,22 @@ enum TestGenResult {
     GenerationFailed { error: String },
 }
 
+/// Result of generating tests for a single file during coverage boost.
+/// Used to accumulate test files for batch committing.
+#[allow(dead_code)]
+struct BoostFileResult {
+    /// Source file that was boosted
+    file: String,
+    /// Test files created (relative paths)
+    test_files: Vec<String>,
+    /// Generated artifacts to stage alongside tests (coverage reports, etc.)
+    artifacts: Vec<String>,
+    /// Number of rounds that produced passing tests
+    rounds_completed: u32,
+    /// File coverage percentage before boost
+    coverage_before: f64,
+}
+
 pub struct Orchestrator {
     config: ValidatedConfig,
     client: SonarClient,
@@ -97,6 +113,8 @@ pub struct Orchestrator {
     rule_cache: std::collections::HashMap<String, String>,
     /// Engine routing configuration for multi-engine AI dispatch
     engine_routing: crate::engine::EngineRoutingConfig,
+    /// Cached test examples (computed once, reused across issues)
+    cached_test_examples: Option<String>,
 }
 
 impl Orchestrator {
@@ -146,6 +164,7 @@ impl Orchestrator {
             exec_state,
             rule_cache: std::collections::HashMap::new(),
             engine_routing,
+            cached_test_examples: None,
         })
     }
 
@@ -204,6 +223,69 @@ impl Orchestrator {
                 warn!("Could not check git status: {} — proceeding anyway", e);
             }
         }
+
+        // Step 0b: Preflight — build and tests MUST pass before anything else.
+        // Detect test command here (will also be used later in the main flow).
+        {
+            let preflight_test_cmd = self.config.test_command.clone()
+                .or_else(|| self.config.commands.test.clone())
+                .or_else(|| runner::detect_test_command(&self.config.path));
+
+            let preflight_build_cmd = self.config.commands.build.clone();
+
+            info!("=== Step 0b: Preflight build + test validation ===");
+
+            if let Some(ref build_cmd) = preflight_build_cmd {
+                info!("Preflight: running build...");
+                match runner::run_shell_command(&self.config.path, build_cmd, "preflight build") {
+                    Ok((true, _)) => {
+                        info!("✓ Preflight build passed");
+                    }
+                    Ok((false, output)) => {
+                        error!("╔═══════════════════════════════════════════════════════════════╗");
+                        error!("║            ✗  PREFLIGHT BUILD FAILED — ABORTING  ✗           ║");
+                        error!("║  Fix the build before running Reparo. Nothing was modified.  ║");
+                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                        error!("Build output:\n{}", truncate_tail(&output, 3000));
+                        anyhow::bail!("Preflight build failed — project does not compile. Fix the build and retry.");
+                    }
+                    Err(e) => {
+                        error!("╔═══════════════════════════════════════════════════════════════╗");
+                        error!("║          ✗  PREFLIGHT BUILD ERROR — ABORTING  ✗              ║");
+                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                        anyhow::bail!("Preflight build error: {}", e);
+                    }
+                }
+            }
+
+            if let Some(ref test_cmd) = preflight_test_cmd {
+                info!("Preflight: running test suite...");
+                match runner::run_tests(&self.config.path, test_cmd, self.config.test_timeout) {
+                    Ok((true, _)) => {
+                        info!("✓ Preflight tests passed");
+                    }
+                    Ok((false, output)) => {
+                        error!("╔═══════════════════════════════════════════════════════════════╗");
+                        error!("║            ✗  PREFLIGHT TESTS FAILED — ABORTING  ✗           ║");
+                        error!("║  Fix failing tests before running Reparo. Nothing modified.  ║");
+                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                        error!("Test output:\n{}", truncate_tail(&output, 3000));
+                        anyhow::bail!("Preflight tests failed — fix failing tests and retry.");
+                    }
+                    Err(e) => {
+                        error!("╔═══════════════════════════════════════════════════════════════╗");
+                        error!("║          ✗  PREFLIGHT TEST ERROR — ABORTING  ✗               ║");
+                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                        anyhow::bail!("Preflight test error: {}", e);
+                    }
+                }
+            } else {
+                warn!("No test command detected for preflight check. Use --test-command to configure one.");
+            }
+        }
+
+        // Step 0.5: Cache test examples once (avoids re-globbing per issue)
+        self.cached_test_examples = Some(runner::find_test_examples(&self.config.path).join("\n\n"));
 
         // Step 0.5: Validate pact configuration if enabled
         if !self.config.skip_pact && self.config.pact.enabled {
@@ -914,18 +996,71 @@ Apply the fix now."#,
             return Ok(());
         }
 
-        info!("Found {} source files needing test coverage — generating tests starting from least covered", files_needing_tests.len());
+        // Wave-based processing:
+        //   parallel_size  = how many files to process per wave (AI generation only, no per-file tests)
+        //   commit_size    = how many files per git commit (>= parallel_size, already resolved)
+        //   skip_test_run  = true when parallel_size > 1 — defer test validation to wave time
+        //   commit_immediately = true when commit_size <= parallel_size (one commit per wave)
+        //
+        // If commit_size > parallel_size, each wave creates a temp "reparo-wip:" commit and
+        // every commit_size / parallel_size waves get squashed into one real commit.
+        let parallel_size = self.config.coverage_wave_size as usize;
+        let commit_size = self.config.coverage_commit_batch as usize; // already resolved (never 0)
+        let skip_test_run = parallel_size > 1;
+        let batch_mode = commit_size > 1 || skip_test_run;
+        let commit_immediately = commit_size <= parallel_size;
+
+        info!(
+            "Found {} source files needing test coverage — generating tests starting from least covered{}",
+            files_needing_tests.len(),
+            if batch_mode {
+                format!(" (wave size: {}, commit batch: {} files)", parallel_size, commit_size)
+            } else {
+                String::new()
+            }
+        );
 
         let test_examples = runner::find_test_examples(&self.config.path);
         let test_examples_str = test_examples.join("\n\n");
         let test_framework = test_command;
 
-        let mut current_pct = overall_pct;
-        let mut files_boosted = 0;
-        // Track which files have been boosted so we can skip them
-        let mut boosted_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // US-040: Build framework context once for all files in the boost loop
+        let detected_deps = runner::detect_test_dependencies(&self.config.path);
+        let framework_context_base = build_framework_context(
+            &detected_deps,
+            &self.config.test_generation,
+        );
 
-        for fc in &files_needing_tests {
+        let stash_prefix = "reparo-boost";
+
+        let mut current_pct = overall_pct;
+        let start_pct = overall_pct;
+        let mut files_boosted = 0;
+        let mut files_processed = 0usize;
+        // Current wave accumulator (parallel_size files per wave)
+        let mut current_wave: Vec<BoostFileResult> = Vec::new();
+        // Temp "reparo-wip:" commits waiting to be squashed (when commit_size > parallel_size)
+        let mut temp_commit_count = 0usize;
+        let mut temp_commit_files: Vec<String> = Vec::new();
+        let total_files = files_needing_tests.len();
+        // Count of files actually queued/processed (for display)
+        let mut queue_idx = 0;
+        // Circuit breaker: stop after N consecutive wave failures (US-034)
+        let mut consecutive_wave_failures = 0usize;
+        let max_wave_failures = self.config.max_boost_failures;
+
+        for (idx, fc) in files_needing_tests.iter().enumerate() {
+            // Circuit breaker: stop if too many consecutive waves failed
+            if max_wave_failures > 0 && consecutive_wave_failures >= max_wave_failures {
+                warn!(
+                    "Stopping coverage boost: {} consecutive waves failed — likely a systemic issue \
+                     (e.g. missing test dependencies, Spring context not available). \
+                     Processed {} files, {} committed, {} remaining. Fix test setup and re-run.",
+                    consecutive_wave_failures, queue_idx, files_boosted, total_files - idx
+                );
+                break;
+            }
+
             // Check if we can stop: overall threshold met AND this file doesn't need per-file boost
             let overall_met = current_pct >= self.config.min_coverage;
             let file_needs_boost = has_file_threshold && fc.coverage_pct < self.config.min_file_coverage;
@@ -934,6 +1069,7 @@ Apply the fix now."#,
                 continue; // Skip files that are only needed for overall boost
             }
 
+            queue_idx += 1;
             let reason = if !overall_met && file_needs_boost {
                 format!("overall {:.1}% < {:.0}% AND file {:.1}% < {:.0}%",
                     current_pct, self.config.min_coverage, fc.coverage_pct, self.config.min_file_coverage)
@@ -944,30 +1080,157 @@ Apply the fix now."#,
             };
 
             info!(
-                "--- Coverage boost [{}/{}]: {} ({:.1}%, {}/{} lines) — {} ---",
-                files_boosted + 1,
-                files_needing_tests.len(),
+                "--- Coverage boost [{}/{}]: {} ({:.1}%, {}/{} lines) — {} | overall: {:.1}% ---",
+                queue_idx,
+                total_files,
                 fc.file,
                 fc.coverage_pct,
                 fc.covered_lines,
                 fc.total_lines,
-                reason
+                reason,
+                current_pct
             );
 
-            if self.boost_file_coverage(fc, test_framework, &test_examples_str)? {
-                files_boosted += 1;
-                boosted_files.insert(fc.file.clone());
+            let is_last = idx == total_files - 1;
 
-                // Re-measure coverage
-                match self.run_coverage_and_measure(&cov_cmd) {
-                    Some(pct) => {
-                        color_info!("Project-wide coverage after boost: {} (was {})", cov_vs(pct, self.config.min_coverage), cov_prev(current_pct));
-                        current_pct = pct;
-                    }
-                    None => {
-                        warn!("Could not re-measure coverage — continuing with next file");
+            files_processed += 1;
+            match self.generate_tests_for_file(fc, test_framework, &test_examples_str, stash_prefix, skip_test_run, &framework_context_base)? {
+                Some(result) if batch_mode && !result.test_files.is_empty() => {
+                    // Wave mode: accumulate result, commit at wave boundary
+                    current_wave.push(result);
+                }
+                Some(_) => {
+                    // Individual mode (parallel=1, commit=1): already committed inside generate_tests_for_file
+                    files_boosted += 1;
+                    consecutive_wave_failures = 0;
+                    match self.run_coverage_and_measure(&cov_cmd) {
+                        Some(pct) => {
+                            color_info!(
+                                "Project-wide coverage after boost: {} (was {})",
+                                cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                            );
+                            current_pct = pct;
+                        }
+                        None => {
+                            warn!("Could not re-measure coverage — continuing with next file");
+                        }
                     }
                 }
+                None => {
+                    // File was skipped (excluded, too large, no uncovered lines, etc.)
+                }
+            }
+
+            // Wave boundary: flush when wave is full or this is the last file
+            let wave_ready = !current_wave.is_empty()
+                && (current_wave.len() >= parallel_size || (is_last && !current_wave.is_empty()));
+
+            if wave_ready {
+                // Pre-wave stash hygiene: drop orphaned stashes from previous failed waves
+                if let Ok(orphan_indices) = git::stash_indices_matching(&self.config.path, stash_prefix) {
+                    if !orphan_indices.is_empty() {
+                        warn!("Dropping {} orphaned stash(es) with prefix '{}' before wave commit", orphan_indices.len(), stash_prefix);
+                        let _ = git::stash_drop_matching(&self.config.path, stash_prefix);
+                    }
+                }
+                // Safety: ensure working tree is clean before wave commit
+                let _ = git::ensure_clean_state(&self.config.path);
+
+                if commit_immediately {
+                    // commit_size <= parallel_size: one real commit per wave
+                    let committed = self.commit_boost_batch(&current_wave, test_framework, stash_prefix, skip_test_run, &framework_context_base)?;
+                    files_boosted += committed;
+                    current_wave.clear();
+                    if committed > 0 {
+                        consecutive_wave_failures = 0;
+                        if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                            color_info!(
+                                "Project-wide coverage after wave commit: {} (was {})",
+                                cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                            );
+                            current_pct = pct;
+                        }
+                    } else {
+                        consecutive_wave_failures += 1;
+                        // Cleanup after failed wave: drop residual stashes and ensure clean state
+                        let _ = git::stash_drop_matching(&self.config.path, stash_prefix);
+                        let _ = git::ensure_clean_state(&self.config.path);
+                    }
+                    info!(
+                        "Coverage boost progress: {}/{} files processed, {} committed, coverage: {:.1}% → {:.1}%",
+                        files_processed, total_files, files_boosted, start_pct, current_pct
+                    );
+                } else {
+                    // commit_size > parallel_size: create temp "reparo-wip:" commit, squash later
+                    let (committed, wave_files) =
+                        self.validate_and_temp_commit_wave(&current_wave, test_framework, stash_prefix, skip_test_run, &framework_context_base)?;
+                    current_wave.clear();
+                    if committed > 0 {
+                        consecutive_wave_failures = 0;
+                        // Only count as temp wip commit if wave_files is non-empty.
+                        // Fallback per-file commits return empty wave_files (they're already real commits).
+                        if !wave_files.is_empty() {
+                            temp_commit_count += 1;
+                            temp_commit_files.extend(wave_files);
+                        } else {
+                            // Per-file fallback created real commits — re-measure coverage
+                            if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                                color_info!(
+                                    "Project-wide coverage after per-file fallback: {} (was {})",
+                                    cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                                );
+                                current_pct = pct;
+                            }
+                        }
+                        files_boosted += committed;
+                    } else {
+                        consecutive_wave_failures += 1;
+                        // Cleanup after failed wave: drop residual stashes and ensure clean state
+                        let _ = git::stash_drop_matching(&self.config.path, stash_prefix);
+                        let _ = git::ensure_clean_state(&self.config.path);
+                    }
+                    info!(
+                        "Coverage boost progress: {}/{} files processed, {} committed, coverage: {:.1}% → {:.1}%",
+                        files_processed, total_files, files_boosted, start_pct, current_pct
+                    );
+
+                    // Squash boundary: when enough temp commits accumulated or last file
+                    let squash_ready = temp_commit_files.len() >= commit_size
+                        || (is_last && temp_commit_count > 0);
+                    if squash_ready && temp_commit_count > 0 {
+                        let _ = self.squash_boost_commits(temp_commit_count, &temp_commit_files);
+                        temp_commit_count = 0;
+                        temp_commit_files.clear();
+                        if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                            color_info!(
+                                "Project-wide coverage after squash commit: {} (was {})",
+                                cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                            );
+                            current_pct = pct;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Safety flush: handle any remaining wave entries not yet triggered by is_last
+        // (can happen when all remaining files were skipped and the last real file already committed)
+        if !current_wave.is_empty() {
+            let committed = self.commit_boost_batch(&current_wave, test_framework, stash_prefix, skip_test_run, &framework_context_base)?;
+            files_boosted += committed;
+            current_wave.clear();
+            if committed == 0 {
+                let _ = git::stash_drop_matching(&self.config.path, stash_prefix);
+                let _ = git::ensure_clean_state(&self.config.path);
+            }
+            if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                current_pct = pct;
+            }
+        }
+        if temp_commit_count > 0 {
+            let _ = self.squash_boost_commits(temp_commit_count, &temp_commit_files);
+            if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                current_pct = pct;
             }
         }
 
@@ -984,6 +1247,10 @@ Apply the fix now."#,
             Vec::new()
         };
 
+        color_info!(
+            "Coverage boost summary: processed {} files, committed {}, coverage {:.1}% → {:.1}% (target: {:.0}%)",
+            files_processed, files_boosted, start_pct, current_pct, self.config.min_coverage
+        );
         if current_pct >= self.config.min_coverage && remaining_below.is_empty() {
             color_info!(
                 "Coverage boost complete: {} (target {:.0}%) — {} files boosted",
@@ -1018,27 +1285,36 @@ Apply the fix now."#,
     ///   - N > 0 → at most N rounds per file
     ///   - 0     → unlimited rounds, keep going while coverage still improves
     ///
-    /// Returns `true` if at least one round produced passing tests that were committed.
-    fn boost_file_coverage(
+    /// Generate tests for a single file in a multi-round loop.
+    ///
+    /// When `coverage_commit_batch == 1`, commits per round (original behavior).
+    /// When `coverage_commit_batch > 1`, accumulates test files and stashes them
+    /// for later batch commit by `commit_boost_batch()`.
+    ///
+    /// Returns `Some(BoostFileResult)` if tests were generated, `None` if skipped.
+    fn generate_tests_for_file(
         &self,
         fc: &runner::FileCoverage,
         test_framework: &str,
         test_examples_str: &str,
-    ) -> Result<bool> {
+        stash_prefix: &str,
+        skip_test_run: bool,
+        framework_context: &str,
+    ) -> Result<Option<BoostFileResult>> {
         // Skip files matching user-configured exclusion patterns (safety net)
         if !self.config.coverage_exclude.is_empty() {
             if self.config.coverage_exclude.iter().any(|pat| {
                 glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
             }) {
                 info!("Skipping excluded file: {}", fc.file);
-                return Ok(false);
+                return Ok(None);
             }
         }
 
         // Skip files with 0 uncovered lines — nothing to boost
         if fc.total_lines <= fc.covered_lines {
             info!("File {} has 0 uncovered lines — nothing to boost", fc.file);
-            return Ok(false);
+            return Ok(None);
         }
 
         // Read the source file — try direct path first, then common source roots
@@ -1047,7 +1323,7 @@ Apply the fix now."#,
             Ok(c) => c,
             Err(e) => {
                 warn!("Cannot read {} (resolved to {}): {} — skipping", fc.file, full_path.display(), e);
-                return Ok(false);
+                return Ok(None);
             }
         };
 
@@ -1059,16 +1335,21 @@ Apply the fix now."#,
                 "File {} has {} lines — exceeds max_boost_file_lines ({}), skipping",
                 fc.file, line_count, max_lines
             );
-            return Ok(false);
+            return Ok(None);
         }
 
+        let batch_mode = self.config.coverage_commit_batch > 1 || skip_test_run;
         let max_rounds = self.config.coverage_rounds;
         let unlimited = max_rounds == 0;
         let mut round: u32 = 0;
-        let mut any_committed = false;
+        let mut any_success = false;
         let mut previous_coverage_pct = fc.coverage_pct;
         let mut current_uncovered_count = fc.total_lines.saturating_sub(fc.covered_lines);
+        // Track specific uncovered line numbers across rounds for targeted prompts.
+        let mut current_uncovered_lines: Vec<u32> = fc.uncovered_lines.clone();
         let mut last_test_output = String::new();
+        let mut accumulated_test_files: Vec<String> = Vec::new();
+        let mut accumulated_artifacts: Vec<String> = Vec::new();
 
         loop {
             round += 1;
@@ -1099,15 +1380,25 @@ Apply the fix now."#,
                 round_label, fc.file, previous_coverage_pct, current_uncovered_count
             );
 
-            // Re-read source in case previous rounds changed it indirectly
-            let current_source = std::fs::read_to_string(&full_path)
-                .unwrap_or_else(|_| source_content.clone());
-
-            // Build prompt — first round or retry with context
-            let uncovered_desc = if round == 1 {
+            // Build prompt — use specific uncovered line numbers when available for targeted generation
+            let uncovered_desc = if !current_uncovered_lines.is_empty() {
+                // Cap at 150 lines to keep the prompt focused; the model will handle the rest in the next round
+                let lines: Vec<String> = current_uncovered_lines.iter().take(150).map(|l| l.to_string()).collect();
+                let suffix = if current_uncovered_lines.len() > 150 {
+                    format!(" (… and {} more)", current_uncovered_lines.len() - 150)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "Lines 1-{} (file has {:.1}% coverage, {} uncovered lines out of {} coverable)",
-                    current_source.lines().count(),
+                    "Lines not yet covered: {}{} — file is at {:.1}% coverage ({} of {} coverable lines hit)",
+                    lines.join(", "), suffix,
+                    previous_coverage_pct,
+                    current_uncovered_count.saturating_sub(current_uncovered_count), // covered count
+                    fc.total_lines
+                )
+            } else if round == 1 {
+                format!(
+                    "File has {:.1}% coverage ({} uncovered lines out of {} coverable) — generate tests for all uncovered paths",
                     previous_coverage_pct,
                     current_uncovered_count,
                     fc.total_lines
@@ -1123,22 +1414,29 @@ Apply the fix now."#,
             };
 
             let prompt = if round == 1 {
+                // US-040: Build per-file framework context with classification
+                let file_class = runner::classify_source_file(&fc.file, &self.config.path);
+                let pkg_hint = runner::derive_test_package(&fc.file)
+                    .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
+                    .unwrap_or_default();
+                let per_file_ctx = build_per_file_context(framework_context, &file_class, &pkg_hint);
                 claude::build_test_generation_prompt(
                     &fc.file,
-                    &current_source,
                     &uncovered_desc,
                     test_framework,
                     test_examples_str,
+                    &per_file_ctx,
                 )
             } else {
+                let file_class = runner::classify_source_file(&fc.file, &self.config.path);
+                let per_file_ctx = build_per_file_context(framework_context, &file_class, "");
                 claude::build_test_generation_retry_prompt(
                     &fc.file,
-                    &current_source,
                     &uncovered_desc,
                     test_framework,
-                    test_examples_str,
                     round,
                     &truncate(&last_test_output, 1000),
+                    &per_file_ctx,
                 )
             };
 
@@ -1151,7 +1449,7 @@ Apply the fix now."#,
             info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
             match self.run_ai(&prompt, &test_tier) {
                 Ok(_) => {
-                    info!("Claude completed test generation for {} ({})", fc.file, round_label);
+                    info!("AI completed test generation for {} ({})", fc.file, round_label);
                 }
                 Err(e) => {
                     warn!("Failed to generate tests for {} ({}): {} — stopping rounds", fc.file, round_label, e);
@@ -1188,31 +1486,35 @@ Apply the fix now."#,
                 break;
             }
 
-            // Run tests
-            info!("Running tests to validate generated tests ({})...", round_label);
-            match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
-                Ok((true, output)) => {
-                    info!("Tests pass after {} for {}", round_label, fc.file);
-                    last_test_output = output;
+            // Run tests (skipped when skip_test_run=true — validation happens at wave commit time)
+            if !skip_test_run {
+                info!("Running tests to validate generated tests ({})...", round_label);
+                match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                    Ok((true, output)) => {
+                        info!("Tests pass after {} for {}", round_label, fc.file);
+                        last_test_output = output;
+                    }
+                    Ok((false, output)) => {
+                        warn!("Tests FAIL after {} for {} — reverting:\n{}", round_label, fc.file, runner::extract_error_summary(&output, 500));
+                        last_test_output = output;
+                        let _ = git::revert_changes(&self.config.path);
+                        // Don't break — try again next round if rounds remain
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Test execution error in {} for {} — reverting: {}", round_label, fc.file, e);
+                        let _ = git::revert_changes(&self.config.path);
+                        break;
+                    }
                 }
-                Ok((false, output)) => {
-                    warn!("Tests FAIL after {} for {} — reverting:\n{}", round_label, fc.file, truncate(&output, 300));
-                    last_test_output = output;
-                    let _ = git::revert_changes(&self.config.path);
-                    // Don't break — try again next round if rounds remain
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Test execution error in {} for {} — reverting: {}", round_label, fc.file, e);
-                    let _ = git::revert_changes(&self.config.path);
-                    break;
-                }
+            } else {
+                info!("Skipping per-file test run for {} ({}) — deferred to wave validation", fc.file, round_label);
             }
 
-            // Commit test files only
-            let test_files_changed: Vec<&str> = changed.iter()
+            // Identify test files and artifacts
+            let test_files_changed: Vec<String> = changed.iter()
                 .filter(|f| is_test_file(f))
-                .map(|s| s.as_str())
+                .cloned()
                 .collect();
 
             if test_files_changed.is_empty() {
@@ -1220,103 +1522,771 @@ Apply the fix now."#,
                 break;
             }
 
-            // Also stage generated artifacts (coverage reports, etc.) so they don't
-            // pollute the next diff, but only commit the test files.
-            let generated_artifacts: Vec<&str> = changed.iter()
+            let generated_artifacts: Vec<String> = changed.iter()
                 .filter(|f| is_generated_artifact(f))
-                .map(|s| s.as_str())
+                .cloned()
                 .collect();
 
-            if let Err(e) = git::add_files(&self.config.path, &test_files_changed) {
-                warn!("Failed to stage test files: {} — reverting", e);
+            // Track extra files (helpers, fixtures, configs) that AI may have created
+            // These are neither test files, nor known artifacts, nor the source file itself
+            let extra_files: Vec<String> = changed.iter()
+                .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f) && **f != fc.file)
+                .cloned()
+                .collect();
+            if !extra_files.is_empty() {
+                info!("Tracking {} extra generated file(s) for {}: {:?}", extra_files.len(), fc.file, extra_files);
+            }
+
+            if batch_mode {
+                // Batch mode: accumulate test files, don't commit yet
+                accumulated_test_files.extend(test_files_changed.clone());
+                accumulated_artifacts.extend(generated_artifacts.clone());
+                accumulated_artifacts.extend(extra_files.clone());
+                any_success = true;
+
+                // Stage test files + artifacts + extra files to keep them across rounds within the same file
+                let mut stage_refs: Vec<&str> = test_files_changed.iter().map(|s| s.as_str()).collect();
+                stage_refs.extend(generated_artifacts.iter().map(|s| s.as_str()));
+                stage_refs.extend(extra_files.iter().map(|s| s.as_str()));
+                if let Err(e) = git::add_files(&self.config.path, &stage_refs) {
+                    warn!("Failed to stage test files: {} — reverting", e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
+
+                // Revert non-test leftover changes, keep staged test files + artifacts
                 let _ = git::revert_changes(&self.config.path);
-                break;
-            }
 
-            // Revert non-test, non-artifact leftover changes before committing
-            let _ = git::revert_changes(&self.config.path);
-            // Re-stage generated artifacts so they don't show as dirty
-            if !generated_artifacts.is_empty() {
-                let _ = git::add_files(&self.config.path, &generated_artifacts);
-            }
+                info!("Staged tests for {} ({}) — deferred commit", fc.file, round_label);
+            } else {
+                // Individual mode: commit immediately (original behavior)
+                let refs: Vec<&str> = test_files_changed.iter().map(|s| s.as_str()).collect();
+                if let Err(e) = git::add_files(&self.config.path, &refs) {
+                    warn!("Failed to stage test files: {} — reverting", e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
 
-            let commit_msg = format_commit_message(
-                &self.config, "test", "coverage",
-                &format!("add tests for {} ({:.0}% → boost, {})", fc.file, previous_coverage_pct, round_label),
-                "", "", &fc.file,
-            );
-            if let Err(e) = git::commit(&self.config.path, &commit_msg) {
-                warn!("Failed to commit tests for {} ({}): {} — reverting", fc.file, round_label, e);
+                // Revert non-test, non-artifact leftover changes before committing
                 let _ = git::revert_changes(&self.config.path);
-                break;
+                // Re-stage generated artifacts so they don't show as dirty
+                if !generated_artifacts.is_empty() {
+                    let artifact_refs: Vec<&str> = generated_artifacts.iter().map(|s| s.as_str()).collect();
+                    let _ = git::add_files(&self.config.path, &artifact_refs);
+                }
+
+                let commit_msg = format_commit_message(
+                    &self.config, "test", "coverage",
+                    &format!("add tests for {} ({:.0}% → boost, {})", fc.file, previous_coverage_pct, round_label),
+                    "", "", &fc.file,
+                );
+                if let Err(e) = git::commit(&self.config.path, &commit_msg) {
+                    warn!("Failed to commit tests for {} ({}): {} — reverting", fc.file, round_label, e);
+                    let _ = git::revert_changes(&self.config.path);
+                    break;
+                }
+
+                info!("Committed tests for {} ({})", fc.file, round_label);
+                any_success = true;
+
+                // Revert any remaining leftover changes
+                let _ = git::revert_changes(&self.config.path);
             }
 
-            info!("Committed tests for {} ({})", fc.file, round_label);
-            any_committed = true;
+            // Re-measure file coverage to decide if we need another round.
+            // Skipped when skip_test_run=true because tests haven't run yet — we only
+            // do one round per file in wave mode and let the wave commit validate coverage.
+            if !skip_test_run {
+                let coverage_cmd = self.config.coverage_command.clone()
+                    .or_else(|| self.config.commands.coverage.clone())
+                    .or_else(|| runner::detect_coverage_command(&self.config.path));
+                if let Some(ref cov_cmd) = coverage_cmd {
+                    let _ = runner::run_shell_command(&self.config.path, cov_cmd, "coverage");
+                }
 
-            // Revert any remaining leftover changes
-            let _ = git::revert_changes(&self.config.path);
-
-            // Re-measure file coverage to decide if we need another round
-            let coverage_cmd = self.config.coverage_command.clone()
-                .or_else(|| self.config.commands.coverage.clone())
-                .or_else(|| runner::detect_coverage_command(&self.config.path));
-            if let Some(ref cov_cmd) = coverage_cmd {
-                let _ = runner::run_shell_command(&self.config.path, cov_cmd, "coverage");
-            }
-
-            let lcov_path = runner::find_lcov_report_with_hint(
-                &self.config.path,
-                self.config.commands.coverage_report.as_deref(),
-            );
-            if let Some(ref lcov) = lcov_path {
-                let file_coverages = runner::per_file_lcov_coverage(lcov);
-                if let Some(updated_fc) = file_coverages.iter().find(|f| f.file == fc.file) {
-                    let new_pct = updated_fc.coverage_pct;
-                    let new_uncovered = updated_fc.total_lines.saturating_sub(updated_fc.covered_lines);
-                    color_info!(
-                        "Coverage for {} after {}: {:.1}% → {:.1}% ({} uncovered lines remaining)",
-                        fc.file, round_label, previous_coverage_pct, new_pct, new_uncovered
-                    );
-
-                    // Check if threshold met
-                    let threshold = if self.config.min_file_coverage > 0.0 {
-                        self.config.min_file_coverage
-                    } else {
-                        self.config.min_coverage
-                    };
-
-                    if new_pct >= threshold {
+                let lcov_path = runner::find_lcov_report_with_hint(
+                    &self.config.path,
+                    self.config.commands.coverage_report.as_deref(),
+                );
+                if let Some(ref lcov) = lcov_path {
+                    let file_coverages = runner::per_file_lcov_coverage(lcov);
+                    if let Some(updated_fc) = file_coverages.iter().find(|f| f.file == fc.file) {
+                        let new_pct = updated_fc.coverage_pct;
+                        let new_uncovered = updated_fc.total_lines.saturating_sub(updated_fc.covered_lines);
                         color_info!(
-                            "Coverage threshold {:.0}% met for {} — done after {} round(s)",
-                            threshold, fc.file, round
+                            "Coverage for {} after {}: {:.1}% → {:.1}% ({} uncovered lines remaining)",
+                            fc.file, round_label, previous_coverage_pct, new_pct, new_uncovered
                         );
+
+                        // Check if threshold met
+                        let threshold = if self.config.min_file_coverage > 0.0 {
+                            self.config.min_file_coverage
+                        } else {
+                            self.config.min_coverage
+                        };
+
+                        if new_pct >= threshold {
+                            color_info!(
+                                "Coverage threshold {:.0}% met for {} — done after {} round(s)",
+                                threshold, fc.file, round
+                            );
+                            break;
+                        }
+
+                        // In unlimited mode: stop if no improvement
+                        if unlimited && new_pct <= previous_coverage_pct {
+                            info!(
+                                "No coverage improvement for {} ({:.1}% → {:.1}%) — stopping rounds",
+                                fc.file, previous_coverage_pct, new_pct
+                            );
+                            break;
+                        }
+
+                        previous_coverage_pct = new_pct;
+                        current_uncovered_count = new_uncovered;
+                        current_uncovered_lines = updated_fc.uncovered_lines.clone();
+                    } else {
+                        warn!("File {} not found in lcov after {} — stopping rounds", fc.file, round_label);
                         break;
                     }
-
-                    // In unlimited mode: stop if no improvement
-                    if unlimited && new_pct <= previous_coverage_pct {
-                        info!(
-                            "No coverage improvement for {} ({:.1}% → {:.1}%) — stopping rounds",
-                            fc.file, previous_coverage_pct, new_pct
-                        );
-                        break;
-                    }
-
-                    previous_coverage_pct = new_pct;
-                    current_uncovered_count = new_uncovered;
                 } else {
-                    warn!("File {} not found in lcov after {} — stopping rounds", fc.file, round_label);
+                    // No lcov report — can't measure progress, stop looping
+                    warn!("No lcov report found after {} — cannot verify improvement, stopping", round_label);
                     break;
                 }
             } else {
-                // No lcov report — can't measure progress, stop looping
-                warn!("No lcov report found after {} — cannot verify improvement, stopping", round_label);
+                // In wave mode: one round of test generation per file is enough.
+                // The wave commit will validate and measure coverage for all files together.
                 break;
             }
         }
 
-        Ok(any_committed)
+        if !any_success {
+            return Ok(None);
+        }
+
+        // In batch mode, stash accumulated test files + artifacts for later batch commit
+        if batch_mode && !accumulated_test_files.is_empty() {
+            let stash_msg = format!("{}:{}", stash_prefix, fc.file);
+            let mut refs: Vec<&str> = accumulated_test_files.iter().map(|s| s.as_str()).collect();
+            refs.extend(accumulated_artifacts.iter().map(|s| s.as_str()));
+            // Ensure all test files + artifacts are staged before stashing
+            let _ = git::add_files(&self.config.path, &refs);
+            match git::stash_push(&self.config.path, &stash_msg, &refs) {
+                Ok(()) => {
+                    info!("Stashed {} test files for {} — pending batch commit", accumulated_test_files.len(), fc.file);
+                }
+                Err(e) => {
+                    warn!("Failed to stash test files for {}: {} — committing individually", fc.file, e);
+                    // Fallback: commit now
+                    let commit_msg = format_commit_message(
+                        &self.config, "test", "coverage",
+                        &format!("add tests for {} ({:.0}% → boost)", fc.file, fc.coverage_pct),
+                        "", "", &fc.file,
+                    );
+                    let _ = git::commit(&self.config.path, &commit_msg);
+                }
+            }
+            let _ = git::revert_changes(&self.config.path);
+        }
+
+        Ok(Some(BoostFileResult {
+            file: fc.file.clone(),
+            test_files: accumulated_test_files,
+            artifacts: accumulated_artifacts,
+            rounds_completed: round.saturating_sub(1),
+            coverage_before: fc.coverage_pct,
+        }))
+    }
+
+    /// Commit a batch of boost results atomically.
+    ///
+    /// Pops stashed test files, optionally runs tests to validate all pass together,
+    /// and creates a single commit. `run_tests` should be `true` when per-file test
+    /// runs were skipped (i.e. `skip_test_run = true`). Falls back gracefully on failure.
+    fn commit_boost_batch(
+        &self,
+        batch: &[BoostFileResult],
+        test_framework: &str,
+        stash_prefix: &str,
+        run_tests: bool,
+        framework_context: &str,
+    ) -> Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        info!(
+            "Committing batch of {} file(s): {}",
+            batch.len(),
+            batch.iter().map(|r| r.file.as_str()).collect::<Vec<_>>().join(", ")
+        );
+
+        // Pop all stashes from the batch (restores test files)
+        let popped = git::stash_pop_matching(&self.config.path, stash_prefix)?;
+        if popped == 0 {
+            warn!("No stashes found for batch commit — nothing to commit");
+            return Ok(0);
+        }
+
+        // Optionally run tests to validate all batch test files together.
+        // Skipped when tests were already validated per-file (run_tests=false).
+        if run_tests {
+            // Build/compile before running tests (fast failure on compilation errors)
+            let build_cmd = self.config.commands.test_compile.as_ref()
+                .or(self.config.commands.build.as_ref());
+            if let Some(cmd) = build_cmd {
+                match runner::run_shell_command(&self.config.path, cmd, "test-compile") {
+                    Ok((true, _)) => {
+                        info!("Pre-test build succeeded for batch ({} files)", batch.len());
+                    }
+                    Ok((false, output)) => {
+                        warn!(
+                            "Pre-test build failed for {} files — falling back to per-file validation:\n{}",
+                            batch.len(), runner::extract_error_summary(&output, 800)
+                        );
+                        return Ok(self.fallback_per_file_commit(batch, test_framework, framework_context));
+                    }
+                    Err(e) => {
+                        warn!("Pre-test build error during batch commit: {} — falling back to per-file validation", e);
+                        return Ok(self.fallback_per_file_commit(batch, test_framework, framework_context));
+                    }
+                }
+            }
+
+            match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                Ok((true, _)) => {
+                    info!("Wave tests pass — proceeding with batch commit ({} files)", batch.len());
+                }
+                Ok((false, output)) => {
+                    warn!(
+                        "Batch tests failed for {} files — falling back to per-file validation:\n{}",
+                        batch.len(), runner::extract_error_summary(&output, 800)
+                    );
+                    // Files are in the working tree (stashes already popped).
+                    // Try each file individually instead of discarding all.
+                    return Ok(self.fallback_per_file_commit(batch, test_framework, framework_context));
+                }
+                Err(e) => {
+                    warn!("Test execution error during batch commit: {} — falling back to per-file validation", e);
+                    return Ok(self.fallback_per_file_commit(batch, test_framework, framework_context));
+                }
+            }
+        }
+
+        // Unstage everything (stash_pop_matching stages between applies),
+        // then selectively re-stage only test files + artifacts.
+        let _ = git::reset_index(&self.config.path);
+        let mut all_stage_files: Vec<&str> = batch.iter()
+            .flat_map(|r| r.test_files.iter().map(|s| s.as_str()))
+            .collect();
+        all_stage_files.extend(batch.iter().flat_map(|r| r.artifacts.iter().map(|s| s.as_str())));
+        if let Err(e) = git::add_files(&self.config.path, &all_stage_files) {
+            warn!("Failed to stage batch test files: {}", e);
+            let _ = git::revert_changes(&self.config.path);
+            return Ok(0);
+        }
+        let _ = git::revert_changes(&self.config.path); // clean remaining leftovers
+
+        let file_list: Vec<&str> = batch.iter().map(|r| r.file.as_str()).collect();
+        let msg = if batch.len() == 1 {
+            format_commit_message(
+                &self.config, "test", "coverage",
+                &format!("add tests for {} ({:.0}% → boost)", batch[0].file, batch[0].coverage_before),
+                "", "", &batch[0].file,
+            )
+        } else {
+            format_commit_message(
+                &self.config, "test", "coverage",
+                &format!("add tests for {} files ({})", batch.len(), file_list.join(", ")),
+                "", "", "",
+            )
+        };
+        match git::commit(&self.config.path, &msg) {
+            Ok(()) => {
+                info!("Batch commit successful ({} files)", batch.len());
+                Ok(batch.len())
+            }
+            Err(e) => {
+                warn!("Batch commit failed: {} — reverting", e);
+                let _ = git::revert_changes(&self.config.path);
+                Ok(0)
+            }
+        }
+    }
+
+    /// Fallback when wave tests fail: re-stash each file's changes individually,
+    /// then test and commit them one by one. Returns the number of files committed.
+    ///
+    /// Expects the working tree to contain all popped stash files (from the failed wave).
+    fn fallback_per_file_commit(
+        &self,
+        batch: &[BoostFileResult],
+        test_framework: &str,
+        framework_context: &str,
+    ) -> usize {
+        let retry_prefix = "reparo-retry";
+        warn!("Falling back to per-file validation for {} file(s)", batch.len());
+
+        // Re-stash each file's changes individually so we can test them one by one.
+        for result in batch {
+            let mut refs: Vec<&str> = result.test_files.iter().map(|s| s.as_str()).collect();
+            refs.extend(result.artifacts.iter().map(|s| s.as_str()));
+            if refs.is_empty() {
+                continue;
+            }
+            let stash_msg = format!("{}:{}", retry_prefix, result.file);
+            let _ = git::add_files(&self.config.path, &refs);
+            if let Err(e) = git::stash_push(&self.config.path, &stash_msg, &refs) {
+                warn!("Failed to re-stash files for {}: {} — skipping", result.file, e);
+            }
+        }
+        // Clean anything left over from the failed wave
+        let _ = git::revert_changes(&self.config.path);
+
+        let mut committed = 0usize;
+        for result in batch {
+            if result.test_files.is_empty() {
+                continue;
+            }
+            let match_str = format!("{}:{}", retry_prefix, result.file);
+
+            let popped = match git::stash_pop_matching(&self.config.path, &match_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("Failed to pop retry stash for {}: {} — skipping", result.file, e);
+                    let _ = git::stash_drop_matching(&self.config.path, &match_str);
+                    let _ = git::revert_changes(&self.config.path);
+                    continue;
+                }
+            };
+            if popped == 0 {
+                warn!("No retry stash found for {} — skipping", result.file);
+                continue;
+            }
+
+            // Build/compile before running tests (fast failure on compilation errors)
+            let build_cmd = self.config.commands.test_compile.as_ref()
+                .or(self.config.commands.build.as_ref());
+            if let Some(cmd) = build_cmd {
+                match runner::run_shell_command(&self.config.path, cmd, "test-compile") {
+                    Ok((true, _)) => {
+                        info!("Per-file build succeeded for {}", result.file);
+                    }
+                    Ok((false, output)) => {
+                        warn!(
+                            "Per-file build failed for {} — {}:\n{}",
+                            result.file,
+                            if self.config.retry_failed_wave_files { "will retry with error context" } else { "discarding" },
+                            runner::extract_error_summary(&output, 800)
+                        );
+                        let _ = git::revert_changes(&self.config.path);
+                        if self.config.retry_failed_wave_files {
+                            if self.retry_failed_file_with_context(result, test_framework, &output, framework_context) {
+                                committed += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Build error for {} — discarding: {}", result.file, e);
+                        let _ = git::revert_changes(&self.config.path);
+                        continue;
+                    }
+                }
+            }
+
+            // Run tests with just this file's changes
+            match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                Ok((true, _)) => {
+                    info!("Per-file tests pass for {} — committing", result.file);
+                    let mut stage_refs: Vec<&str> = result.test_files.iter().map(|s| s.as_str()).collect();
+                    stage_refs.extend(result.artifacts.iter().map(|s| s.as_str()));
+                    if git::add_files(&self.config.path, &stage_refs).is_ok() {
+                        let _ = git::revert_changes(&self.config.path); // clean non-test leftovers
+                        let msg = format_commit_message(
+                            &self.config, "test", "coverage",
+                            &format!("add tests for {} ({:.0}% → boost)", result.file, result.coverage_before),
+                            "", "", &result.file,
+                        );
+                        if git::commit(&self.config.path, &msg).is_ok() {
+                            committed += 1;
+                        } else {
+                            warn!("Commit failed for {} — reverting", result.file);
+                            let _ = git::revert_changes(&self.config.path);
+                        }
+                    } else {
+                        warn!("Failed to stage files for {} — reverting", result.file);
+                        let _ = git::revert_changes(&self.config.path);
+                    }
+                }
+                Ok((false, output)) => {
+                    warn!(
+                        "Per-file tests fail for {} — {}:\n{}",
+                        result.file,
+                        if self.config.retry_failed_wave_files { "will retry with error context" } else { "discarding" },
+                        runner::extract_error_summary(&output, 800)
+                    );
+                    let _ = git::revert_changes(&self.config.path);
+                    if self.config.retry_failed_wave_files {
+                        if self.retry_failed_file_with_context(result, test_framework, &output, framework_context) {
+                            committed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Test error for {} — discarding: {}", result.file, e);
+                    let _ = git::revert_changes(&self.config.path);
+                }
+            }
+        }
+
+        // Safety cleanup: drop any remaining retry stashes
+        let _ = git::stash_drop_matching(&self.config.path, retry_prefix);
+
+        if committed > 0 {
+            info!("Per-file fallback: committed {} of {} file(s)", committed, batch.len());
+        } else {
+            warn!("Per-file fallback: no files passed individual validation");
+        }
+        committed
+    }
+
+    /// Retry test generation for a single file that failed build/test in per-file fallback.
+    ///
+    /// Calls the AI with the previous error as context, validates the new tests
+    /// (build + test), and commits if successful. Returns `true` if committed.
+    fn retry_failed_file_with_context(
+        &self,
+        result: &BoostFileResult,
+        test_framework: &str,
+        error_output: &str,
+        framework_context: &str,
+    ) -> bool {
+        info!("Retrying test generation for {} with compilation error context", result.file);
+
+        let uncovered_desc = format!(
+            "File has {:.0}% coverage — previous test generation attempt failed. \
+             Fix the errors and regenerate working tests.",
+            result.coverage_before
+        );
+        // US-040: Include framework context in retry
+        let file_class = runner::classify_source_file(&result.file, &self.config.path);
+        let per_file_ctx = build_per_file_context(framework_context, &file_class, "");
+        let prompt = claude::build_test_generation_retry_prompt(
+            &result.file,
+            &uncovered_desc,
+            test_framework,
+            2, // retry attempt
+            &truncate(error_output, 2000),
+            &per_file_ctx,
+        );
+        let tier = claude::classify_repair_tier();
+
+        if let Err(e) = self.run_ai(&prompt, &tier) {
+            warn!("AI retry failed for {}: {} — discarding definitively", result.file, e);
+            let _ = git::revert_changes(&self.config.path);
+            return false;
+        }
+
+        // Verify no source files were modified
+        let changed = match git::changed_files(&self.config.path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Cannot check changed files after retry for {}: {}", result.file, e);
+                let _ = git::revert_changes(&self.config.path);
+                return false;
+            }
+        };
+
+        if changed.is_empty() {
+            warn!("No files changed during retry for {} — discarding", result.file);
+            return false;
+        }
+
+        let source_modified: Vec<&String> = changed.iter()
+            .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
+            .collect();
+        if !source_modified.is_empty() {
+            warn!(
+                "Source files modified during retry for {}: {:?} — reverting",
+                result.file, source_modified
+            );
+            let _ = git::revert_changes(&self.config.path);
+            return false;
+        }
+
+        let test_files: Vec<String> = changed.iter()
+            .filter(|f| is_test_file(f))
+            .cloned()
+            .collect();
+        if test_files.is_empty() {
+            warn!("No test files generated during retry for {} — reverting", result.file);
+            let _ = git::revert_changes(&self.config.path);
+            return false;
+        }
+
+        // Build/compile retried tests
+        let build_cmd = self.config.commands.test_compile.as_ref()
+            .or(self.config.commands.build.as_ref());
+        if let Some(cmd) = build_cmd {
+            match runner::run_shell_command(&self.config.path, cmd, "test-compile") {
+                Ok((true, _)) => {
+                    info!("Retry build succeeded for {}", result.file);
+                }
+                Ok((false, output)) => {
+                    warn!(
+                        "Discarding test for {} — retry build also failed:\n{}",
+                        result.file, runner::extract_error_summary(&output, 500)
+                    );
+                    let _ = git::revert_changes(&self.config.path);
+                    return false;
+                }
+                Err(e) => {
+                    warn!("Retry build error for {}: {} — discarding", result.file, e);
+                    let _ = git::revert_changes(&self.config.path);
+                    return false;
+                }
+            }
+        }
+
+        // Run tests on retried files
+        match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+            Ok((true, _)) => {
+                info!("Retry tests pass for {} — committing", result.file);
+            }
+            Ok((false, output)) => {
+                warn!(
+                    "Discarding test for {} — retry tests also failed:\n{}",
+                    result.file, runner::extract_error_summary(&output, 500)
+                );
+                let _ = git::revert_changes(&self.config.path);
+                return false;
+            }
+            Err(e) => {
+                warn!("Retry test error for {}: {} — discarding", result.file, e);
+                let _ = git::revert_changes(&self.config.path);
+                return false;
+            }
+        }
+
+        // Stage and commit
+        let artifacts: Vec<String> = changed.iter()
+            .filter(|f| is_generated_artifact(f))
+            .cloned()
+            .collect();
+        let mut stage_refs: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+        stage_refs.extend(artifacts.iter().map(|s| s.as_str()));
+        if git::add_files(&self.config.path, &stage_refs).is_err() {
+            warn!("Failed to stage retried files for {} — reverting", result.file);
+            let _ = git::revert_changes(&self.config.path);
+            return false;
+        }
+        let _ = git::revert_changes(&self.config.path); // clean non-test leftovers
+        let msg = format_commit_message(
+            &self.config, "test", "coverage",
+            &format!("add tests for {} ({:.0}% → boost, retry)", result.file, result.coverage_before),
+            "", "", &result.file,
+        );
+        if git::commit(&self.config.path, &msg).is_ok() {
+            info!("Retry commit successful for {}", result.file);
+            true
+        } else {
+            warn!("Retry commit failed for {} — reverting", result.file);
+            let _ = git::revert_changes(&self.config.path);
+            false
+        }
+    }
+
+    /// Validate a wave of boost results and create a temporary "reparo-wip:" commit.
+    ///
+    /// Used when `commit_size > parallel_size`: multiple waves are accumulated as
+    /// temporary commits and later squashed by [`squash_boost_commits`] into one
+    /// real commit per `commit_size` files.
+    ///
+    /// Returns `(files_committed, source_file_list)`.
+    fn validate_and_temp_commit_wave(
+        &self,
+        wave: &[BoostFileResult],
+        test_framework: &str,
+        stash_prefix: &str,
+        run_tests: bool,
+        framework_context: &str,
+    ) -> Result<(usize, Vec<String>)> {
+        if wave.is_empty() {
+            return Ok((0, vec![]));
+        }
+
+        let file_names: Vec<&str> = wave.iter().map(|r| r.file.as_str()).collect();
+        info!(
+            "Validating wave of {} file(s) before temp commit: {}",
+            wave.len(),
+            file_names.join(", ")
+        );
+
+        // Pop all stashes from this wave
+        let popped = git::stash_pop_matching(&self.config.path, stash_prefix)?;
+        if popped == 0 {
+            warn!("No stashes found for wave — skipping temp commit");
+            return Ok((0, vec![]));
+        }
+
+        // Optionally run tests to validate wave files together
+        if run_tests {
+            // Build/compile before running tests (fast failure on compilation errors)
+            let build_cmd = self.config.commands.test_compile.as_ref()
+                .or(self.config.commands.build.as_ref());
+            if let Some(cmd) = build_cmd {
+                match runner::run_shell_command(&self.config.path, cmd, "test-compile") {
+                    Ok((true, _)) => {
+                        info!("Pre-test build succeeded for wave ({} files)", wave.len());
+                    }
+                    Ok((false, output)) => {
+                        warn!(
+                            "Pre-test build failed for {} files — falling back to per-file validation:\n{}",
+                            wave.len(), runner::extract_error_summary(&output, 800)
+                        );
+                        let committed = self.fallback_per_file_commit(wave, test_framework, framework_context);
+                        return Ok((committed, vec![]));
+                    }
+                    Err(e) => {
+                        warn!("Pre-test build error during wave validation: {} — falling back to per-file validation", e);
+                        let committed = self.fallback_per_file_commit(wave, test_framework, framework_context);
+                        return Ok((committed, vec![]));
+                    }
+                }
+            }
+
+            match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                Ok((true, _)) => {
+                    info!("Wave tests pass ({} files)", wave.len());
+                }
+                Ok((false, output)) => {
+                    warn!(
+                        "Wave tests failed for {} files — falling back to per-file validation:\n{}",
+                        wave.len(), runner::extract_error_summary(&output, 800)
+                    );
+                    let committed = self.fallback_per_file_commit(wave, test_framework, framework_context);
+                    // Return empty files — fallback creates real commits, not temp wip commits
+                    return Ok((committed, vec![]));
+                }
+                Err(e) => {
+                    warn!("Test execution error during wave validation: {} — falling back to per-file validation", e);
+                    let committed = self.fallback_per_file_commit(wave, test_framework, framework_context);
+                    return Ok((committed, vec![]));
+                }
+            }
+        }
+
+        // Unstage everything (stash_pop_matching stages between applies),
+        // then selectively re-stage only test files + artifacts.
+        let _ = git::reset_index(&self.config.path);
+        let mut all_stage_files: Vec<&str> = wave.iter()
+            .flat_map(|r| r.test_files.iter().map(|s| s.as_str()))
+            .collect();
+        all_stage_files.extend(wave.iter().flat_map(|r| r.artifacts.iter().map(|s| s.as_str())));
+        if let Err(e) = git::add_files(&self.config.path, &all_stage_files) {
+            warn!("Failed to stage wave test files: {}", e);
+            let _ = git::revert_changes(&self.config.path);
+            return Ok((0, vec![]));
+        }
+        let _ = git::revert_changes(&self.config.path); // clean remaining leftovers
+
+        // Create temp "reparo-wip:" commit — will be squashed later
+        // Uses --no-verify to bypass pre-commit hooks (e.g. Conventional Commits)
+        // since this is a temporary commit that will be squashed into a proper one.
+        let wip_msg = format!(
+            "reparo-wip: coverage boost {} file(s): {}",
+            wave.len(),
+            file_names.join(", ")
+        );
+        match git::commit_no_verify(&self.config.path, &wip_msg) {
+            Ok(()) => {
+                info!("Temp wave commit created ({} files) — pending squash", wave.len());
+                Ok((wave.len(), wave.iter().map(|r| r.file.clone()).collect()))
+            }
+            Err(e) => {
+                warn!("Failed to create temp wave commit: {} — reverting", e);
+                let _ = git::revert_changes(&self.config.path);
+                Ok((0, vec![]))
+            }
+        }
+    }
+
+    /// Squash N temporary "reparo-wip:" commits into a single real commit.
+    ///
+    /// Used when `commit_size > parallel_size`: after accumulating enough temp
+    /// commits, this squashes them and creates one properly formatted commit.
+    fn squash_boost_commits(&self, n: usize, files: &[String]) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+
+        info!("Squashing {} temp commit(s) into one real commit ({} files)...", n, files.len());
+
+        // Verify that the last n commits are "reparo-wip:" commits (safety check)
+        let log_output = std::process::Command::new("git")
+            .current_dir(&self.config.path)
+            .args(["log", "--oneline", &format!("-{}", n)])
+            .output();
+
+        if let Ok(out) = log_output {
+            let log_str = String::from_utf8_lossy(&out.stdout);
+            let non_wip: Vec<&str> = log_str.lines()
+                .filter(|l| !l.contains("reparo-wip:"))
+                .collect();
+            if !non_wip.is_empty() {
+                warn!(
+                    "Cannot squash: last {} commits contain non-wip entries: {:?}",
+                    n, non_wip
+                );
+                return Ok(());
+            }
+        }
+
+        // git reset --soft HEAD~n to unstage all wip commits back to index
+        let reset_status = std::process::Command::new("git")
+            .current_dir(&self.config.path)
+            .args(["reset", "--soft", &format!("HEAD~{}", n)])
+            .status();
+
+        match reset_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                warn!("git reset --soft HEAD~{} failed (exit {})", n, s);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to run git reset: {}", e);
+                return Ok(());
+            }
+        }
+
+        // Create the real commit
+        let file_list: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let msg = if files.len() == 1 {
+            format_commit_message(
+                &self.config, "test", "coverage",
+                &format!("add tests for {} (coverage boost)", files[0]),
+                "", "", &files[0],
+            )
+        } else {
+            format_commit_message(
+                &self.config, "test", "coverage",
+                &format!("add tests for {} files ({})", files.len(), file_list.join(", ")),
+                "", "", "",
+            )
+        };
+
+        match git::commit(&self.config.path, &msg) {
+            Ok(()) => {
+                info!("Squash commit successful ({} files in {} waves)", files.len(), n);
+            }
+            Err(e) => {
+                warn!("Squash commit failed: {}", e);
+            }
+        }
+        Ok(())
     }
 
     /// Run the coverage command and return the overall project coverage percentage.
@@ -1525,13 +2495,8 @@ Apply the fix now."#,
             }
 
             // Step 2: Ask Claude to refactor and eliminate duplication
-            // Re-read file content (may have changed if tests were generated)
-            let current_content = std::fs::read_to_string(&abs_path)
-                .unwrap_or_else(|_| file_content.clone());
-
             let prompt = claude::build_dedup_prompt(
                 &dup_file.file_path,
-                &current_content,
                 &duplicated_ranges,
                 dup_file.duplication_pct,
             );
@@ -1726,18 +2691,14 @@ Apply the fix now."#,
             info!("--- [doc {}/{}] {} ---", idx + 1, max_files, file_path);
 
             let abs_path = self.config.path.join(file_path);
-            let file_content = match std::fs::read_to_string(&abs_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Cannot read {}: {} — skipping", file_path, e);
-                    docs_skipped += 1;
-                    continue;
-                }
-            };
+            if !abs_path.exists() {
+                warn!("Cannot read {} — skipping", file_path);
+                docs_skipped += 1;
+                continue;
+            }
 
             let prompt = claude::build_documentation_prompt(
                 file_path,
-                &file_content,
                 &doc_config.style,
                 &doc_config.standards,
                 &doc_config.scope,
@@ -2021,7 +2982,7 @@ Apply the fix now."#,
                     // Sub-step 2: Generate contract tests if enabled
                     if self.config.pact.generate_tests {
                         let gen_result = self.generate_contract_tests_with_retry(
-                            issue, &file_path, &file_content,
+                            issue, &file_path,
                         ).await;
 
                         match gen_result {
@@ -2124,7 +3085,6 @@ Apply the fix now."#,
             &issue.rule,
             &issue.message,
             &file_path,
-            &file_content,
             start_line,
             end_line,
             &rule_desc_with_hint,
@@ -2755,9 +3715,13 @@ Apply a different fix now."#,
         initial_uncovered: &[u32],
         test_command: &str,
     ) -> TestGenResult {
-        let test_examples = runner::find_test_examples(&self.config.path);
-        let examples_str = test_examples.join("\n\n");
+        let examples_str = self.cached_test_examples.clone().unwrap_or_else(|| {
+            runner::find_test_examples(&self.config.path).join("\n\n")
+        });
         let framework = detect_test_framework(&self.config.path);
+        // US-040: Build framework context for issue-fix test generation
+        let detected_deps = runner::detect_test_dependencies(&self.config.path);
+        let framework_ctx_base = build_framework_context(&detected_deps, &self.config.test_generation);
         let mut all_test_files: Vec<String> = Vec::new();
         let mut current_uncovered = initial_uncovered.to_vec();
         let mut last_test_output = String::new();
@@ -2778,31 +3742,36 @@ Apply a different fix now."#,
                 .join(", ");
 
             // Build prompt — first attempt or retry with context
+            let file_class = runner::classify_source_file(file_path, &self.config.path);
+            let pkg_hint = runner::derive_test_package(file_path)
+                .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
+                .unwrap_or_default();
             let prompt = if attempt == 1 {
                 let uncovered = format!(
                     "Lines {}-{} (specifically uncovered: {})",
                     start_line, end_line, uncovered_desc
                 );
+                let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, &pkg_hint);
                 claude::build_test_generation_prompt(
                     file_path,
-                    file_content,
                     &uncovered,
                     &framework,
                     &examples_str,
+                    &per_file_ctx,
                 )
             } else {
                 let still_uncovered = format!(
                     "Lines still uncovered: {}",
                     uncovered_desc
                 );
+                let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, "");
                 claude::build_test_generation_retry_prompt(
                     file_path,
-                    file_content,
                     &still_uncovered,
                     &framework,
-                    &examples_str,
                     attempt,
                     &truncate(&last_test_output, 1000),
+                    &per_file_ctx,
                 )
             };
 
@@ -2953,7 +3922,6 @@ Apply a different fix now."#,
         &self,
         issue: &Issue,
         file_path: &str,
-        file_content: &str,
     ) -> crate::pact::PactTestGenResult {
         let pact_framework = crate::pact::detect_pact_framework(&self.config.path);
         let contract_examples = crate::pact::find_contract_test_examples(&self.config.path);
@@ -2978,7 +3946,6 @@ Apply a different fix now."#,
             let prompt = if attempt == 1 {
                 claude::build_contract_test_prompt(
                     file_path,
-                    file_content,
                     provider,
                     consumer,
                     &pact_framework,
@@ -2988,11 +3955,9 @@ Apply a different fix now."#,
             } else {
                 claude::build_contract_test_retry_prompt(
                     file_path,
-                    file_content,
                     provider,
                     consumer,
                     &pact_framework,
-                    &examples_str,
                     attempt,
                     &last_output,
                 )
@@ -3084,6 +4049,113 @@ Apply a different fix now."#,
         }
     }
 
+    /// Rebase the current fix branch onto the latest base branch from origin.
+    ///
+    /// Fetches the latest base, attempts rebase, and if conflicts arise,
+    /// invokes the AI engine to resolve them. Aborts if resolution fails.
+    fn rebase_on_latest_base(&self) -> Result<()> {
+        info!("=== Pre-push rebase: fetching latest {} from origin ===", self.config.branch);
+
+        if let Err(e) = git::fetch_branch(&self.config.path, &self.config.branch) {
+            warn!("Could not fetch origin/{}: {} — skipping rebase", self.config.branch, e);
+            return Ok(());
+        }
+
+        match git::rebase_onto(&self.config.path, &self.config.branch)? {
+            true => {
+                info!("Rebase onto origin/{} completed cleanly", self.config.branch);
+                Ok(())
+            }
+            false => {
+                info!("Rebase has conflicts — attempting AI-assisted resolution");
+                self.resolve_rebase_conflicts()
+            }
+        }
+    }
+
+    /// Attempt to resolve rebase conflicts using the AI engine.
+    ///
+    /// For each conflicted commit, reads the conflicted files, asks the AI to
+    /// resolve them, and continues the rebase. Aborts if any step fails.
+    fn resolve_rebase_conflicts(&self) -> Result<()> {
+        const MAX_CONFLICT_ROUNDS: usize = 20; // safety limit for multi-commit rebases
+
+        for round in 0..MAX_CONFLICT_ROUNDS {
+            let conflicts = git::conflict_files(&self.config.path)?;
+            if conflicts.is_empty() {
+                info!("No more conflicts to resolve");
+                break;
+            }
+
+            info!("Conflict round {}: {} file(s) to resolve: {}",
+                round + 1, conflicts.len(), conflicts.join(", "));
+
+            for file in &conflicts {
+                let file_path = self.config.path.join(file);
+                let content = match std::fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Cannot read conflicted file {}: {}", file, e);
+                        git::abort_rebase(&self.config.path)?;
+                        anyhow::bail!("Rebase aborted: could not read {}", file);
+                    }
+                };
+
+                let prompt = format!(
+                    "The file `{}` has git merge conflicts (marked with <<<<<<< / ======= / >>>>>>>). \
+                     Resolve all conflicts by choosing the best combination of both sides. \
+                     Output ONLY the complete resolved file content, no explanations. \
+                     Keep all functionality from both sides where possible.\n\n```\n{}\n```",
+                    file, content
+                );
+
+                let tier = claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7);
+                match self.run_ai(&prompt, &tier) {
+                    Ok(_) => {
+                        // The AI engine edits files in-place, so we just check the file
+                        // no longer has conflict markers
+                        let resolved = std::fs::read_to_string(&file_path).unwrap_or_default();
+                        if resolved.contains("<<<<<<<") || resolved.contains(">>>>>>>") {
+                            warn!("AI did not fully resolve conflicts in {} — aborting rebase", file);
+                            git::abort_rebase(&self.config.path)?;
+                            anyhow::bail!(
+                                "Rebase aborted: AI could not resolve conflicts in {}. \
+                                 Resolve manually and re-run, or use --skip-rebase.",
+                                file
+                            );
+                        }
+                        info!("Resolved conflicts in {}", file);
+                    }
+                    Err(e) => {
+                        error!("AI conflict resolution failed for {}: {}", file, e);
+                        git::abort_rebase(&self.config.path)?;
+                        anyhow::bail!(
+                            "Rebase aborted: AI failed to resolve {}. \
+                             Resolve manually and re-run, or use --skip-rebase.",
+                            file
+                        );
+                    }
+                }
+            }
+
+            // All files resolved for this commit — continue rebase
+            match git::mark_resolved_and_continue(&self.config.path)? {
+                true => {
+                    info!("Rebase continued successfully after conflict resolution");
+                    return Ok(());
+                }
+                false => {
+                    info!("More conflicts after continue — resolving next commit");
+                    // Loop continues
+                }
+            }
+        }
+
+        warn!("Too many conflict rounds ({}) — aborting rebase", MAX_CONFLICT_ROUNDS);
+        git::abort_rebase(&self.config.path)?;
+        anyhow::bail!("Rebase aborted after {} conflict rounds. Resolve manually or use --skip-rebase.", MAX_CONFLICT_ROUNDS);
+    }
+
     /// Create a PR from the accumulated results (US-008).
     fn create_pr(&self, branch_name: &str) -> Result<String> {
         // Stage any remaining changes (changelog, etc.) and push
@@ -3091,6 +4163,15 @@ Apply a different fix now."#,
         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
             let msg = format_commit_message(&self.config, "chore", "sonar", "include changelog and report updates", "", "", "");
             let _ = git::commit(&self.config.path, &msg);
+        }
+
+        // Rebase onto latest base branch to minimize merge conflicts
+        if !self.config.skip_rebase {
+            if let Err(e) = self.rebase_on_latest_base() {
+                warn!("Pre-push rebase failed: {} — pushing without rebase", e);
+            }
+        } else {
+            info!("Pre-push rebase skipped (--skip-rebase)");
         }
 
         // US-016: Push with retry
@@ -3606,6 +4687,55 @@ fn detect_test_framework(project_path: &Path) -> String {
     "Unknown - use project conventions".to_string()
 }
 
+/// Build framework context string from detected dependencies and YAML config (US-040).
+///
+/// Combines auto-detected test dependencies with user-provided YAML overrides.
+fn build_framework_context(
+    detected_deps: &str,
+    tg: &crate::config::TestGenerationConfig,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Start with auto-detected dependencies
+    if !detected_deps.is_empty() {
+        parts.push(format!("Detected test dependencies: {}", detected_deps));
+    }
+
+    // YAML overrides / supplements
+    if let Some(ref fw) = tg.framework {
+        parts.push(format!("Test framework: {}", fw));
+    }
+    if let Some(ref mock) = tg.mock_framework {
+        parts.push(format!("Mock framework: {}", mock));
+    }
+    if let Some(ref assert_lib) = tg.assertion_library {
+        parts.push(format!("Assertion library: {}", assert_lib));
+    }
+    if tg.avoid_spring_context {
+        parts.push("IMPORTANT: Do NOT use @SpringBootTest for unit tests. Use @ExtendWith(MockitoExtension.class) or plain JUnit 5 instead.".to_string());
+    }
+    if let Some(ref custom) = tg.custom_instructions {
+        parts.push(custom.clone());
+    }
+
+    parts.join("\n")
+}
+
+/// Build per-file context combining base framework context with file-specific classification (US-040).
+fn build_per_file_context(base: &str, file_classification: &str, package_hint: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !base.is_empty() {
+        parts.push(base.to_string());
+    }
+    if !file_classification.is_empty() {
+        parts.push(file_classification.to_string());
+    }
+    if !package_hint.is_empty() {
+        parts.push(package_hint.to_string());
+    }
+    parts.join("\n")
+}
+
 /// Files that cannot have unit test coverage (style, templates, assets).
 /// These should skip coverage checks and test generation.
 fn is_non_coverable_file(path: &str) -> bool {
@@ -3775,6 +4905,10 @@ fn format_commit_message(
     result = result.replace("{issue_key}", issue_key);
     result = result.replace("{rule}", rule);
     result = result.replace("{file}", file);
+    result = result.replace(
+        "{ticket}",
+        config.commit_issue.as_deref().unwrap_or(""),
+    );
 
     // Apply custom variables from commit_vars
     for (key, value) in &config.commit_vars {
@@ -4162,6 +5296,51 @@ FAIL src/components/Button.test.tsx
         let ts = "20260321120000";
         let branch = format!("fix/sonar-batch-{}-{}", 1, ts);
         assert_eq!(branch, "fix/sonar-batch-1-20260321120000");
+    }
+
+    #[test]
+    fn test_coverage_progress_format() {
+        // Validates the progress log format used after each wave (US-038)
+        let (files_processed, total_files, files_boosted) = (5usize, 20usize, 3usize);
+        let (start_pct, current_pct) = (15.4f64, 22.7f64);
+        let msg = format!(
+            "Coverage boost progress: {}/{} files processed, {} committed, coverage: {:.1}% → {:.1}%",
+            files_processed, total_files, files_boosted, start_pct, current_pct
+        );
+        assert!(msg.contains("5/20 files processed"));
+        assert!(msg.contains("3 committed"));
+        assert!(msg.contains("15.4%"));
+        assert!(msg.contains("22.7%"));
+    }
+
+    #[test]
+    fn test_coverage_summary_format() {
+        // Validates the final summary format (US-038)
+        let (files_processed, files_boosted) = (57usize, 12usize);
+        let (start_pct, current_pct, target) = (15.4f64, 45.2f64, 80.0f64);
+        let msg = format!(
+            "Coverage boost summary: processed {} files, committed {}, coverage {:.1}% → {:.1}% (target: {:.0}%)",
+            files_processed, files_boosted, start_pct, current_pct, target
+        );
+        assert!(msg.contains("processed 57 files"));
+        assert!(msg.contains("committed 12"));
+        assert!(msg.contains("15.4% → 45.2%"));
+        assert!(msg.contains("(target: 80%)"));
+    }
+
+    #[test]
+    fn test_coverage_per_file_log_includes_overall() {
+        // Validates the per-file log line includes overall coverage (US-038)
+        let (queue_idx, total, file_pct, covered, total_lines, current_pct) =
+            (7usize, 181usize, 23.5f64, 47u32, 200u32, 18.2f64);
+        let reason = "overall 18.2% < 80%";
+        let msg = format!(
+            "--- Coverage boost [{}/{}]: {} ({:.1}%, {}/{} lines) — {} | overall: {:.1}% ---",
+            queue_idx, total, "src/main.java", file_pct, covered, total_lines, reason, current_pct
+        );
+        assert!(msg.contains("[7/181]"));
+        assert!(msg.contains("23.5%"));
+        assert!(msg.contains("| overall: 18.2%"));
     }
 
     fn make_test_issue(key: &str) -> sonar::Issue {

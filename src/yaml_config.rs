@@ -29,6 +29,9 @@ pub struct YamlConfig {
     /// List of exact filenames (matched against the basename, case-insensitive).
     #[serde(default)]
     pub protected_files: Vec<String>,
+    /// Test generation hints for framework-aware prompts (US-040)
+    #[serde(default)]
+    pub test_generation: TestGenerationYaml,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -81,6 +84,14 @@ pub struct ExecutionYaml {
     /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
     #[serde(default)]
     pub coverage_exclude: Vec<String>,
+    /// Files per wave before running the test suite once (default: 3)
+    pub coverage_wave_size: Option<u32>,
+    /// Files per coverage boost commit (0 = same as coverage_wave_size, 1 = one commit per file)
+    pub coverage_commit_batch: Option<u32>,
+    /// Stop coverage boost after N consecutive wave failures (0 = disabled, default: 5)
+    pub max_boost_failures: Option<usize>,
+    /// Retry failed wave files with error context in per-file fallback (default: true)
+    pub retry_failed_wave_files: Option<bool>,
     /// Enable final validation — run full test suite after all fixes (default: true)
     pub final_validation: Option<bool>,
     /// Maximum repair attempts during final validation — all tests must pass (default: 5)
@@ -89,6 +100,8 @@ pub struct ExecutionYaml {
     pub dedup_on_completion: Option<bool>,
     /// Maximum deduplication iterations (default: 10)
     pub max_dedup: Option<usize>,
+    /// Rebase fix branch onto latest base before push/PR (default: true)
+    pub auto_rebase: Option<bool>,
 }
 
 /// Project commands that Reparo executes directly (no heuristics, no LLM).
@@ -113,6 +126,8 @@ pub struct CommandsYaml {
     pub coverage_report: Option<String>,
     /// Documentation generation/validation command (e.g., "npx typedoc", "javadoc", "pydoc")
     pub docs: Option<String>,
+    /// Fast compile-only command for tests (e.g., "mvn test-compile"). Falls back to `build`.
+    pub test_compile: Option<String>,
 }
 
 /// Documentation quality standards configuration.
@@ -194,6 +209,24 @@ pub struct PactYaml {
     pub api_patterns: Vec<String>,
 }
 
+/// Test generation hints for framework-aware prompts (US-040).
+/// Allows users to specify the test framework, mock library, assertions, etc.
+/// so that generated tests compile and work with the project's actual setup.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TestGenerationYaml {
+    /// Test framework override (e.g., "junit5", "junit4", "testng")
+    pub framework: Option<String>,
+    /// Mock framework (e.g., "mockito", "easymock")
+    pub mock_framework: Option<String>,
+    /// Assertion library (e.g., "assertj", "hamcrest")
+    pub assertion_library: Option<String>,
+    /// Avoid @SpringBootTest for unit tests (default: false)
+    pub avoid_spring_context: Option<bool>,
+    /// Custom instructions appended to every test generation prompt
+    pub custom_instructions: Option<String>,
+}
+
 /// Prompt customization per rule or category (US-019).
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -264,6 +297,8 @@ pub struct ProjectCommands {
     pub lint: Option<String>,
     /// Explicit path to the coverage report file (bypasses auto-detection)
     pub coverage_report: Option<String>,
+    /// Fast compile-only command for tests (e.g., "mvn test-compile"). Falls back to `build`.
+    pub test_compile: Option<String>,
 }
 
 impl ProjectCommands {
@@ -496,6 +531,30 @@ pub fn merge_yaml_into_config(
     if config.coverage_exclude.is_empty() && !yaml.execution.coverage_exclude.is_empty() {
         config.coverage_exclude = yaml.execution.coverage_exclude.clone();
     }
+    // coverage_wave_size: only override if CLI is at default (3)
+    if config.coverage_wave_size == 3 {
+        if let Some(v) = yaml.execution.coverage_wave_size {
+            config.coverage_wave_size = v;
+        }
+    }
+    // coverage_commit_batch: only override if CLI is at default (0)
+    if config.coverage_commit_batch == 0 {
+        if let Some(v) = yaml.execution.coverage_commit_batch {
+            config.coverage_commit_batch = v;
+        }
+    }
+    // max_boost_failures: only override if CLI is at default (5)
+    if config.max_boost_failures == 5 {
+        if let Some(v) = yaml.execution.max_boost_failures {
+            config.max_boost_failures = v;
+        }
+    }
+    // retry_failed_wave_files: YAML can disable retry (default: true)
+    if !config.skip_retry_failed_wave_files {
+        if let Some(false) = yaml.execution.retry_failed_wave_files {
+            config.skip_retry_failed_wave_files = true;
+        }
+    }
     // final_validation: YAML can disable final validation (default: true)
     if !config.skip_final_validation {
         if let Some(false) = yaml.execution.final_validation {
@@ -518,6 +577,12 @@ pub fn merge_yaml_into_config(
     if config.max_dedup == 10 {
         if let Some(v) = yaml.execution.max_dedup {
             config.max_dedup = v;
+        }
+    }
+    // auto_rebase: YAML can disable pre-push rebase (default: true)
+    if !config.skip_rebase {
+        if let Some(false) = yaml.execution.auto_rebase {
+            config.skip_rebase = true;
         }
     }
     // protected_files: always take from YAML (no CLI equivalent)
@@ -590,6 +655,16 @@ pub fn merge_yaml_into_config(
         attempts: pact.attempts.unwrap_or(3),
         api_patterns: pact.api_patterns.clone(),
     };
+
+    // test_generation: resolve from YAML (US-040)
+    let tg = &yaml.test_generation;
+    config.test_generation = crate::config::TestGenerationConfig {
+        framework: tg.framework.clone(),
+        mock_framework: tg.mock_framework.clone(),
+        assertion_library: tg.assertion_library.clone(),
+        avoid_spring_context: tg.avoid_spring_context.unwrap_or(false),
+        custom_instructions: tg.custom_instructions.clone(),
+    };
 }
 
 /// Extract ProjectCommands from YAML, with CLI overrides.
@@ -613,6 +688,7 @@ pub fn resolve_commands(
         format: base.format,
         lint: base.lint,
         coverage_report: base.coverage_report,
+        test_compile: base.test_compile,
     }
 }
 
@@ -805,6 +881,22 @@ pub fn merge_personal_into_config(config: &mut crate::config::Config, personal: 
         }
     }
 
+    // Merge coverage wave size
+    if let Some(v) = exec.coverage_wave_size {
+        if config.coverage_wave_size == 3 {
+            config.coverage_wave_size = v;
+        }
+    }
+    if let Some(v) = exec.coverage_commit_batch {
+        if config.coverage_commit_batch == 0 {
+            config.coverage_commit_batch = v;
+        }
+    }
+    if let Some(v) = exec.max_boost_failures {
+        if config.max_boost_failures == 5 {
+            config.max_boost_failures = v;
+        }
+    }
     // Merge git defaults
     let git = &personal.git;
     if let Some(bs) = git.batch_size {
@@ -905,6 +997,27 @@ commands:
     }
 
     #[test]
+    fn test_parse_test_generation_yaml() {
+        let yaml_str = r#"
+sonar:
+  project_id: "demo"
+test_generation:
+  framework: "junit5"
+  mock_framework: "mockito"
+  assertion_library: "assertj"
+  avoid_spring_context: true
+  custom_instructions: "Always use @ExtendWith(MockitoExtension.class)"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        let tg = &config.test_generation;
+        assert_eq!(tg.framework.as_deref(), Some("junit5"));
+        assert_eq!(tg.mock_framework.as_deref(), Some("mockito"));
+        assert_eq!(tg.assertion_library.as_deref(), Some("assertj"));
+        assert_eq!(tg.avoid_spring_context, Some(true));
+        assert!(tg.custom_instructions.as_deref().unwrap().contains("MockitoExtension"));
+    }
+
+    #[test]
     fn test_resolve_commands_yaml_only() {
         let yaml = YamlConfig {
             commands: CommandsYaml {
@@ -956,6 +1069,21 @@ commands:
         let cmds = resolve_commands(Some(&yaml), &None, &None);
         assert_eq!(cmds.coverage_report.as_deref(), Some("target/site/jacoco/jacoco.xml"));
         assert_eq!(cmds.coverage.as_deref(), Some("mvn test jacoco:report"));
+    }
+
+    #[test]
+    fn test_resolve_commands_test_compile_passthrough() {
+        let yaml = YamlConfig {
+            commands: CommandsYaml {
+                test_compile: Some("mvn test-compile".to_string()),
+                build: Some("mvn compile".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = resolve_commands(Some(&yaml), &None, &None);
+        assert_eq!(cmds.test_compile.as_deref(), Some("mvn test-compile"));
+        assert_eq!(cmds.build.as_deref(), Some("mvn compile"));
     }
 
     #[test]
@@ -1301,5 +1429,122 @@ prompts:
         // CLI value should NOT be overwritten by personal config
         merge_personal_into_config(&mut config, &personal);
         assert_eq!(config.sonar_url, "https://cli-value.com");
+    }
+
+    #[test]
+    fn test_yaml_max_boost_failures_override() {
+        let yaml_str = r#"
+execution:
+  max_boost_failures: 10
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(yaml.execution.max_boost_failures, Some(10));
+    }
+
+    #[test]
+    fn test_yaml_max_boost_failures_default_absent() {
+        let yaml_str = r#"
+execution:
+  coverage_wave_size: 5
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(yaml.execution.max_boost_failures, None);
+    }
+
+    #[test]
+    fn test_merge_yaml_max_boost_failures() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+        ]);
+        assert_eq!(config.max_boost_failures, 5); // default
+
+        let yaml_str = r#"
+execution:
+  max_boost_failures: 8
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        merge_yaml_into_config(&mut config, &yaml);
+        assert_eq!(config.max_boost_failures, 8);
+    }
+
+    #[test]
+    fn test_merge_yaml_max_boost_failures_cli_wins() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+            "--max-boost-failures", "3",
+        ]);
+        assert_eq!(config.max_boost_failures, 3);
+
+        let yaml_str = r#"
+execution:
+  max_boost_failures: 10
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        merge_yaml_into_config(&mut config, &yaml);
+        // CLI value (3) != default (5), so YAML should NOT override
+        assert_eq!(config.max_boost_failures, 3);
+    }
+
+    #[test]
+    fn test_parse_yaml_test_compile() {
+        let yaml_str = r#"
+commands:
+  build: "mvn compile -DskipTests"
+  test: "mvn test"
+  test_compile: "mvn test-compile"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(config.commands.test_compile.as_deref(), Some("mvn test-compile"));
+        assert_eq!(config.commands.build.as_deref(), Some("mvn compile -DskipTests"));
+    }
+
+    #[test]
+    fn test_resolve_commands_test_compile_none_by_default() {
+        let cmds = resolve_commands(None, &None, &None);
+        assert!(cmds.test_compile.is_none());
+    }
+
+    #[test]
+    fn test_parse_yaml_retry_failed_wave_files() {
+        let yaml_str = r#"
+execution:
+  retry_failed_wave_files: false
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        assert_eq!(config.execution.retry_failed_wave_files, Some(false));
+    }
+
+    #[test]
+    fn test_merge_yaml_retry_failed_wave_files_disables() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+        ]);
+        assert!(!config.skip_retry_failed_wave_files);
+
+        let yaml_str = r#"
+execution:
+  retry_failed_wave_files: false
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        merge_yaml_into_config(&mut config, &yaml);
+        assert!(config.skip_retry_failed_wave_files);
+    }
+
+    #[test]
+    fn test_merge_yaml_retry_failed_wave_files_cli_wins() {
+        let mut config = crate::config::Config::parse_from(vec![
+            "reparo", "--path", ".", "--sonar-project-id", "test",
+            "--skip-retry-failed-wave-files",
+        ]);
+        assert!(config.skip_retry_failed_wave_files);
+
+        let yaml_str = r#"
+execution:
+  retry_failed_wave_files: true
+"#;
+        let yaml: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        merge_yaml_into_config(&mut config, &yaml);
+        // CLI already disabled, YAML should NOT re-enable
+        assert!(config.skip_retry_failed_wave_files);
     }
 }

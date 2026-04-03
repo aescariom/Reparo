@@ -9,7 +9,7 @@ Reparo is a Rust CLI tool that automates SonarQube technical debt fixing using `
 ```bash
 cargo build              # dev build
 cargo build --release    # release build
-cargo test               # run all 139 unit tests
+cargo test               # run all 253 unit tests
 ```
 
 Tests create temporary git repos via `tempfile` — they are self-contained and need no external services.
@@ -24,7 +24,8 @@ src/
   orchestrator.rs   Main workflow loop — the heart of the system
   sonar.rs          SonarQube API client (issues, coverage, rules, scanner)
   claude.rs         Claude CLI invocation with per-call timeout, prompt builders
-  git.rs            Git operations (branch, commit, push, PR via gh)
+  engine.rs         Multi-engine AI dispatch (Claude, Gemini, Aider) + tier routing
+  git.rs            Git operations (branch, commit, push, PR via gh, stash)
   runner.rs         Test/build/lint execution, framework detection
   report.rs         REPORT.md, TECHDEBT_CHANGELOG.md, REVIEW_NEEDED.md
   retry.rs          Retry with exponential backoff for network/CLI calls
@@ -40,16 +41,19 @@ The flow is sequential and single-threaded:
 
 ```
 main.rs → Config::validate() → Orchestrator::run()
+  Step 0: check clean git working tree [git.rs]
+  Step 0b: preflight build + tests — abort with visible error if either fails [runner.rs]
   Step 1: check_connection() [sonar.rs]
   Step 2: run_scanner() + wait_for_analysis() [sonar.rs]
   Step 3: fetch_issues() sorted by severity [sonar.rs]
+  Step 3b: boost_coverage_to_threshold() — wave-based, N files per wave [engine.rs + runner.rs + git.rs]
   Step 4: for each batch of issues:
     create_branch [git.rs]
     for each issue:
       check_coverage [sonar.rs → CoverageResult]
-      generate_tests_with_retry [claude.rs + runner.rs] (max 3 attempts)
+      generate_tests_with_retry [engine.rs + runner.rs] (max 3 attempts)
       clean [runner.rs, if commands.clean set]
-      run_claude fix [claude.rs]
+      run AI fix [engine.rs]
       format [runner.rs, if commands.format set]
       build [runner.rs, if commands.build set — blocking]
       run tests [runner.rs — blocking]
@@ -86,7 +90,8 @@ main.rs → Config::validate() → Orchestrator::run()
 | `orchestrator.rs` | Workflow orchestration, batch loop, process_issue | API calls, git commands, file I/O |
 | `sonar.rs` | All SonarQube API interaction | Git, Claude, test execution |
 | `claude.rs` | Running `claude` CLI, building prompts | Deciding what to fix or when to retry |
-| `git.rs` | All git/gh commands | Deciding when to branch or commit |
+| `engine.rs` | Multi-engine dispatch (Claude/Gemini/Aider), tier routing, `run_engine()` | Deciding which task to fix or when to retry |
+| `git.rs` | All git/gh commands, stash push/pop/drop | Deciding when to branch or commit |
 | `runner.rs` | Executing shell commands (test, build, lint, format) | Deciding which commands to run |
 | `report.rs` | Writing REPORT.md, CHANGELOG, REVIEW_NEEDED | Deciding what status an issue gets |
 
@@ -95,7 +100,7 @@ main.rs → Config::validate() → Orchestrator::run()
 1. Check if there's a relevant US in `US/`. If not, create one.
 2. Identify which module(s) are affected.
 3. Add the implementation with tests in the same module.
-4. Run `cargo test` — all 117+ tests must pass.
+4. Run `cargo test` — all 253+ tests must pass.
 5. Run `cargo build` — no errors, only the `dead_code` warning for `ValidatedConfig` fields is acceptable.
 
 ## Common Tasks
@@ -122,6 +127,7 @@ Every optional step can be enabled or disabled via CLI flags and/or YAML configu
 | Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled | Remove duplicate fixes |
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled | Run full suite after all fixes |
 | Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled | Must enable via YAML |
+| Pre-push rebase | `--skip-rebase` | `execution.auto_rebase: false` | enabled | Rebase onto latest base before push, AI-resolves conflicts |
 | PR creation | `--no-pr` | — | enabled | Create PR via `gh` |
 
 **Priority**: CLI flags > ENV vars > YAML > defaults.
@@ -132,6 +138,14 @@ Every optional step can be enabled or disabled via CLI flags and/or YAML configu
 - `verify_before_fix` — verify contracts before applying fix
 - `verify_after_fix` — verify contracts after applying fix
 
+**Coverage boost parallelism** (`execution` YAML section / CLI flags):
+
+| Parameter | CLI flag | YAML field | Default | Description |
+|-----------|----------|------------|---------|-------------|
+| Wave size | `--coverage-wave-size` | `execution.coverage_wave_size` | 3 | Files per wave (AI gen in sequence, tests run once per wave) |
+| Commit batch | `--coverage-commit-batch` | `execution.coverage_commit_batch` | 0 (= same as wave size) | Files per git commit. 0 uses `coverage_wave_size`. 1 = one commit per file (original behavior). |
+| Ticket ref | `--commit-issue` | — (CLI only) | — | External issue ref (Jira/Linear) embedded as `{ticket}` in commit messages |
+
 **YAML example** (all steps explicit):
 ```yaml
 execution:
@@ -139,11 +153,14 @@ execution:
   coverage_boost: true
   coverage_attempts: 3
   coverage_rounds: 3
+  coverage_wave_size: 3
+  coverage_commit_batch: 0
   coverage_exclude: []
   final_validation: true
   final_validation_attempts: 5
   dedup_on_completion: true
   max_dedup: 10
+  auto_rebase: true
 
 pact:
   enabled: false

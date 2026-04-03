@@ -8,58 +8,14 @@ pub const DEFAULT_CLAUDE_TIMEOUT: u64 = 300;
 /// Ensures generated tests are self-contained, deterministic, and safe for
 /// parallel execution regardless of the project language or framework.
 const TEST_ROBUSTNESS_GUIDELINES: &str = r#"
-## Test Robustness — MANDATORY RULES
-Every test you generate MUST follow these rules. Tests that violate them will be
-rejected automatically.
-
-### 1. Full isolation — no shared mutable state
-- Each test MUST set up its own data and tear it down (or use framework
-  before/after hooks scoped to the single test, NOT the suite).
-- NEVER rely on database rows, files, caches, or environment variables left by
-  another test or by a previous run.
-- Use unique identifiers per test (e.g. UUID, timestamp suffix, or the test
-  name itself) for any resource that is created: DB records, temp files, queue
-  messages, API keys, usernames, etc.
-
-### 2. No dependency on external services or live data
-- Mock, stub, or fake ALL external I/O: HTTP APIs, databases, message brokers,
-  file systems outside a temp directory, mail servers, etc.
-- Use the project's existing mock/stub utilities and patterns when available.
-- If a database is truly required (integration test), use an in-memory or
-  ephemeral instance (e.g. SQLite :memory:, testcontainers, pg_tmp) and
-  populate it inside the test.
-
-### 3. Deterministic and repeatable
-- No dependency on wall-clock time (`Date.now()`, `time.time()`, etc.) —
-  freeze or inject time when the code under test uses it.
-- No randomness unless seeded. If the code under test uses randomness, seed it
-  or mock the RNG.
-- Fixed locale/timezone where formatting matters.
-
-### 4. Parallel-safe — no port or resource collisions
-- NEVER hard-code ports, file paths, or global singleton names that could
-  collide with another concurrent test run.
-- If a server is needed, bind to port 0 (OS-assigned) or use a unique temp
-  directory.
-
-### 5. Fast and focused
-- Each test should run in < 2 seconds unless it is explicitly an integration
-  test.
-- Prefer testing one behaviour per test function.
-- Avoid `sleep` / `setTimeout` unless testing real async behaviour, and keep
-  durations minimal.
-
-### 6. Clean assertions and failure messages
-- Use the framework's built-in matchers (expect().toBe, assert_eq!, assertEqual)
-  rather than raw `if` + `throw`.
-- Include a descriptive message or context so a failure is diagnosable without
-  reading the full test body.
-
-### 7. No test pollution
-- Restore any global state you touch (env vars, singletons, monkey-patches) in
-  an after/teardown hook.
-- Do NOT write to the working directory — use `os.tmpdir()`, `tempfile`, or
-  the framework's temp support.
+## Test rules (MANDATORY):
+1. Isolation: each test sets up and tears down its own data; use unique IDs for every created resource (DB rows, files, queue messages, etc.).
+2. No live I/O: mock/stub ALL HTTP, databases, message brokers, and filesystem access outside a temp directory; use in-memory or ephemeral DBs for integration tests.
+3. Deterministic: freeze or mock wall-clock time and RNG; use fixed locale/timezone where formatting matters.
+4. Parallel-safe: never hard-code ports, file paths, or global names — bind to port 0, use OS-assigned temp directories.
+5. Fast: each test < 2 s unless explicitly an integration test; avoid sleep/setTimeout except for real async behaviour.
+6. Assertions: use framework matchers (assert_eq!, assertEqual, expect().toBe) with descriptive failure messages.
+7. No pollution: restore env vars, singletons, and monkey-patches in teardown; write only to tmpdir.
 "#;
 
 /// UTF-8-safe string truncation.
@@ -272,25 +228,26 @@ pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64
 /// Build a prompt for generating unit tests (US-005).
 pub fn build_test_generation_prompt(
     source_file: &str,
-    source_content: &str,
     uncovered_lines: &str,
     test_framework_hint: &str,
     existing_test_examples: &str,
+    framework_context: &str,
 ) -> String {
+    let fc_section = if framework_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project test dependencies and class guidance:\n{}\n", framework_context)
+    };
     format!(
-        r#"I need you to generate unit tests for the following source file to achieve 100% code coverage on the specified lines.
-
-## Source file: `{source_file}`
-```
-{source_content}
-```
+        r#"Generate unit tests for `{source_file}` to cover the specified lines.
+Read the source file to understand the code.
 
 ## Lines that need test coverage:
 {uncovered_lines}
 
 ## Testing framework:
 {test_framework_hint}
-
+{fc_section}
 ## Examples of existing tests in this project:
 {existing_test_examples}
 {TEST_ROBUSTNESS_GUIDELINES}
@@ -299,48 +256,42 @@ pub fn build_test_generation_prompt(
 2. Follow the same style, conventions, and patterns as the existing tests
 3. Place the test file in the appropriate location following project conventions
 4. Each test should be focused and test one behavior
-5. Include both positive and negative test cases where applicable
-6. Do NOT modify any existing source code — only create new test files or add tests to existing test files
-7. Make sure all tests pass
-8. For each uncovered line, ensure at least one test exercises that line's branch/path
+5. Do NOT modify any existing source code — only create new test files or add tests to existing test files
+6. Make sure all tests pass
+7. For each uncovered line, ensure at least one test exercises that line's branch/path
 
 Write the tests now."#
     )
 }
 
 /// Build a retry prompt for test generation when the first attempt didn't achieve full coverage (US-005).
+/// Omits source content (AI can re-read the file), test examples (already seen), and guidelines (already seen).
 pub fn build_test_generation_retry_prompt(
     source_file: &str,
-    source_content: &str,
     still_uncovered_lines: &str,
     test_framework_hint: &str,
-    existing_test_examples: &str,
     attempt: u32,
     previous_test_output: &str,
+    framework_context: &str,
 ) -> String {
+    let fc_section = if framework_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project test dependencies and class guidance:\n{}\n", framework_context)
+    };
     format!(
-        r#"The previous test generation attempt ({attempt}/3) did NOT achieve 100% coverage. Some lines are still uncovered.
+        r#"Attempt {attempt}/3 — some lines in `{source_file}` are still uncovered. Re-read the file.
 
-## Source file: `{source_file}`
-```
-{source_content}
-```
-
-## Lines STILL uncovered after previous attempt:
+## Lines STILL uncovered:
 {still_uncovered_lines}
 
-## Testing framework:
-{test_framework_hint}
-
-## Examples of existing tests in this project:
-{existing_test_examples}
-
+## Testing framework: {test_framework_hint}
+{fc_section}
 ## Output from the previous test run:
 ```
 {previous_test_output}
 ```
 
-{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Analyze WHY the above lines are still uncovered — they likely require specific inputs, edge cases, or branch conditions
 2. Write ADDITIONAL unit tests that specifically target these uncovered lines
@@ -357,7 +308,6 @@ Write the additional tests now."#
 /// Build a prompt for generating pact/contract tests.
 pub fn build_contract_test_prompt(
     source_file: &str,
-    source_content: &str,
     provider_name: &str,
     consumer_name: &str,
     pact_framework: &str,
@@ -365,13 +315,7 @@ pub fn build_contract_test_prompt(
     existing_pact_files: &str,
 ) -> String {
     format!(
-        r#"I need you to generate pact/contract tests for the following source file
-that interacts with APIs.
-
-## Source file: `{source_file}`
-```
-{source_content}
-```
+        r#"Generate pact/contract tests for `{source_file}` (read the file to find API interactions).
 
 ## Provider: {provider_name}
 ## Consumer: {consumer_name}
@@ -402,31 +346,21 @@ Write the contract tests now."#
 }
 
 /// Build a retry prompt for contract test generation.
+/// Omits source content and examples (already seen on first attempt), and skips guidelines.
 pub fn build_contract_test_retry_prompt(
     source_file: &str,
-    source_content: &str,
     provider_name: &str,
     consumer_name: &str,
     pact_framework: &str,
-    existing_contract_examples: &str,
     attempt: u32,
     previous_output: &str,
 ) -> String {
     format!(
-        r#"The previous contract test generation attempt ({attempt}) failed verification.
-Please fix the issues.
-
-## Source file: `{source_file}`
-```
-{source_content}
-```
+        r#"Contract test attempt {attempt} for `{source_file}` failed. Re-read the source file and fix the issues.
 
 ## Provider: {provider_name}
 ## Consumer: {consumer_name}
 ## Pact framework: {pact_framework}
-
-## Existing contract test examples:
-{existing_contract_examples}
 
 ## Output from the previous attempt:
 ```
@@ -437,7 +371,6 @@ Please fix the issues.
 1. Do NOT modify existing source code or test files
 2. Fix only the contract tests that were generated in the previous attempt
 
-{TEST_ROBUSTNESS_GUIDELINES}
 ## Instructions:
 1. Analyze the error output to understand what went wrong
 2. Fix the contract tests — ensure request/response bodies match the actual API schema
@@ -456,13 +389,12 @@ pub fn build_fix_prompt(
     rule: &str,
     message: &str,
     file_path: &str,
-    file_content: &str,
     start_line: u32,
     end_line: u32,
     rule_description: &str,
 ) -> String {
     format!(
-        r#"Fix the following SonarQube issue in this project.
+        r#"Fix the following SonarQube issue. Read `{file_path}` to see the current code.
 
 ## Issue details
 - **Key**: {issue_key}
@@ -474,11 +406,6 @@ pub fn build_fix_prompt(
 
 ## Rule description:
 {rule_description}
-
-## Current file content (`{file_path}`):
-```
-{file_content}
-```
 
 ## CRITICAL RULES:
 - **NEVER modify test files** — do NOT touch any file matching *.spec.ts, *.test.ts, *_test.*, test_*.*, *.spec.js, *.test.js. This is an absolute rule. Test file modifications will be automatically reverted.
@@ -499,7 +426,6 @@ Apply the fix now."#
 /// Build a prompt asking Claude to eliminate code duplication in a file.
 pub fn build_dedup_prompt(
     file_path: &str,
-    file_content: &str,
     duplicated_ranges: &[(u32, u32)], // (from_line, to_line) pairs
     duplication_pct: f64,
 ) -> String {
@@ -510,29 +436,21 @@ pub fn build_dedup_prompt(
         .join("\n");
 
     format!(
-        r#"Refactor the following file to eliminate code duplication.
+        r#"Refactor `{file_path}` to eliminate code duplication. Read the file first.
 
-## File: `{file_path}`
-- **Duplication**: {duplication_pct:.1}% of lines are duplicated
-- **Duplicated ranges**:
+## Duplication: {duplication_pct:.1}% of lines are duplicated
+## Duplicated ranges:
 {ranges_desc}
 
-## Current file content (`{file_path}`):
-```
-{file_content}
-```
-
 ## Instructions:
-1. Identify the duplicated code patterns in the ranges listed above
+1. Read `{file_path}` and identify duplicated code in the ranges above
 2. Extract common logic into shared helper functions, utilities, or base classes
 3. Replace ALL duplicated instances with calls to the shared code
 4. Do NOT modify any test files
 5. Do NOT change the external behavior or public API of the code
 6. Keep the same function signatures for public/exported functions
-7. Ensure all extracted helpers are well-named and documented
-8. If the duplication spans multiple files, focus ONLY on `{file_path}` — do NOT modify other source files
-9. Prefer composition and reuse over copy-paste patterns
-10. The goal is to reduce duplicated lines while keeping the code readable
+7. If the duplication spans multiple files, focus ONLY on `{file_path}`
+8. Prefer composition and reuse over copy-paste patterns
 
 Apply the refactoring now."#
     )
@@ -574,7 +492,6 @@ Fix the {error_type} error now."#
 /// to meet ISO 25000 and/or MDR standards.
 pub fn build_documentation_prompt(
     file_path: &str,
-    file_content: &str,
     style: &str,
     standards: &[String],
     scope: &[String],
@@ -615,9 +532,7 @@ pub fn build_documentation_prompt(
     };
 
     format!(
-        r#"Improve the documentation of the following source file to meet quality standards.
-
-## File: `{file_path}`
+        r#"Improve documentation in `{file_path}` to meet quality standards. Read the file first.
 
 ## Documentation style: {style_desc}
 
@@ -626,11 +541,6 @@ pub fn build_documentation_prompt(
 ## Scope: {scope_desc}
 
 ## Required elements per function/method/class: {elements_desc}
-
-## Current file content (`{file_path}`):
-```
-{file_content}
-```
 {custom_section}
 
 ## Instructions:
@@ -659,35 +569,37 @@ mod tests {
     fn test_build_test_generation_prompt_contains_all_context() {
         let prompt = build_test_generation_prompt(
             "src/calculator.py",
-            "def add(a, b):\n    return a + b",
             "Lines 1-2 (specifically uncovered: 2)",
             "pytest",
             "// File: tests/test_math.py\ndef test_sub(): assert sub(3,1) == 2",
+            "",
         );
         assert!(prompt.contains("src/calculator.py"));
-        assert!(prompt.contains("def add(a, b)"));
         assert!(prompt.contains("uncovered: 2"));
         assert!(prompt.contains("pytest"));
         assert!(prompt.contains("test_math.py"));
         assert!(prompt.contains("Do NOT modify any existing source code"));
+        // Source content is NOT embedded — AI reads the file directly
+        assert!(!prompt.contains("def add(a, b)"));
     }
 
     #[test]
     fn test_build_retry_prompt_includes_attempt_and_output() {
         let prompt = build_test_generation_retry_prompt(
             "src/main.py",
-            "x = 1\nif x > 0:\n    print('yes')",
             "Lines still uncovered: 3",
             "pytest",
-            "",
             2,
             "FAILED test_foo - AssertionError",
+            "",
         );
         assert!(prompt.contains("2/3"));
         assert!(prompt.contains("Lines still uncovered: 3"));
         assert!(prompt.contains("FAILED test_foo"));
         assert!(prompt.contains("WHY the above lines are still uncovered"));
         assert!(prompt.contains("Do NOT duplicate existing tests"));
+        // No test examples or guidelines on retries
+        assert!(!prompt.contains("Examples of existing tests"));
     }
 
     #[test]
@@ -699,7 +611,6 @@ mod tests {
             "python:S1234",
             "Null dereference",
             "src/service.py",
-            "obj = None\nobj.method()",
             1,
             2,
             "# Null Dereference\nAvoid calling methods on null.",
@@ -710,15 +621,15 @@ mod tests {
         assert!(prompt.contains("python:S1234"));
         assert!(prompt.contains("Null dereference"));
         assert!(prompt.contains("src/service.py"));
-        assert!(prompt.contains("obj = None"));
         assert!(prompt.contains("NEVER modify test files"));
+        // File content NOT embedded
+        assert!(!prompt.contains("obj = None"));
     }
 
     #[test]
     fn test_build_contract_test_prompt_contains_context() {
         let prompt = build_contract_test_prompt(
             "src/api/users.ts",
-            "fetch('/api/users')",
             "UserService",
             "WebApp",
             "pact-js",
@@ -738,15 +649,13 @@ mod tests {
     fn test_build_contract_test_retry_prompt_contains_attempt() {
         let prompt = build_contract_test_retry_prompt(
             "src/api/users.ts",
-            "fetch('/api/users')",
             "UserService",
             "WebApp",
             "pact-js",
-            "",
             2,
             "Error: expected 200 got 404",
         );
-        assert!(prompt.contains("(2)"));
+        assert!(prompt.contains("attempt 2"));
         assert!(prompt.contains("Error: expected 200 got 404"));
         assert!(prompt.contains("Do NOT modify"));
     }

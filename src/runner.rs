@@ -152,8 +152,8 @@ pub fn find_test_examples(project_path: &Path) -> Vec<String> {
         if let Ok(paths) = glob::glob(&format!("{}/{}", project_path.display(), pattern)) {
             for entry in paths.flatten() {
                 if let Ok(content) = std::fs::read_to_string(&entry) {
-                    // Only take first ~50 lines as example
-                    let snippet: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
+                    // Only take first ~20 lines as example — enough to convey style/patterns
+                    let snippet: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
                     let rel_path = entry.strip_prefix(project_path).unwrap_or(&entry);
                     examples.push(format!("// File: {}\n{}", rel_path.display(), snippet));
                     if examples.len() >= 2 {
@@ -165,6 +165,178 @@ pub fn find_test_examples(project_path: &Path) -> Vec<String> {
     }
 
     examples
+}
+
+/// Detect test dependencies from build files (pom.xml / build.gradle) for framework-aware prompts (US-040).
+///
+/// Returns a human-readable description of the detected test stack,
+/// e.g. "JUnit 5, Mockito, AssertJ". Returns empty string if nothing detected.
+pub fn detect_test_dependencies(project_path: &Path) -> String {
+    let mut deps: Vec<&str> = Vec::new();
+
+    // Try pom.xml first
+    if let Ok(content) = std::fs::read_to_string(project_path.join("pom.xml")) {
+        let content_lower = content.to_lowercase();
+        // JUnit version detection
+        if content_lower.contains("junit-jupiter") || content_lower.contains("junit-bom") {
+            deps.push("JUnit 5 (junit-jupiter)");
+        } else if content_lower.contains("junit</artifactid") || content_lower.contains("junit:junit") {
+            deps.push("JUnit 4");
+        }
+        // Mockito
+        if content_lower.contains("mockito-core") || content_lower.contains("mockito-junit-jupiter") {
+            if content_lower.contains("mockito-junit-jupiter") {
+                deps.push("Mockito with mockito-junit-jupiter (@ExtendWith(MockitoExtension.class))");
+            } else {
+                deps.push("Mockito");
+            }
+        }
+        // Spring
+        if content_lower.contains("spring-boot-starter-test") {
+            deps.push("Spring Boot Test (spring-boot-starter-test)");
+        } else if content_lower.contains("spring-test") {
+            deps.push("Spring Test");
+        }
+        // Assertion libraries
+        if content_lower.contains("assertj-core") {
+            deps.push("AssertJ (assertThat style assertions)");
+        }
+        if content_lower.contains("hamcrest") {
+            deps.push("Hamcrest");
+        }
+        return deps.join(", ");
+    }
+
+    // Try build.gradle / build.gradle.kts
+    for gradle_file in &["build.gradle", "build.gradle.kts"] {
+        if let Ok(content) = std::fs::read_to_string(project_path.join(gradle_file)) {
+            let content_lower = content.to_lowercase();
+            if content_lower.contains("junit-jupiter") || content_lower.contains("junit-bom") {
+                deps.push("JUnit 5 (junit-jupiter)");
+            } else if content_lower.contains("junit:junit") {
+                deps.push("JUnit 4");
+            }
+            if content_lower.contains("mockito") {
+                deps.push("Mockito");
+            }
+            if content_lower.contains("spring-boot-starter-test") {
+                deps.push("Spring Boot Test");
+            }
+            if content_lower.contains("assertj") {
+                deps.push("AssertJ");
+            }
+            return deps.join(", ");
+        }
+    }
+
+    // Try package.json for JS/TS projects
+    if let Ok(content) = std::fs::read_to_string(project_path.join("package.json")) {
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("jest") {
+            deps.push("Jest");
+        }
+        if content_lower.contains("mocha") {
+            deps.push("Mocha");
+        }
+        if content_lower.contains("vitest") {
+            deps.push("Vitest");
+        }
+        if content_lower.contains("sinon") {
+            deps.push("Sinon");
+        }
+        if content_lower.contains("chai") {
+            deps.push("Chai");
+        }
+        return deps.join(", ");
+    }
+
+    String::new()
+}
+
+/// Classify a source file by reading its content to determine the type of test needed (US-040).
+///
+/// For Java/Kotlin files, detects Spring annotations to recommend the appropriate test approach.
+/// Returns empty string for non-Java files or when no classification is possible.
+pub fn classify_source_file(file_path: &str, project_path: &Path) -> String {
+    let full_path = project_path.join(file_path);
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    // Only classify Java/Kotlin files
+    if !file_path.ends_with(".java") && !file_path.ends_with(".kt") {
+        return String::new();
+    }
+
+    // Detect Spring annotations
+    let has_rest_controller = content.contains("@RestController") || content.contains("@Controller");
+    let has_service = content.contains("@Service") || content.contains("@Component");
+    let has_repository = content.contains("@Repository");
+    let has_entity = content.contains("@Entity") || content.contains("@Table");
+    let has_configuration = content.contains("@Configuration") || content.contains("@Bean");
+
+    if has_rest_controller {
+        return "This is a @RestController. Use @WebMvcTest or plain Mockito with MockMvc for testing. Do NOT use @SpringBootTest.".to_string();
+    }
+    if has_service {
+        return "This is a @Service/@Component. Use @ExtendWith(MockitoExtension.class) with @Mock and @InjectMocks. Do NOT use @SpringBootTest.".to_string();
+    }
+    if has_repository {
+        return "This is a @Repository. Use @ExtendWith(MockitoExtension.class) to mock dependencies. Do NOT use @SpringBootTest.".to_string();
+    }
+    if has_entity {
+        return "This is a JPA @Entity. Generate simple unit tests with JUnit 5 only — test constructors, getters, setters, equals/hashCode. Do NOT use @SpringBootTest.".to_string();
+    }
+    if has_configuration {
+        return "This is a @Configuration class. Test the @Bean methods in isolation with JUnit 5 and Mockito if needed. Do NOT use @SpringBootTest.".to_string();
+    }
+
+    // Check for DTO/POJO/Enum patterns (no Spring annotations, simple class)
+    let is_enum = content.contains("public enum ") || content.contains("enum class ");
+    let is_record = content.contains("public record ");
+    let is_interface = content.contains("public interface ");
+    let has_only_fields = !content.contains("@Autowired")
+        && !content.contains("@Inject")
+        && !has_rest_controller
+        && !has_service
+        && !has_repository;
+
+    if is_enum {
+        return "This is an enum. Generate simple unit tests with JUnit 5 only — test values, valueOf, any custom methods. Do NOT use Spring or Mockito.".to_string();
+    }
+    if is_record {
+        return "This is a record/DTO. Generate simple unit tests with JUnit 5 only — test constructor, accessors, equals/hashCode. Do NOT use Spring or Mockito.".to_string();
+    }
+    if is_interface {
+        return String::new(); // Interfaces usually don't need direct tests
+    }
+    if has_only_fields {
+        return "This is a POJO/DTO class. Generate simple unit tests with JUnit 5 only — test constructors, getters, setters. Do NOT use @SpringBootTest.".to_string();
+    }
+
+    String::new()
+}
+
+/// Derive the expected test package from a Java/Kotlin source file path (US-040).
+///
+/// E.g., "src/main/java/com/example/service/MyService.java" → "com.example.service"
+pub fn derive_test_package(file_path: &str) -> Option<String> {
+    // Look for src/main/java/ or src/main/kotlin/ prefix
+    let markers = ["src/main/java/", "src/main/kotlin/"];
+    for marker in &markers {
+        if let Some(idx) = file_path.find(marker) {
+            let after = &file_path[idx + marker.len()..];
+            // Remove filename to get directory path, then convert / to .
+            if let Some(last_slash) = after.rfind('/') {
+                let package = after[..last_slash].replace('/', ".");
+                if !package.is_empty() {
+                    return Some(package);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Result of checking local coverage for a file's line range.
@@ -329,6 +501,8 @@ pub struct FileCoverage {
     pub covered_lines: u64,
     /// Coverage percentage.
     pub coverage_pct: f64,
+    /// Line numbers that are coverable but not yet hit (hit count == 0).
+    pub uncovered_lines: Vec<u32>,
 }
 
 /// Parse a coverage report and return per-file coverage, sorted ascending by coverage %.
@@ -361,19 +535,23 @@ fn per_file_lcov_coverage_from_content(content: &str) -> Vec<FileCoverage> {
     let mut current_file: Option<String> = None;
     let mut total: u64 = 0;
     let mut covered: u64 = 0;
+    let mut uncovered_lines: Vec<u32> = Vec::new();
 
     for line in content.lines() {
         if line.starts_with("SF:") {
             current_file = Some(line[3..].to_string());
             total = 0;
             covered = 0;
+            uncovered_lines = Vec::new();
         } else if line.starts_with("DA:") {
             let parts: Vec<&str> = line[3..].splitn(2, ',').collect();
             if parts.len() == 2 {
-                if let Ok(hits) = parts[1].parse::<u64>() {
+                if let (Ok(line_num), Ok(hits)) = (parts[0].parse::<u32>(), parts[1].parse::<u64>()) {
                     total += 1;
                     if hits > 0 {
                         covered += 1;
+                    } else {
+                        uncovered_lines.push(line_num);
                     }
                 }
             }
@@ -385,6 +563,7 @@ fn per_file_lcov_coverage_from_content(content: &str) -> Vec<FileCoverage> {
                     total_lines: total,
                     covered_lines: covered,
                     coverage_pct: pct,
+                    uncovered_lines: uncovered_lines.clone(),
                 });
             }
             current_file = None;
@@ -406,6 +585,7 @@ fn per_file_jacoco_xml_coverage(content: &str) -> Vec<FileCoverage> {
     let mut current_file: Option<String> = None;
     let mut total: u64 = 0;
     let mut covered: u64 = 0;
+    let mut uncovered_lines: Vec<u32> = Vec::new();
 
     // Normalize minified XML: ensure each tag starts on its own line
     let normalized = content.replace('<', "\n<");
@@ -420,6 +600,7 @@ fn per_file_jacoco_xml_coverage(content: &str) -> Vec<FileCoverage> {
                 current_file = Some(format!("{}/{}", current_package, name));
                 total = 0;
                 covered = 0;
+                uncovered_lines = Vec::new();
             }
         } else if trimmed.starts_with("<line ") && current_file.is_some() {
             // JaCoCo <line nr="N" mi="M" ci="C" mb="M" cb="C"/>
@@ -434,6 +615,8 @@ fn per_file_jacoco_xml_coverage(content: &str) -> Vec<FileCoverage> {
                 total += 1;
                 if ci > 0 {
                     covered += 1;
+                } else if let Some(nr) = extract_xml_attr(trimmed, "nr").and_then(|v| v.parse::<u32>().ok()) {
+                    uncovered_lines.push(nr);
                 }
             }
         } else if trimmed.starts_with("</sourcefile>") {
@@ -445,6 +628,7 @@ fn per_file_jacoco_xml_coverage(content: &str) -> Vec<FileCoverage> {
                         total_lines: total,
                         covered_lines: covered,
                         coverage_pct: pct,
+                        uncovered_lines: uncovered_lines.clone(),
                     });
                 }
             }
@@ -464,6 +648,7 @@ fn per_file_cobertura_xml_coverage(content: &str) -> Vec<FileCoverage> {
     let mut current_file: Option<String> = None;
     let mut total: u64 = 0;
     let mut covered: u64 = 0;
+    let mut uncovered_lines: Vec<u32> = Vec::new();
 
     // Normalize minified XML: ensure each tag starts on its own line
     let normalized = content.replace('<', "\n<");
@@ -474,6 +659,7 @@ fn per_file_cobertura_xml_coverage(content: &str) -> Vec<FileCoverage> {
                 current_file = Some(filename);
                 total = 0;
                 covered = 0;
+                uncovered_lines = Vec::new();
             }
         } else if trimmed.starts_with("<line ") && current_file.is_some() {
             if let Some(hits_str) = extract_xml_attr(trimmed, "hits") {
@@ -481,6 +667,8 @@ fn per_file_cobertura_xml_coverage(content: &str) -> Vec<FileCoverage> {
                     total += 1;
                     if hits > 0 {
                         covered += 1;
+                    } else if let Some(num) = extract_xml_attr(trimmed, "number").and_then(|v| v.parse::<u32>().ok()) {
+                        uncovered_lines.push(num);
                     }
                 }
             }
@@ -493,6 +681,7 @@ fn per_file_cobertura_xml_coverage(content: &str) -> Vec<FileCoverage> {
                         total_lines: total,
                         covered_lines: covered,
                         coverage_pct: pct,
+                        uncovered_lines: uncovered_lines.clone(),
                     });
                 }
             }
@@ -532,6 +721,104 @@ pub fn overall_lcov_coverage(report_path: &Path) -> Option<f64> {
     }
 
     Some((covered as f64 / total as f64) * 100.0)
+}
+
+/// Extract a useful error summary from build/test output.
+///
+/// Searches for common error patterns (Maven `[ERROR]`, Gradle `FAILED`,
+/// compiler errors, exceptions) and returns context lines around them.
+/// Falls back to the tail of the output when no recognizable pattern is found.
+pub fn extract_error_summary(output: &str, max_chars: usize) -> String {
+    if output.chars().count() <= max_chars {
+        return output.to_string();
+    }
+
+    // Error patterns ordered by specificity
+    let patterns: &[&str] = &[
+        // Maven
+        "[ERROR]",
+        "BUILD FAILURE",
+        "Compilation failure",
+        "compilation error",
+        // Gradle
+        "> Task ",
+        "FAILED",
+        // General compiler / runtime
+        "error:",
+        "error[",
+        "FAIL",
+        "Exception",
+        "panic",
+        "cannot find symbol",
+        "does not exist",
+    ];
+
+    let lines: Vec<&str> = output.lines().collect();
+
+    // Collect indices of lines matching any error pattern (case-insensitive for general patterns)
+    let mut error_indices: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        for &pat in patterns {
+            if pat == pat.to_uppercase().as_str() {
+                // Exact-case patterns: [ERROR], BUILD FAILURE, FAILED, FAIL, Exception
+                if line.contains(pat) {
+                    error_indices.push(i);
+                    break;
+                }
+            } else {
+                // Case-insensitive patterns
+                if line.to_lowercase().contains(&pat.to_lowercase()) {
+                    error_indices.push(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if error_indices.is_empty() {
+        // Fallback: return the tail of the output
+        let tail: String = output.chars().skip(output.chars().count() - max_chars).collect();
+        return format!("...{}", tail);
+    }
+
+    // Deduplicate and collect context around error lines (1 line before, 2 after)
+    let mut selected: Vec<usize> = Vec::new();
+    for &idx in &error_indices {
+        let start = idx.saturating_sub(1);
+        let end = (idx + 3).min(lines.len());
+        for i in start..end {
+            selected.push(i);
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+
+    // Build result from selected lines, respecting max_chars
+    let mut result = String::new();
+    let mut prev_idx: Option<usize> = None;
+    for &i in &selected {
+        if let Some(prev) = prev_idx {
+            if i > prev + 1 {
+                result.push_str("\n  ...\n");
+            }
+        }
+        let line = lines[i];
+        if result.chars().count() + line.chars().count() + 1 > max_chars {
+            if result.is_empty() {
+                // At least include a partial first line
+                let remaining = max_chars.saturating_sub(4);
+                let partial: String = line.chars().take(remaining).collect();
+                result.push_str(&partial);
+                result.push_str("...");
+            }
+            break;
+        }
+        result.push_str(line);
+        result.push('\n');
+        prev_idx = Some(i);
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -576,6 +863,106 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cmd = detect_test_command(tmp.path());
         assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn test_detect_test_dependencies_junit5_mockito() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("pom.xml"),
+            r#"<project>
+  <dependencies>
+    <dependency>
+      <artifactId>junit-jupiter</artifactId>
+    </dependency>
+    <dependency>
+      <artifactId>mockito-junit-jupiter</artifactId>
+    </dependency>
+    <dependency>
+      <artifactId>assertj-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>"#,
+        )
+        .unwrap();
+        let result = detect_test_dependencies(tmp.path());
+        assert!(result.contains("JUnit 5"), "expected JUnit 5 in: {result}");
+        assert!(result.contains("Mockito"), "expected Mockito in: {result}");
+        assert!(result.contains("AssertJ"), "expected AssertJ in: {result}");
+    }
+
+    #[test]
+    fn test_detect_test_dependencies_spring_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("pom.xml"),
+            r#"<project>
+  <dependencies>
+    <dependency>
+      <artifactId>spring-boot-starter-test</artifactId>
+    </dependency>
+  </dependencies>
+</project>"#,
+        )
+        .unwrap();
+        let result = detect_test_dependencies(tmp.path());
+        assert!(result.contains("Spring Boot Test"), "expected Spring Boot Test in: {result}");
+    }
+
+    #[test]
+    fn test_detect_test_dependencies_empty_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = detect_test_dependencies(tmp.path());
+        assert!(result.is_empty(), "expected empty string for project with no build file, got: {result}");
+    }
+
+    #[test]
+    fn test_classify_source_file_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let java_path = tmp.path().join("MyService.java");
+        fs::write(
+            &java_path,
+            "@Service\npublic class MyService {\n    void doWork() {}\n}\n",
+        )
+        .unwrap();
+        let result = classify_source_file(java_path.to_str().unwrap(), tmp.path());
+        assert!(result.contains("@InjectMocks") || result.contains("Mockito"), "expected Mockito guidance for @Service, got: {result}");
+    }
+
+    #[test]
+    fn test_classify_source_file_enum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let java_path = tmp.path().join("SortType.java");
+        fs::write(
+            &java_path,
+            "public enum SortType { ASC, DESC }\n",
+        )
+        .unwrap();
+        let result = classify_source_file(java_path.to_str().unwrap(), tmp.path());
+        assert!(result.contains("JUnit 5") || result.contains("enum"), "expected JUnit 5 guidance for enum, got: {result}");
+        assert!(!result.contains("SpringBootTest"), "enum should not suggest SpringBootTest, got: {result}");
+    }
+
+    #[test]
+    fn test_classify_source_file_non_java() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py_path = tmp.path().join("calc.py");
+        fs::write(&py_path, "def add(a, b): return a + b\n").unwrap();
+        let result = classify_source_file(py_path.to_str().unwrap(), tmp.path());
+        // Non-Java files return empty string
+        assert!(result.is_empty(), "expected empty for non-Java file, got: {result}");
+    }
+
+    #[test]
+    fn test_derive_test_package_maven_layout() {
+        let result = derive_test_package("src/main/java/com/example/service/MyService.java");
+        assert_eq!(result, Some("com.example.service".to_string()));
+    }
+
+    #[test]
+    fn test_derive_test_package_no_match() {
+        let result = derive_test_package("src/calculator.py");
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -890,5 +1277,71 @@ mod tests {
         fs::write(&xml_path, xml).unwrap();
         let cov = overall_lcov_coverage(&xml_path).unwrap();
         assert!((cov - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_error_summary_maven_error() {
+        let output = "[INFO] Scanning for projects...\n\
+            [INFO] ----------------------< com.example:app >-----------------------\n\
+            [INFO] Building App 1.0.0\n\
+            [INFO]   from pom.xml\n\
+            [INFO] --------------------------------[ jar ]---------------------------------\n\
+            [INFO] --- maven-compiler-plugin:3.11.0:compile (default-compile) @ app ---\n\
+            [ERROR] /src/main/java/App.java:[15,10] cannot find symbol\n\
+            [ERROR]   symbol:   class FooService\n\
+            [ERROR]   location: class com.example.App\n\
+            [INFO] BUILD FAILURE\n\
+            [INFO] Total time:  2.345 s";
+        let summary = extract_error_summary(output, 500);
+        assert!(summary.contains("[ERROR]"), "Should contain [ERROR] lines");
+        assert!(summary.contains("cannot find symbol"), "Should contain the actual error");
+        assert!(summary.contains("BUILD FAILURE"), "Should contain BUILD FAILURE");
+    }
+
+    #[test]
+    fn test_extract_error_summary_gradle_failure() {
+        let output = "> Task :compileJava UP-TO-DATE\n\
+            > Task :processResources NO-SOURCE\n\
+            > Task :classes UP-TO-DATE\n\
+            > Task :compileTestJava\n\
+            /src/test/java/AppTest.java:10: error: cannot find symbol\n\
+            > Task :compileTestJava FAILED\n\
+            BUILD FAILED in 5s\n\
+            3 actionable tasks: 1 executed, 2 up-to-date";
+        let summary = extract_error_summary(output, 500);
+        assert!(summary.contains("error: cannot find symbol"), "Should contain compile error");
+        assert!(summary.contains("FAILED"), "Should contain FAILED marker");
+    }
+
+    #[test]
+    fn test_extract_error_summary_no_pattern_falls_back_to_tail() {
+        let mut output = String::new();
+        for i in 0..100 {
+            output.push_str(&format!("line {} of normal output\n", i));
+        }
+        let summary = extract_error_summary(&output, 200);
+        assert!(summary.starts_with("..."), "Should start with ... (tail fallback)");
+        assert!(summary.contains("line 99"), "Should contain last lines of output");
+    }
+
+    #[test]
+    fn test_extract_error_summary_short_output_unchanged() {
+        let output = "short output";
+        let summary = extract_error_summary(output, 500);
+        assert_eq!(summary, "short output");
+    }
+
+    #[test]
+    fn test_extract_error_summary_exception_trace() {
+        let output = "[INFO] Running com.example.AppTest\n\
+            [INFO] Tests run: 5, Failures: 1, Errors: 0\n\
+            [ERROR] testFoo(com.example.AppTest)  Time elapsed: 0.012 s  <<< FAILURE!\n\
+            java.lang.NullPointerException: Cannot invoke method on null\n\
+            \tat com.example.App.foo(App.java:42)\n\
+            \tat com.example.AppTest.testFoo(AppTest.java:15)\n\
+            [INFO] BUILD FAILURE";
+        let summary = extract_error_summary(output, 800);
+        assert!(summary.contains("NullPointerException"), "Should contain exception");
+        assert!(summary.contains("[ERROR]"), "Should contain ERROR line");
     }
 }
