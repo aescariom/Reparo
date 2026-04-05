@@ -22,9 +22,10 @@ pub struct YamlConfig {
     /// Documentation quality configuration (ISO 25000 / MDR compliance)
     #[serde(default)]
     pub documentation: DocumentationYaml,
-    /// Pact/contract testing configuration (opt-in, all disabled by default)
-    #[serde(default)]
-    pub pact: PactYaml,
+    /// Pact/contract testing configuration. Presence of this section is what marks
+    /// the pact phase as configured — missing section + no `--skip-pact` is an error.
+    /// When present without an explicit `enabled`, it defaults to enabled (opt-out).
+    pub pact: Option<PactYaml>,
     /// Files that Claude must never modify during fixes (reverted automatically).
     /// List of exact filenames (matched against the basename, case-insensitive).
     #[serde(default)]
@@ -161,11 +162,13 @@ pub struct DocumentationYaml {
 
 /// Pact/contract testing configuration.
 /// Controls the contract verification step between coverage check and fix.
-/// All sub-steps are opt-in and disabled by default.
+/// When the section is present, the phase runs unless `--skip-pact` is passed;
+/// sub-steps are opt-in and default to false.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PactYaml {
-    /// Master switch — enable pact integration (default: false)
+    /// Master switch. Defaults to true when the section is present (opt-out).
+    /// Set to false to keep the configuration but disable the phase.
     pub enabled: Option<bool>,
     /// Path to pact files directory. Can be absolute or relative to project root.
     /// Supports external/shared pact directories across projects.
@@ -174,10 +177,6 @@ pub struct PactYaml {
     pub provider_name: Option<String>,
     /// This project's consumer name (for consumer-driven contracts)
     pub consumer_name: Option<String>,
-    /// Pact Broker URL for fetching/publishing contracts
-    pub broker_url: Option<String>,
-    /// Pact Broker token for authentication
-    pub broker_token: Option<String>,
 
     // --- Sub-step toggles (all default false) ---
 
@@ -629,23 +628,26 @@ pub fn merge_yaml_into_config(
         },
         docs_command: yaml.commands.docs.clone(),
     };
-    // pact: resolve from YAML (all disabled by default)
-    let pact = &yaml.pact;
-    config.pact = crate::config::PactConfig {
-        enabled: pact.enabled.unwrap_or(false),
-        pact_dir: pact.pact_dir.clone(),
-        provider_name: pact.provider_name.clone(),
-        consumer_name: pact.consumer_name.clone(),
-        broker_url: pact.broker_url.clone(),
-        broker_token: pact.broker_token.clone(),
-        check_contracts: pact.check_contracts.unwrap_or(false),
-        generate_tests: pact.generate_tests.unwrap_or(false),
-        verify_before_fix: pact.verify_before_fix.unwrap_or(false),
-        verify_after_fix: pact.verify_after_fix.unwrap_or(false),
-        verify_command: pact.verify_command.clone(),
-        test_command: pact.test_command.clone(),
-        attempts: pact.attempts.unwrap_or(3),
-        api_patterns: pact.api_patterns.clone(),
+    // pact: resolve from YAML. Section missing → configured=false, which causes
+    // `PactConfig::validate()` to bail unless --skip-pact is set.
+    config.pact = match &yaml.pact {
+        Some(pact) => crate::config::PactConfig {
+            configured: true,
+            // Default to enabled when the section is present (opt-out via --skip-pact).
+            enabled: pact.enabled.unwrap_or(true),
+            pact_dir: pact.pact_dir.clone(),
+            provider_name: pact.provider_name.clone(),
+            consumer_name: pact.consumer_name.clone(),
+            check_contracts: pact.check_contracts.unwrap_or(false),
+            generate_tests: pact.generate_tests.unwrap_or(false),
+            verify_before_fix: pact.verify_before_fix.unwrap_or(false),
+            verify_after_fix: pact.verify_after_fix.unwrap_or(false),
+            verify_command: pact.verify_command.clone(),
+            test_command: pact.test_command.clone(),
+            attempts: pact.attempts.unwrap_or(3),
+            api_patterns: pact.api_patterns.clone(),
+        },
+        None => crate::config::PactConfig::default(),
     };
 
     // test_generation: resolve from YAML (US-040)
@@ -1227,8 +1229,6 @@ pact:
   pact_dir: "../shared-pacts"
   provider_name: "UserService"
   consumer_name: "WebApp"
-  broker_url: "https://broker.example.com"
-  broker_token: "tok123"
   check_contracts: true
   generate_tests: true
   verify_before_fix: true
@@ -1241,19 +1241,19 @@ pact:
     - "**/services/**"
 "#;
         let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
-        assert_eq!(config.pact.enabled, Some(true));
-        assert_eq!(config.pact.pact_dir.as_deref(), Some("../shared-pacts"));
-        assert_eq!(config.pact.provider_name.as_deref(), Some("UserService"));
-        assert_eq!(config.pact.consumer_name.as_deref(), Some("WebApp"));
-        assert_eq!(config.pact.broker_url.as_deref(), Some("https://broker.example.com"));
-        assert_eq!(config.pact.check_contracts, Some(true));
-        assert_eq!(config.pact.generate_tests, Some(true));
-        assert_eq!(config.pact.verify_before_fix, Some(true));
-        assert_eq!(config.pact.verify_after_fix, Some(true));
-        assert_eq!(config.pact.verify_command.as_deref(), Some("npm run test:pact:verify"));
-        assert_eq!(config.pact.test_command.as_deref(), Some("npm run test:pact"));
-        assert_eq!(config.pact.attempts, Some(5));
-        assert_eq!(config.pact.api_patterns.len(), 2);
+        let pact = config.pact.expect("pact section should be present");
+        assert_eq!(pact.enabled, Some(true));
+        assert_eq!(pact.pact_dir.as_deref(), Some("../shared-pacts"));
+        assert_eq!(pact.provider_name.as_deref(), Some("UserService"));
+        assert_eq!(pact.consumer_name.as_deref(), Some("WebApp"));
+        assert_eq!(pact.check_contracts, Some(true));
+        assert_eq!(pact.generate_tests, Some(true));
+        assert_eq!(pact.verify_before_fix, Some(true));
+        assert_eq!(pact.verify_after_fix, Some(true));
+        assert_eq!(pact.verify_command.as_deref(), Some("npm run test:pact:verify"));
+        assert_eq!(pact.test_command.as_deref(), Some("npm run test:pact"));
+        assert_eq!(pact.attempts, Some(5));
+        assert_eq!(pact.api_patterns.len(), 2);
     }
 
     #[test]
@@ -1263,25 +1263,39 @@ pact:
   enabled: true
 "#;
         let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
-        assert_eq!(config.pact.enabled, Some(true));
-        assert!(config.pact.pact_dir.is_none());
-        assert!(config.pact.provider_name.is_none());
-        assert!(config.pact.check_contracts.is_none());
-        assert!(config.pact.generate_tests.is_none());
-        assert!(config.pact.verify_before_fix.is_none());
-        assert!(config.pact.verify_after_fix.is_none());
-        assert!(config.pact.verify_command.is_none());
-        assert!(config.pact.test_command.is_none());
-        assert!(config.pact.attempts.is_none());
-        assert!(config.pact.api_patterns.is_empty());
+        let pact = config.pact.expect("pact section should be present");
+        assert_eq!(pact.enabled, Some(true));
+        assert!(pact.pact_dir.is_none());
+        assert!(pact.provider_name.is_none());
+        assert!(pact.check_contracts.is_none());
+        assert!(pact.generate_tests.is_none());
+        assert!(pact.verify_before_fix.is_none());
+        assert!(pact.verify_after_fix.is_none());
+        assert!(pact.verify_command.is_none());
+        assert!(pact.test_command.is_none());
+        assert!(pact.attempts.is_none());
+        assert!(pact.api_patterns.is_empty());
     }
 
     #[test]
     fn test_parse_yaml_pact_empty() {
+        // Empty YAML → no pact section → None (marks phase as not configured).
         let config: YamlConfig = serde_yaml::from_str("").unwrap();
-        assert!(config.pact.enabled.is_none());
-        assert!(config.pact.pact_dir.is_none());
-        assert!(config.pact.api_patterns.is_empty());
+        assert!(config.pact.is_none());
+    }
+
+    #[test]
+    fn test_parse_yaml_pact_section_without_enabled_defaults_to_none_in_yaml() {
+        // Presence of the section alone is what marks it configured; the
+        // opt-out default is applied later during merging, not here.
+        let yaml_str = r#"
+pact:
+  provider_name: "API"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml_str).unwrap();
+        let pact = config.pact.expect("pact section should be present");
+        assert!(pact.enabled.is_none());
+        assert_eq!(pact.provider_name.as_deref(), Some("API"));
     }
 
     #[test]

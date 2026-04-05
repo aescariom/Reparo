@@ -343,12 +343,15 @@ routing:
     model: "opus"
     effort: "max"
 
-# Contract/pact testing (default: all disabled)
+# Contract/pact testing (presence of the section enables the phase;
+# use `--skip-pact` to opt out, or `enabled: false` to keep config but disable)
 pact:
-  enabled: false                # master switch for pact testing
+  enabled: true                 # defaults to true when the section is present
   pact_dir: "./pacts"           # path to pact files (can be shared across projects)
-  broker_url: "${PACT_BROKER_URL}"    # pact broker URL (optional)
-  broker_token: "${PACT_BROKER_TOKEN}" # pact broker token (optional)
+  provider_name: "MyAPI"        # provider name (improves prompt quality)
+  consumer_name: "MyFrontend"   # consumer name (improves prompt quality)
+  verify_command: "npm run test:pact:verify"  # required if any verify_* step is enabled
+  test_command:   "npm run test:pact"         # required if generate_tests is enabled
   check_contracts: false        # check if file involves API contracts
   generate_tests: false         # generate contract tests for API files
   verify_before_fix: false      # verify contracts pass before applying fix
@@ -383,7 +386,7 @@ Every optional step can be controlled via CLI flags and/or YAML. CLI flags alway
 | Initial formatting | `--skip-format` | `execution.format_on_start: false` | enabled |
 | Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled |
 | Fix loop | `--skip-fixes` | — | enabled |
-| Contract/pact testing | `--skip-pact` | `pact.enabled: true` | disabled |
+| Contract/pact testing | `--skip-pact` | `pact:` section present | enabled when section present (hard error if missing) |
 | Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled |
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled |
 | Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled |
@@ -496,7 +499,6 @@ Reparo can verify API contracts (pacts) during the fix process, ensuring that fi
 
 - **Shared pact directory**: The `pact_dir` can point to a path outside the project (e.g., `/shared/pacts/`), allowing multiple projects to share the same contract definitions
 - **Granular sub-steps**: Each phase (check, generate, verify before, verify after) can be enabled independently
-- **Broker support**: Optional pact broker integration for centralized contract management
 - **Works with frontend and backend**: API detection is file-based, so it works regardless of whether the project is a consumer (frontend) or provider (backend)
 
 **Configuration:**
@@ -505,13 +507,19 @@ Reparo can verify API contracts (pacts) during the fix process, ensuring that fi
 pact:
   enabled: true
   pact_dir: "/shared/pacts/my-service"   # can be outside the project
-  broker_url: "${PACT_BROKER_URL}"
-  broker_token: "${PACT_BROKER_TOKEN}"
+  provider_name: "MyAPI"
+  consumer_name: "MyFrontend"
+  verify_command: "npm run test:pact:verify"
+  test_command:   "npm run test:pact"
   check_contracts: true       # detect API-related files
   generate_tests: true        # generate contract tests
   verify_before_fix: true     # contracts must pass before fix
   verify_after_fix: true      # contracts must still pass after fix
 ```
+
+> If a `pact:` section is present, the phase runs by default. Omit the section and pass
+> `--skip-pact`, or keep the section with `enabled: false`, to skip it. Running the phase
+> without a `pact:` section is a hard error — Reparo exits before touching any code.
 
 Or disable entirely via CLI:
 

@@ -41,7 +41,7 @@ The flow is sequential and single-threaded:
 
 ```
 main.rs → Config::validate() → Orchestrator::run()
-  Step 0: check clean git working tree [git.rs]
+  Step 0: check clean git working tree [git.rs] (or stage WIP changes if --allow-wip)
   Step 0b: preflight build + tests — abort with visible error if either fails [runner.rs]
   Step 1: check_connection() [sonar.rs]
   Step 2: run_scanner() + wait_for_analysis() [sonar.rs]
@@ -123,12 +123,13 @@ Every optional step can be enabled or disabled via CLI flags and/or YAML configu
 |------|----------|------------|---------|-------|
 | Initial formatting | `--skip-format` | `execution.format_on_start: false` | enabled | Format & commit before fixes |
 | Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled | Generate tests until min_coverage |
-| Contract/pact testing | `--skip-pact` | `pact.enabled: true` | disabled | Must enable via YAML `pact.enabled` |
+| Contract/pact testing | `--skip-pact` | `pact:` section present | enabled when section present | Presence of the `pact:` section activates the phase; missing section is a hard error unless `--skip-pact`. `PactConfig::validate()` bails on missing `verify_command`/`test_command`. |
 | Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled | Remove duplicate fixes |
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled | Run full suite after all fixes |
 | Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled | Must enable via YAML |
 | Pre-push rebase | `--skip-rebase` | `execution.auto_rebase: false` | enabled | Rebase onto latest base before push, AI-resolves conflicts |
 | PR creation | `--no-pr` | — | enabled | Create PR via `gh` |
+| WIP working tree | `--allow-wip` (env `REPARO_ALLOW_WIP`) | — | disabled (clean tree required) | Stage pending changes at startup; they are folded into the first commit Reparo creates |
 
 **Priority**: CLI flags > ENV vars > YAML > defaults.
 
