@@ -239,7 +239,7 @@ impl Orchestrator {
             let is_last = idx == total_files - 1;
 
             files_processed += 1;
-            match self.generate_tests_for_file(fc, test_framework, &test_examples_str, stash_prefix, skip_test_run, &framework_context_base)? {
+            match self.generate_tests_for_file(fc, test_framework, &test_examples_str, stash_prefix, skip_test_run, &framework_context_base, false)? {
                 Some(result) if batch_mode && !result.test_files.is_empty() => {
                     // Wave mode: accumulate result, commit at wave boundary
                     current_wave.push(result);
@@ -381,6 +381,105 @@ impl Orchestrator {
             }
         }
 
+        // Cleanup pass: files still below min_file_coverage get a targeted individual-mode retry.
+        //
+        // In wave mode (coverage_wave_size > 1), the main loop does only ONE round of test
+        // generation per file (coverage_rounds is skipped — no per-file test run between rounds).
+        // Files whose wave tests failed and were reverted end up never getting their full
+        // coverage_rounds. This cleanup pass processes those files one-by-one with full
+        // coverage_rounds support (force_individual = true).
+        if has_file_threshold {
+            let still_below: Vec<_> = runner::find_lcov_report_with_hint(
+                    &self.config.path, self.config.commands.coverage_report.as_deref())
+                .map(|p| runner::per_file_lcov_coverage(&p))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|fc| {
+                    !is_test_file(&fc.file)
+                        && fc.coverage_pct < self.config.min_file_coverage
+                        && fc.total_lines > fc.covered_lines
+                        && !self.config.coverage_exclude.iter().any(|pat| {
+                            glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+                        })
+                })
+                .collect();
+
+            if !still_below.is_empty() {
+                info!(
+                    "Cleanup pass: {} file(s) still below per-file threshold {:.0}% — retrying individually with up to {} round(s) each",
+                    still_below.len(), self.config.min_file_coverage, self.config.coverage_rounds
+                );
+                for fc in &still_below {
+                    match self.generate_tests_for_file(
+                        fc, test_framework, &test_examples_str,
+                        stash_prefix, false, &framework_context_base, true,
+                    )? {
+                        Some(_) => {
+                            files_boosted += 1;
+                            if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                                color_info!(
+                                    "Project-wide coverage after cleanup commit: {} (was {})",
+                                    cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                                );
+                                current_pct = pct;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        // Overall coverage retry pass: if overall coverage is still below min_coverage,
+        // re-scan for files with room for improvement and retry them individually with
+        // full coverage_rounds support.  The main wave loop only does one round per file,
+        // so this pass compensates when the target hasn't been reached.
+        if current_pct < self.config.min_coverage {
+            let retry_candidates: Vec<_> = runner::find_lcov_report_with_hint(
+                    &self.config.path, self.config.commands.coverage_report.as_deref())
+                .map(|p| runner::per_file_lcov_coverage(&p))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|fc| {
+                    !is_test_file(&fc.file)
+                        && fc.coverage_pct < 100.0
+                        && fc.total_lines > fc.covered_lines
+                        && !self.config.coverage_exclude.iter().any(|pat| {
+                            glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+                        })
+                        && resolve_source_file(&self.config.path, &fc.file).exists()
+                })
+                .collect();
+
+            if !retry_candidates.is_empty() {
+                info!(
+                    "Overall coverage retry: {:.1}% < {:.0}% target — retrying {} file(s) individually with up to {} round(s) each",
+                    current_pct, self.config.min_coverage, retry_candidates.len(), self.config.coverage_rounds
+                );
+                for fc in &retry_candidates {
+                    if current_pct >= self.config.min_coverage {
+                        break;
+                    }
+                    match self.generate_tests_for_file(
+                        &fc, test_framework, &test_examples_str,
+                        stash_prefix, false, &framework_context_base, true,
+                    )? {
+                        Some(_) => {
+                            files_boosted += 1;
+                            if let Some(pct) = self.run_coverage_and_measure(&cov_cmd) {
+                                color_info!(
+                                    "Project-wide coverage after overall retry: {} (was {})",
+                                    cov_vs(pct, self.config.min_coverage), cov_prev(current_pct)
+                                );
+                                current_pct = pct;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
         // Final summary
         let remaining_below: Vec<_> = if has_file_threshold {
             // Re-read lcov to check which files are still below threshold
@@ -447,6 +546,10 @@ impl Orchestrator {
         stash_prefix: &str,
         skip_test_run: bool,
         framework_context: &str,
+        // When true: ignore coverage_commit_batch and wave mode — commit each round immediately
+        // and run tests after each round (enables full coverage_rounds support).
+        // Used by the cleanup pass for files still below min_file_coverage after the main wave loop.
+        force_individual: bool,
     ) -> Result<Option<BoostFileResult>> {
         // Skip files matching user-configured exclusion patterns (safety net)
         if !self.config.coverage_exclude.is_empty() {
@@ -474,18 +577,12 @@ impl Orchestrator {
             }
         };
 
-        // Skip very large files — prompts with too many lines tend to timeout
-        let line_count = source_content.lines().count();
-        let max_lines = self.config.max_boost_file_lines;
-        if max_lines > 0 && line_count > max_lines {
-            warn!(
-                "File {} has {} lines — exceeds max_boost_file_lines ({}), skipping",
-                fc.file, line_count, max_lines
-            );
-            return Ok(None);
-        }
-
-        let batch_mode = self.config.coverage_commit_batch > 1 || skip_test_run;
+        let batch_mode = if force_individual {
+            false
+        } else {
+            self.config.coverage_commit_batch > 1 || skip_test_run
+        };
+        let skip_test_run = if force_individual { false } else { skip_test_run };
         let max_rounds = self.config.coverage_rounds;
         let unlimited = max_rounds == 0;
         let mut round: u32 = 0;
@@ -527,81 +624,147 @@ impl Orchestrator {
                 round_label, fc.file, previous_coverage_pct, current_uncovered_count
             );
 
-            // Build prompt — use specific uncovered line numbers when available for targeted generation
-            let uncovered_desc = if !current_uncovered_lines.is_empty() {
-                // Cap at 150 lines to keep the prompt focused; the model will handle the rest in the next round
-                let lines: Vec<String> = current_uncovered_lines.iter().take(150).map(|l| l.to_string()).collect();
-                let suffix = if current_uncovered_lines.len() > 150 {
-                    format!(" (… and {} more)", current_uncovered_lines.len() - 150)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "Lines not yet covered: {}{} — file is at {:.1}% coverage ({} of {} coverable lines hit)",
-                    lines.join(", "), suffix,
-                    previous_coverage_pct,
-                    current_uncovered_count.saturating_sub(current_uncovered_count), // covered count
-                    fc.total_lines
-                )
-            } else if round == 1 {
-                format!(
-                    "File has {:.1}% coverage ({} uncovered lines out of {} coverable) — generate tests for all uncovered paths",
-                    previous_coverage_pct,
-                    current_uncovered_count,
-                    fc.total_lines
-                )
+            // Decide strategy: chunked (method-by-method) or single prompt
+            let use_chunks = current_uncovered_lines.len() > 15;
+
+            let file_class = runner::classify_source_file(&fc.file, &self.config.path);
+            let pkg_hint = runner::derive_test_package(&fc.file)
+                .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
+                .unwrap_or_default();
+            let per_file_ctx = if round == 1 {
+                build_per_file_context(framework_context, &file_class, &pkg_hint)
             } else {
-                format!(
-                    "Lines still uncovered — file has {:.1}% coverage after {} previous round(s), {} lines remain uncovered out of {} coverable",
-                    previous_coverage_pct,
-                    round - 1,
-                    current_uncovered_count,
-                    fc.total_lines
-                )
+                build_per_file_context(framework_context, &file_class, "")
             };
 
-            let prompt = if round == 1 {
-                // US-040: Build per-file framework context with classification
-                let file_class = runner::classify_source_file(&fc.file, &self.config.path);
-                let pkg_hint = runner::derive_test_package(&fc.file)
-                    .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
-                    .unwrap_or_default();
-                let per_file_ctx = build_per_file_context(framework_context, &file_class, &pkg_hint);
-                claude::build_test_generation_prompt(
-                    &fc.file,
-                    &uncovered_desc,
-                    test_framework,
-                    test_examples_str,
-                    &per_file_ctx,
-                )
-            } else {
-                let file_class = runner::classify_source_file(&fc.file, &self.config.path);
-                let per_file_ctx = build_per_file_context(framework_context, &file_class, "");
-                claude::build_test_generation_retry_prompt(
-                    &fc.file,
-                    &uncovered_desc,
-                    test_framework,
-                    round,
-                    &truncate(&last_test_output, 1000),
-                    &per_file_ctx,
-                )
-            };
+            if use_chunks {
+                // --- Chunked strategy: one AI call per method/block ---
+                let chunks = split_into_method_chunks(&source_content, &current_uncovered_lines, &fc.file);
+                let total_chunks = chunks.len();
+                info!(
+                    "Splitting {} uncovered lines into {} method chunk(s) for {} ({})",
+                    current_uncovered_lines.len(), total_chunks, fc.file, round_label
+                );
 
-            if self.config.show_prompts {
-                info!("Coverage boost prompt ({}):\n{}", round_label, prompt);
-            }
+                for (ci, chunk) in chunks.iter().enumerate() {
+                    let chunk_idx = ci + 1;
+                    let chunk_tier = claude::classify_test_gen_tier(
+                        chunk.uncovered_count,
+                        chunk.snippet.lines().count(),
+                    );
 
-            let uncovered = current_uncovered_count as usize;
-            let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize);
-            info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
-            match self.run_ai(&prompt, &test_tier) {
-                Ok(_) => {
-                    info!("AI completed test generation for {} ({})", fc.file, round_label);
+                    let prompt = claude::build_chunk_test_prompt(
+                        &fc.file,
+                        &chunk.label,
+                        &chunk.snippet,
+                        chunk_idx,
+                        total_chunks,
+                        test_framework,
+                        &per_file_ctx,
+                    );
+
+                    if self.config.show_prompts {
+                        info!("Chunk {}/{} prompt ({}):\n{}", chunk_idx, total_chunks, round_label, prompt);
+                    }
+
+                    info!(
+                        "  Chunk {}/{}: {} — {} uncovered lines [{}]",
+                        chunk_idx, total_chunks, chunk.label, chunk.uncovered_count, chunk_tier
+                    );
+                    match self.run_ai(&prompt, &chunk_tier) {
+                        Ok(_) => {
+                            info!("  Chunk {}/{} completed", chunk_idx, total_chunks);
+                            // Validate: no source files modified by this chunk
+                            let changed = git::changed_files(&self.config.path).unwrap_or_default();
+                            let src_modified: Vec<&String> = changed.iter()
+                                .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
+                                .collect();
+                            if !src_modified.is_empty() {
+                                warn!("  Chunk {}/{} modified source files: {:?} — reverting chunk", chunk_idx, total_chunks, src_modified);
+                                let _ = git::revert_changes(&self.config.path);
+                                // Continue with next chunk — don't abort the whole file
+                            } else {
+                                // Stage test files from this chunk to preserve them across subsequent chunks
+                                let test_files: Vec<String> = changed.iter()
+                                    .filter(|f| is_test_file(f) || is_generated_artifact(f))
+                                    .cloned()
+                                    .collect();
+                                if !test_files.is_empty() {
+                                    let refs: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+                                    let _ = git::add_files(&self.config.path, &refs);
+                                    // Revert non-test changes
+                                    let _ = git::revert_changes(&self.config.path);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "  Chunk {}/{} ({}) failed: {} — skipping chunk",
+                                chunk_idx, total_chunks, chunk.label, e
+                            );
+                            let _ = git::revert_changes(&self.config.path);
+                            // Continue with remaining chunks
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to generate tests for {} ({}): {} — stopping rounds", fc.file, round_label, e);
-                    let _ = git::revert_changes(&self.config.path);
+
+                // Check if any test files were generated across all chunks
+                let has_staged = git::has_staged_changes(&self.config.path).unwrap_or(false);
+                let all_changed = git::changed_files(&self.config.path).unwrap_or_default();
+                if all_changed.is_empty() && !has_staged {
+                    warn!("No test files generated across all chunks for {} ({})", fc.file, round_label);
                     break;
+                }
+            } else {
+                // --- Single-prompt strategy: ≤15 uncovered lines ---
+                let covered_count = fc.total_lines.saturating_sub(current_uncovered_count as u64);
+                let uncovered_summary = format!(
+                    "{:.1}% coverage — {} of {} coverable lines hit, {} uncovered",
+                    previous_coverage_pct, covered_count, fc.total_lines, current_uncovered_count
+                );
+                let uncovered_snippets = extract_uncovered_snippets(
+                    &source_content,
+                    &current_uncovered_lines,
+                    80,
+                );
+
+                let prompt = if round == 1 {
+                    claude::build_test_generation_prompt(
+                        &fc.file,
+                        &uncovered_summary,
+                        &uncovered_snippets,
+                        test_framework,
+                        test_examples_str,
+                        &per_file_ctx,
+                    )
+                } else {
+                    claude::build_test_generation_retry_prompt(
+                        &fc.file,
+                        &uncovered_summary,
+                        &uncovered_snippets,
+                        test_framework,
+                        round,
+                        &truncate(&last_test_output, 1000),
+                        &per_file_ctx,
+                    )
+                };
+
+                if self.config.show_prompts {
+                    info!("Coverage boost prompt ({}):\n{}", round_label, prompt);
+                }
+
+                let uncovered = current_uncovered_count as usize;
+                let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize);
+                info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
+                match self.run_ai(&prompt, &test_tier) {
+                    Ok(_) => {
+                        info!("AI completed test generation for {} ({})", fc.file, round_label);
+                    }
+                    Err(e) => {
+                        warn!("Failed to generate tests for {} ({}): {} — stopping rounds", fc.file, round_label, e);
+                        let _ = git::revert_changes(&self.config.path);
+                        break;
+                    }
                 }
             }
 
@@ -1112,17 +1275,21 @@ impl Orchestrator {
     ) -> bool {
         info!("Retrying test generation for {} with compilation error context", result.file);
 
-        let uncovered_desc = format!(
-            "File has {:.0}% coverage — previous test generation attempt failed. \
+        let uncovered_summary = format!(
+            "{:.0}% coverage — previous test generation attempt failed. \
              Fix the errors and regenerate working tests.",
             result.coverage_before
         );
+        // Repair retry: the AI already generated tests that failed to compile.
+        // No snippets needed — the error output tells it what to fix.
+        let uncovered_snippets = String::new();
         // US-040: Include framework context in retry
         let file_class = runner::classify_source_file(&result.file, &self.config.path);
         let per_file_ctx = build_per_file_context(framework_context, &file_class, "");
         let prompt = claude::build_test_generation_retry_prompt(
             &result.file,
-            &uncovered_desc,
+            &uncovered_summary,
+            &uncovered_snippets,
             test_framework,
             2, // retry attempt
             &truncate(error_output, 2000),

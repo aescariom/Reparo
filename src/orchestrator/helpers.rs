@@ -402,6 +402,444 @@ pub(crate) fn build_per_file_context(base: &str, file_classification: &str, pack
     parts.join("\n")
 }
 
+/// Extract annotated code snippets for uncovered lines, grouping consecutive
+/// lines into contiguous blocks with ±1 line of context.  Returns a compact
+/// representation that the AI can act on directly without reading the file.
+///
+/// Output format (one block per group):
+/// ```text
+/// // Lines 45-52 (UNCOVERED):
+///  44: previousLine          ← context
+/// >45: uncoveredLine         ← needs coverage
+/// >46: uncoveredLine
+///  53: nextLine              ← context
+/// ```
+pub(crate) fn extract_uncovered_snippets(
+    source_content: &str,
+    uncovered_lines: &[u32],
+    max_lines: usize,
+) -> String {
+    if uncovered_lines.is_empty() || source_content.is_empty() {
+        return String::new();
+    }
+
+    let source_lines: Vec<&str> = source_content.lines().collect();
+    let total = source_lines.len();
+
+    // Group consecutive uncovered lines into ranges
+    let mut groups: Vec<(u32, u32)> = Vec::new(); // (start, end) inclusive
+    let mut lines_so_far = 0usize;
+    for &line in uncovered_lines {
+        if lines_so_far >= max_lines {
+            break;
+        }
+        if let Some(last) = groups.last_mut() {
+            if line <= last.1 + 3 {
+                // Merge into current group (gap ≤ 2 lines)
+                last.1 = line;
+            } else {
+                groups.push((line, line));
+            }
+        } else {
+            groups.push((line, line));
+        }
+        lines_so_far += 1;
+    }
+
+    let mut out = String::new();
+    for (start, end) in &groups {
+        let s = (*start as usize).saturating_sub(1); // 0-indexed
+        let e = (*end as usize).saturating_sub(1);
+
+        // Context: 1 line before, 1 line after
+        let ctx_start = s.saturating_sub(1);
+        let ctx_end = (e + 1).min(total.saturating_sub(1));
+
+        out.push_str(&format!("// Lines {}-{} (UNCOVERED):\n", start, end));
+        for i in ctx_start..=ctx_end {
+            if i >= total {
+                break;
+            }
+            let lineno = i + 1; // 1-indexed
+            let marker = if uncovered_lines.contains(&(lineno as u32)) { ">" } else { " " };
+            out.push_str(&format!("{}{:>4}: {}\n", marker, lineno, source_lines[i]));
+        }
+        out.push('\n');
+    }
+
+    if lines_so_far < uncovered_lines.len() {
+        out.push_str(&format!(
+            "// … and {} more uncovered lines (will be addressed in subsequent rounds)\n",
+            uncovered_lines.len() - lines_so_far
+        ));
+    }
+
+    out
+}
+
+/// A chunk of uncovered code within a single method/function, ready for
+/// targeted test generation.
+#[derive(Debug, Clone)]
+pub(crate) struct MethodChunk {
+    /// Human-readable label (e.g. "processOrder (lines 45-78)")
+    pub label: String,
+    /// The uncovered line numbers in this chunk
+    pub uncovered_lines: Vec<u32>,
+    /// Annotated source snippet with `>` markers on uncovered lines
+    pub snippet: String,
+    /// Number of uncovered lines
+    pub uncovered_count: usize,
+}
+
+/// Split uncovered lines into method-level chunks for targeted test generation.
+///
+/// Uses language-aware heuristics to find method/function boundaries, then groups
+/// uncovered lines by the method they belong to.  Each chunk contains the full
+/// method source (annotated) so the AI can write tests for one method at a time.
+///
+/// Falls back to contiguous-group splitting when method detection isn't applicable.
+pub(crate) fn split_into_method_chunks(
+    source_content: &str,
+    uncovered_lines: &[u32],
+    file_path: &str,
+) -> Vec<MethodChunk> {
+    if uncovered_lines.is_empty() || source_content.is_empty() {
+        return Vec::new();
+    }
+
+    let source_lines: Vec<&str> = source_content.lines().collect();
+    let total = source_lines.len();
+
+    // Detect method boundaries based on file extension
+    let methods = detect_method_boundaries(&source_lines, file_path);
+
+    if methods.is_empty() {
+        // Fallback: split into groups of ~20 contiguous uncovered lines
+        return split_by_contiguous_groups(source_content, uncovered_lines, &source_lines, 20);
+    }
+
+    // Assign each uncovered line to its enclosing method
+    let mut method_chunks: Vec<MethodChunk> = Vec::new();
+    let mut unassigned: Vec<u32> = Vec::new();
+
+    // Pre-build method lookup: for each uncovered line, find which method contains it
+    for &line in uncovered_lines {
+        let idx = line as usize;
+        let mut found = false;
+        for m in &methods {
+            if idx >= m.start_line && idx <= m.end_line {
+                // Find or create chunk for this method
+                if let Some(chunk) = method_chunks.iter_mut().find(|c| c.label == m.name) {
+                    chunk.uncovered_lines.push(line);
+                    chunk.uncovered_count += 1;
+                } else {
+                    method_chunks.push(MethodChunk {
+                        label: m.name.clone(),
+                        uncovered_lines: vec![line],
+                        snippet: String::new(), // filled below
+                        uncovered_count: 1,
+                    });
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            unassigned.push(line);
+        }
+    }
+
+    // Build annotated snippets for each method chunk
+    for chunk in &mut method_chunks {
+        // Find the method boundaries again for context
+        if let Some(m) = methods.iter().find(|m| m.name == chunk.label) {
+            let start = m.start_line.saturating_sub(1); // 0-indexed
+            let end = (m.end_line.saturating_sub(1)).min(total.saturating_sub(1));
+
+            chunk.snippet.push_str(&format!("// Method: {} (lines {}-{})\n", m.name, m.start_line, m.end_line));
+            for i in start..=end {
+                if i >= total { break; }
+                let lineno = (i + 1) as u32;
+                let marker = if chunk.uncovered_lines.contains(&lineno) { ">" } else { " " };
+                chunk.snippet.push_str(&format!("{}{:>4}: {}\n", marker, lineno, source_lines[i]));
+            }
+        }
+    }
+
+    // Handle lines outside any method (class-level code, field initializers)
+    if !unassigned.is_empty() {
+        let snippet = extract_uncovered_snippets(source_content, &unassigned, 40);
+        method_chunks.push(MethodChunk {
+            label: format!("class-level code ({} lines)", unassigned.len()),
+            uncovered_lines: unassigned.clone(),
+            snippet,
+            uncovered_count: unassigned.len(),
+        });
+    }
+
+    method_chunks
+}
+
+/// A detected method/function boundary in source code.
+struct MethodBoundary {
+    name: String,
+    start_line: usize, // 1-indexed, inclusive
+    end_line: usize,   // 1-indexed, inclusive
+}
+
+/// Detect method/function boundaries using language-aware heuristics.
+fn detect_method_boundaries(lines: &[&str], file_path: &str) -> Vec<MethodBoundary> {
+    let lower = file_path.to_lowercase();
+    if lower.ends_with(".java") || lower.ends_with(".kt") || lower.ends_with(".scala") {
+        detect_java_methods(lines)
+    } else if lower.ends_with(".py") {
+        detect_python_functions(lines)
+    } else if lower.ends_with(".js") || lower.ends_with(".ts")
+        || lower.ends_with(".jsx") || lower.ends_with(".tsx")
+    {
+        detect_js_functions(lines)
+    } else if lower.ends_with(".go") {
+        detect_go_functions(lines)
+    } else if lower.ends_with(".rs") {
+        detect_rust_functions(lines)
+    } else {
+        // Brace-based languages fallback
+        detect_brace_functions(lines)
+    }
+}
+
+/// Java/Kotlin: method = line with access modifier + return type + name + `(`, ending at balanced `}`.
+/// Excludes class/interface/enum declarations.
+fn detect_java_methods(lines: &[&str]) -> Vec<MethodBoundary> {
+    let method_re = regex::Regex::new(
+        r"^\s*(public|private|protected|static|final|abstract|synchronized|default|override\s)[\s\w<>\[\],?]*\s+(\w+)\s*\("
+    ).unwrap();
+    let class_re = regex::Regex::new(
+        r"\b(class|interface|enum|record)\s+"
+    ).unwrap();
+    let mut methods = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(caps) = method_re.captures(lines[i]) {
+            // Skip class/interface/enum declarations
+            if class_re.is_match(lines[i]) {
+                i += 1;
+                continue;
+            }
+            let name = caps.get(2).map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| format!("anonymous_{}", i + 1));
+            let start = i + 1;
+            // Find balanced braces
+            let mut brace_depth = 0i32;
+            let mut found_open = false;
+            let mut j = i;
+            while j < lines.len() {
+                for ch in lines[j].chars() {
+                    if ch == '{' { brace_depth += 1; found_open = true; }
+                    else if ch == '}' { brace_depth -= 1; }
+                }
+                if found_open && brace_depth == 0 {
+                    methods.push(MethodBoundary { name, start_line: start, end_line: j + 1 });
+                    i = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_open || brace_depth != 0 { i += 1; }
+        } else {
+            i += 1;
+        }
+    }
+    methods
+}
+
+fn detect_go_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    let func_re = regex::Regex::new(r"^\s*func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(").unwrap();
+    detect_brace_delimited(lines, &func_re, 1)
+}
+
+fn detect_rust_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    let fn_re = regex::Regex::new(r"^\s*(pub\s+)?(async\s+)?fn\s+(\w+)").unwrap();
+    detect_brace_delimited(lines, &fn_re, 3)
+}
+
+fn detect_js_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    let func_re = regex::Regex::new(
+        r"(?:^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)|^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(?|^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{)"
+    ).unwrap();
+    detect_brace_delimited_multi_capture(lines, &func_re, &[1, 2, 3])
+}
+
+/// Generic brace-delimited function detector.
+fn detect_brace_delimited(lines: &[&str], signature_re: &regex::Regex, name_group: usize) -> Vec<MethodBoundary> {
+    detect_brace_delimited_multi_capture(lines, signature_re, &[name_group])
+}
+
+fn detect_brace_delimited_multi_capture(
+    lines: &[&str],
+    signature_re: &regex::Regex,
+    name_groups: &[usize],
+) -> Vec<MethodBoundary> {
+    let mut methods = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(caps) = signature_re.captures(lines[i]) {
+            // Extract name from first non-empty capture group
+            let name = name_groups.iter()
+                .filter_map(|&g| caps.get(g).map(|m| m.as_str().to_string()))
+                .next()
+                .unwrap_or_else(|| format!("anonymous_{}", i + 1));
+
+            let start = i + 1; // 1-indexed
+
+            // Find the opening brace (might be on the same or next line)
+            let mut brace_depth = 0i32;
+            let mut found_open = false;
+            let mut j = i;
+            while j < lines.len() {
+                for ch in lines[j].chars() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                        found_open = true;
+                    } else if ch == '}' {
+                        brace_depth -= 1;
+                    }
+                }
+                if found_open && brace_depth == 0 {
+                    methods.push(MethodBoundary {
+                        name,
+                        start_line: start,
+                        end_line: j + 1, // 1-indexed
+                    });
+                    i = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_open || brace_depth != 0 {
+                // Couldn't find balanced braces, skip this match
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    methods
+}
+
+/// Python: function = `def name(` with indentation-based end detection.
+fn detect_python_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    let def_re = regex::Regex::new(r"^(\s*)def\s+(\w+)\s*\(").unwrap();
+    let mut methods = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(caps) = def_re.captures(lines[i]) {
+            let indent = caps.get(1).map(|m| m.as_str().len()).unwrap_or(0);
+            let name = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let start = i + 1; // 1-indexed
+
+            // Function body: all subsequent lines with indent > function def indent,
+            // or blank lines within the body
+            let mut end = i;
+            let mut j = i + 1;
+            while j < lines.len() {
+                let line = lines[j];
+                if line.trim().is_empty() {
+                    // Blank lines are part of the body
+                    j += 1;
+                    continue;
+                }
+                let line_indent = line.len() - line.trim_start().len();
+                if line_indent > indent {
+                    end = j;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if end > i {
+                methods.push(MethodBoundary {
+                    name,
+                    start_line: start,
+                    end_line: end + 1, // 1-indexed
+                });
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    methods
+}
+
+/// Fallback for unknown brace-based languages: detect top-level brace blocks.
+fn detect_brace_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    // Very conservative: only detect if the line before `{` looks like a function
+    let generic_re = regex::Regex::new(r"^\s*(?:\w+\s+)*(\w+)\s*\(").unwrap();
+    detect_brace_delimited(lines, &generic_re, 1)
+}
+
+/// Fallback when no method boundaries are detected: split uncovered lines into
+/// contiguous groups of up to `max_per_chunk` uncovered lines.
+fn split_by_contiguous_groups(
+    _source_content: &str,
+    uncovered_lines: &[u32],
+    source_lines: &[&str],
+    max_per_chunk: usize,
+) -> Vec<MethodChunk> {
+    let total = source_lines.len();
+
+    // Group consecutive lines (gap ≤ 3 merges into same group)
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for &line in uncovered_lines {
+        if let Some(last) = groups.last_mut() {
+            if line <= *last.last().unwrap() + 3 {
+                last.push(line);
+            } else {
+                groups.push(vec![line]);
+            }
+        } else {
+            groups.push(vec![line]);
+        }
+    }
+
+    // Split groups that exceed max_per_chunk
+    let mut final_groups: Vec<Vec<u32>> = Vec::new();
+    for group in groups {
+        if group.len() <= max_per_chunk {
+            final_groups.push(group);
+        } else {
+            for chunk in group.chunks(max_per_chunk) {
+                final_groups.push(chunk.to_vec());
+            }
+        }
+    }
+
+    // Build chunks with extended context (±3 lines)
+    final_groups.into_iter().map(|lines| {
+        let first = *lines.first().unwrap() as usize;
+        let last_line = *lines.last().unwrap() as usize;
+        let ctx_start = first.saturating_sub(1).saturating_sub(3); // 0-indexed, 3 lines before
+        let ctx_end = (last_line.saturating_sub(1) + 3).min(total.saturating_sub(1));
+
+        let mut snippet = format!("// Lines {}-{} ({} uncovered):\n", first, last_line, lines.len());
+        for i in ctx_start..=ctx_end {
+            if i >= total { break; }
+            let lineno = (i + 1) as u32;
+            let marker = if lines.contains(&lineno) { ">" } else { " " };
+            snippet.push_str(&format!("{}{:>4}: {}\n", marker, lineno, source_lines[i]));
+        }
+
+        MethodChunk {
+            label: format!("lines {}-{}", first, last_line),
+            uncovered_lines: lines.clone(),
+            snippet,
+            uncovered_count: lines.len(),
+        }
+    }).collect()
+}
+
 /// Files that cannot have unit test coverage (style, templates, assets).
 /// These should skip coverage checks and test generation.
 pub(crate) fn is_non_coverable_file(path: &str) -> bool {
@@ -1123,5 +1561,155 @@ FAIL src/components/Button.test.tsx
             status: "OPEN".to_string(),
             tags: vec![],
         }
+    }
+
+    // -- extract_uncovered_snippets --
+
+    #[test]
+    fn test_extract_uncovered_snippets_basic() {
+        let source = "line1\nline2\nline3\nline4\nline5\n";
+        let uncovered = vec![3];
+        let result = extract_uncovered_snippets(source, &uncovered, 80);
+        assert!(result.contains("Lines 3-3 (UNCOVERED)"));
+        assert!(result.contains(">   3: line3"));
+        // Context lines
+        assert!(result.contains("    2: line2"));
+        assert!(result.contains("    4: line4"));
+    }
+
+    #[test]
+    fn test_extract_uncovered_snippets_groups_consecutive() {
+        let source = "a\nb\nc\nd\ne\nf\ng\n";
+        let uncovered = vec![2, 3, 4];
+        let result = extract_uncovered_snippets(source, &uncovered, 80);
+        // Should be a single group
+        assert!(result.contains("Lines 2-4 (UNCOVERED)"));
+        assert!(result.contains(">   2: b"));
+        assert!(result.contains(">   3: c"));
+        assert!(result.contains(">   4: d"));
+    }
+
+    #[test]
+    fn test_extract_uncovered_snippets_separate_groups() {
+        let source = (1..=20).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let uncovered = vec![2, 10]; // far apart → separate groups
+        let result = extract_uncovered_snippets(&source, &uncovered, 80);
+        assert!(result.contains("Lines 2-2 (UNCOVERED)"));
+        assert!(result.contains("Lines 10-10 (UNCOVERED)"));
+    }
+
+    #[test]
+    fn test_extract_uncovered_snippets_max_lines_cap() {
+        let source = (1..=100).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let uncovered: Vec<u32> = (1..=100).collect();
+        let result = extract_uncovered_snippets(&source, &uncovered, 5);
+        assert!(result.contains("and 95 more uncovered lines"));
+    }
+
+    #[test]
+    fn test_extract_uncovered_snippets_empty_inputs() {
+        assert!(extract_uncovered_snippets("", &[1, 2], 80).is_empty());
+        assert!(extract_uncovered_snippets("line1\n", &[], 80).is_empty());
+    }
+
+    // -- split_into_method_chunks / method detection --
+
+    #[test]
+    fn test_split_java_methods() {
+        let java_src = r#"package com.example;
+
+public class Calc {
+    public int add(int a, int b) {
+        return a + b;
+    }
+
+    private int multiply(int a, int b) {
+        int result = a * b;
+        return result;
+    }
+}"#;
+        // Lines 4-6 = add, lines 8-11 = multiply
+        let uncovered = vec![5, 9, 10]; // return a+b, int result, return result
+        let chunks = split_into_method_chunks(java_src, &uncovered, "Calc.java");
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].label == "add" || chunks[1].label == "add");
+        assert!(chunks[0].label == "multiply" || chunks[1].label == "multiply");
+        // Each chunk should have the right uncovered lines
+        let add_chunk = chunks.iter().find(|c| c.label == "add").unwrap();
+        assert_eq!(add_chunk.uncovered_count, 1);
+        assert!(add_chunk.snippet.contains("return a + b"));
+        let mul_chunk = chunks.iter().find(|c| c.label == "multiply").unwrap();
+        assert_eq!(mul_chunk.uncovered_count, 2);
+        assert!(mul_chunk.snippet.contains("int result"));
+    }
+
+    #[test]
+    fn test_split_python_functions() {
+        let py_src = "def foo():\n    x = 1\n    return x\n\ndef bar():\n    y = 2\n    return y\n";
+        let uncovered = vec![2, 6]; // x = 1, y = 2
+        let chunks = split_into_method_chunks(py_src, &uncovered, "module.py");
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().any(|c| c.label == "foo"));
+        assert!(chunks.iter().any(|c| c.label == "bar"));
+    }
+
+    #[test]
+    fn test_split_few_lines_returns_single_fallback() {
+        let src = "a\nb\nc\nd\ne\n";
+        // Only 2 lines → below threshold, but split_into_method_chunks
+        // doesn't enforce the threshold (caller does).
+        // With no detected methods, falls back to contiguous groups.
+        let uncovered = vec![2, 3];
+        let chunks = split_into_method_chunks(src, &uncovered, "unknown.txt");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].uncovered_count, 2);
+    }
+
+    #[test]
+    fn test_split_go_functions() {
+        let go_src = "package main\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\nfunc Sub(a, b int) int {\n\treturn a - b\n}\n";
+        let uncovered = vec![4, 8];
+        let chunks = split_into_method_chunks(go_src, &uncovered, "main.go");
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().any(|c| c.label == "Add"));
+        assert!(chunks.iter().any(|c| c.label == "Sub"));
+    }
+
+    #[test]
+    fn test_split_js_functions() {
+        let js_src = "function greet(name) {\n  return `Hello ${name}`;\n}\n\nconst add = (a, b) => {\n  return a + b;\n};\n";
+        let uncovered = vec![2, 6];
+        let chunks = split_into_method_chunks(js_src, &uncovered, "util.js");
+        assert!(chunks.len() >= 1); // At least greet should be detected
+        assert!(chunks.iter().any(|c| c.label == "greet"));
+    }
+
+    #[test]
+    fn test_split_unassigned_lines_go_to_class_level() {
+        // When there ARE methods but some lines fall outside them → class-level chunk
+        let java_src = r#"package com.example;
+
+public class Foo {
+    private int x = 42;
+
+    public int getX() {
+        return x;
+    }
+}"#;
+        let uncovered = vec![4, 7]; // field init (class-level) + return x (inside getX)
+        let chunks = split_into_method_chunks(java_src, &uncovered, "Foo.java");
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().any(|c| c.label == "getX"));
+        assert!(chunks.iter().any(|c| c.label.contains("class-level")));
+    }
+
+    #[test]
+    fn test_split_no_methods_falls_back_to_groups() {
+        // No detectable methods → contiguous group fallback
+        let java_src = "package com.example;\n\npublic class Foo {\n    private int x = 42;\n}\n";
+        let uncovered = vec![4];
+        let chunks = split_into_method_chunks(java_src, &uncovered, "Foo.java");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].label.contains("lines"));
     }
 }

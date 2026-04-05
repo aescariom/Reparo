@@ -1115,11 +1115,15 @@ Apply a different fix now."#,
                 current_uncovered.len()
             );
 
-            let uncovered_desc = current_uncovered
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let uncovered_summary = format!(
+                "{} uncovered lines (range {}-{}) out of {} total",
+                current_uncovered.len(), start_line, end_line, file_content.lines().count()
+            );
+            let uncovered_snippets = extract_uncovered_snippets(
+                file_content,
+                &current_uncovered,
+                80,
+            );
 
             // Build prompt — first attempt or retry with context
             let file_class = runner::classify_source_file(file_path, &self.config.path);
@@ -1127,27 +1131,21 @@ Apply a different fix now."#,
                 .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
                 .unwrap_or_default();
             let prompt = if attempt == 1 {
-                let uncovered = format!(
-                    "Lines {}-{} (specifically uncovered: {})",
-                    start_line, end_line, uncovered_desc
-                );
                 let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, &pkg_hint);
                 claude::build_test_generation_prompt(
                     file_path,
-                    &uncovered,
+                    &uncovered_summary,
+                    &uncovered_snippets,
                     &framework,
                     &examples_str,
                     &per_file_ctx,
                 )
             } else {
-                let still_uncovered = format!(
-                    "Lines still uncovered: {}",
-                    uncovered_desc
-                );
                 let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, "");
                 claude::build_test_generation_retry_prompt(
                     file_path,
-                    &still_uncovered,
+                    &uncovered_summary,
+                    &uncovered_snippets,
                     &framework,
                     attempt,
                     &truncate(&last_test_output, 1000),
@@ -1353,8 +1351,9 @@ Apply a different fix now."#,
             let claude_result = self.run_ai(&prompt, &tier);
 
             match claude_result {
-                Ok(output) => {
-                    last_output = output;
+                Ok(_output) => {
+                    // AI output is not used for retry prompts — test failure output is
+                    // captured below and fed back into the retry prompt instead.
                 }
                 Err(e) => {
                     if attempt == 1 {

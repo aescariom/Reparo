@@ -228,7 +228,8 @@ pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64
 /// Build a prompt for generating unit tests (US-005).
 pub fn build_test_generation_prompt(
     source_file: &str,
-    uncovered_lines: &str,
+    uncovered_summary: &str,
+    uncovered_snippets: &str,
     test_framework_hint: &str,
     existing_test_examples: &str,
     framework_context: &str,
@@ -236,39 +237,80 @@ pub fn build_test_generation_prompt(
     let fc_section = if framework_context.is_empty() {
         String::new()
     } else {
-        format!("\n## Project test dependencies and class guidance:\n{}\n", framework_context)
+        format!("\n## Test stack:\n{}\n", framework_context)
+    };
+    let examples_section = if existing_test_examples.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Existing test patterns (follow this style):\n{}\n", existing_test_examples)
+    };
+    let snippets_section = if uncovered_snippets.is_empty() {
+        // Fallback when we don't have line-level data
+        String::new()
+    } else {
+        format!("\n## Source code of uncovered lines (lines marked `>` need coverage):\n```\n{}\n```\n", uncovered_snippets)
     };
     format!(
-        r#"Generate unit tests for `{source_file}` to cover the specified lines.
-Read the source file to understand the code.
+        r#"Write unit tests for `{source_file}` targeting ONLY the uncovered lines below.
 
-## Lines that need test coverage:
-{uncovered_lines}
+## Coverage gap:
+{uncovered_summary}
+{snippets_section}
+## Framework: {test_framework_hint}
+{fc_section}{examples_section}
+## Rules:
+- Cover every line marked `>` — write the minimum tests needed to hit those branches/paths
+- Do NOT modify source code — only create or append to test files
+- Mock external I/O (HTTP, DB, filesystem); use framework matchers for assertions
+- Follow project conventions for test file location and naming
 
-## Testing framework:
-{test_framework_hint}
+Write the tests now."#
+    )
+}
+
+/// Build a focused prompt for a single method/block chunk of uncovered code.
+///
+/// Used when the file has many uncovered lines and is split into method-level
+/// chunks for faster, more targeted test generation.
+pub fn build_chunk_test_prompt(
+    source_file: &str,
+    chunk_label: &str,
+    chunk_snippet: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+    test_framework_hint: &str,
+    framework_context: &str,
+) -> String {
+    let fc_section = if framework_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Test stack:\n{}\n", framework_context)
+    };
+    format!(
+        r#"Write unit tests for `{source_file}` — chunk {chunk_index}/{total_chunks}: **{chunk_label}**.
+
+## Code to cover (lines marked `>` need tests):
+```
+{chunk_snippet}
+```
+
+## Framework: {test_framework_hint}
 {fc_section}
-## Examples of existing tests in this project:
-{existing_test_examples}
-{TEST_ROBUSTNESS_GUIDELINES}
-## Instructions:
-1. Write unit tests that cover ALL the specified uncovered lines
-2. Follow the same style, conventions, and patterns as the existing tests
-3. Place the test file in the appropriate location following project conventions
-4. Each test should be focused and test one behavior
-5. Do NOT modify any existing source code — only create new test files or add tests to existing test files
-6. Make sure all tests pass
-7. For each uncovered line, ensure at least one test exercises that line's branch/path
+## Rules:
+- Write the MINIMUM tests to cover every `>` line — target specific branch conditions
+- Add tests to the existing test file if one already exists for this source file
+- Do NOT modify source code; mock external I/O
+- Follow project conventions for test file location and naming
 
 Write the tests now."#
     )
 }
 
 /// Build a retry prompt for test generation when the first attempt didn't achieve full coverage (US-005).
-/// Omits source content (AI can re-read the file), test examples (already seen), and guidelines (already seen).
 pub fn build_test_generation_retry_prompt(
     source_file: &str,
-    still_uncovered_lines: &str,
+    still_uncovered_summary: &str,
+    uncovered_snippets: &str,
     test_framework_hint: &str,
     attempt: u32,
     previous_test_output: &str,
@@ -277,29 +319,31 @@ pub fn build_test_generation_retry_prompt(
     let fc_section = if framework_context.is_empty() {
         String::new()
     } else {
-        format!("\n## Project test dependencies and class guidance:\n{}\n", framework_context)
+        format!("\n## Test stack:\n{}\n", framework_context)
+    };
+    let snippets_section = if uncovered_snippets.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Source code still uncovered (lines marked `>`):\n```\n{}\n```\n", uncovered_snippets)
     };
     format!(
-        r#"Attempt {attempt}/3 — some lines in `{source_file}` are still uncovered. Re-read the file.
+        r#"Retry {attempt} — `{source_file}` still has uncovered lines after the previous attempt.
 
-## Lines STILL uncovered:
-{still_uncovered_lines}
-
-## Testing framework: {test_framework_hint}
+## Remaining gap:
+{still_uncovered_summary}
+{snippets_section}
+## Framework: {test_framework_hint}
 {fc_section}
-## Output from the previous test run:
+## Previous test output:
 ```
 {previous_test_output}
 ```
 
-## Instructions:
-1. Analyze WHY the above lines are still uncovered — they likely require specific inputs, edge cases, or branch conditions
-2. Write ADDITIONAL unit tests that specifically target these uncovered lines
-3. For conditional branches, ensure you test both the true and false paths
-4. For error handling code, write tests that trigger those error conditions
-5. Do NOT modify any existing source code — only create new test files or add tests to existing test files
-6. Do NOT duplicate existing tests — add new ones that cover the gaps
-7. Make sure all tests (old and new) pass
+## What to do:
+- Look at each `>` line: identify the branch condition or input that reaches it
+- Write ADDITIONAL tests that force execution through those paths
+- For conditionals: test both true/false; for error handling: trigger the error
+- Do NOT modify source code or duplicate existing tests
 
 Write the additional tests now."#
     )
@@ -567,39 +611,42 @@ mod tests {
 
     #[test]
     fn test_build_test_generation_prompt_contains_all_context() {
+        let snippets = "// Lines 2-2 (UNCOVERED):\n   1: def add(a, b):\n>  2:     return a + b\n";
         let prompt = build_test_generation_prompt(
             "src/calculator.py",
-            "Lines 1-2 (specifically uncovered: 2)",
+            "1 uncovered line out of 2 total",
+            snippets,
             "pytest",
             "// File: tests/test_math.py\ndef test_sub(): assert sub(3,1) == 2",
             "",
         );
         assert!(prompt.contains("src/calculator.py"));
-        assert!(prompt.contains("uncovered: 2"));
+        assert!(prompt.contains("1 uncovered line"));
         assert!(prompt.contains("pytest"));
         assert!(prompt.contains("test_math.py"));
-        assert!(prompt.contains("Do NOT modify any existing source code"));
-        // Source content is NOT embedded — AI reads the file directly
-        assert!(!prompt.contains("def add(a, b)"));
+        assert!(prompt.contains("Do NOT modify source code"));
+        // Source snippets ARE embedded directly in the prompt
+        assert!(prompt.contains("return a + b"));
+        assert!(prompt.contains("UNCOVERED"));
     }
 
     #[test]
     fn test_build_retry_prompt_includes_attempt_and_output() {
+        let snippets = "// Lines 3-3 (UNCOVERED):\n>  3: raise ValueError\n";
         let prompt = build_test_generation_retry_prompt(
             "src/main.py",
-            "Lines still uncovered: 3",
+            "1 line still uncovered",
+            snippets,
             "pytest",
             2,
             "FAILED test_foo - AssertionError",
             "",
         );
-        assert!(prompt.contains("2/3"));
-        assert!(prompt.contains("Lines still uncovered: 3"));
+        assert!(prompt.contains("Retry 2"));
+        assert!(prompt.contains("1 line still uncovered"));
         assert!(prompt.contains("FAILED test_foo"));
-        assert!(prompt.contains("WHY the above lines are still uncovered"));
-        assert!(prompt.contains("Do NOT duplicate existing tests"));
-        // No test examples or guidelines on retries
-        assert!(!prompt.contains("Examples of existing tests"));
+        assert!(prompt.contains("raise ValueError"));
+        assert!(prompt.contains("Do NOT modify source code"));
     }
 
     #[test]

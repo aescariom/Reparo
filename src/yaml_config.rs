@@ -79,8 +79,6 @@ pub struct ExecutionYaml {
     pub coverage_attempts: Option<u32>,
     /// Maximum coverage rounds per file during boost (default: 3, 0 = unlimited while improving)
     pub coverage_rounds: Option<u32>,
-    /// Maximum file size (total lines) for coverage boost (default: 500, 0 = no limit)
-    pub max_boost_file_lines: Option<usize>,
     /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
     #[serde(default)]
     pub coverage_exclude: Vec<String>,
@@ -519,12 +517,6 @@ pub fn merge_yaml_into_config(
     if config.coverage_rounds == 3 {
         if let Some(v) = yaml.execution.coverage_rounds {
             config.coverage_rounds = v;
-        }
-    }
-    // max_boost_file_lines: only override if CLI is at default (500)
-    if config.max_boost_file_lines == 500 {
-        if let Some(v) = yaml.execution.max_boost_file_lines {
-            config.max_boost_file_lines = v;
         }
     }
     // coverage_exclude: YAML provides glob patterns (no CLI equivalent)
