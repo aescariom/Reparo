@@ -103,7 +103,22 @@ impl Orchestrator {
     /// and dispatches to `engine::run_engine`.
     pub(crate) fn run_ai(&self, prompt: &str, tier: &claude::ClaudeTier) -> anyhow::Result<String> {
         let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
-        let timeout = tier.effective_timeout(self.config.claude_timeout);
+        let tier_timeout = tier.effective_timeout(self.config.claude_timeout);
+
+        // Prompt-aware timeout floor: larger prompts indicate more complex tasks
+        // requiring more reasoning and output generation time.  Use 120s base +
+        // ~100ms per prompt character, capped at 3× the configured base timeout.
+        let prompt_floor = ((prompt.len() as u64) / 10 + 120)
+            .min(self.config.claude_timeout.saturating_mul(3));
+        let timeout = tier_timeout.max(prompt_floor);
+
+        if timeout > tier_timeout {
+            tracing::info!(
+                "Timeout boosted by prompt size: {}s → {}s (prompt {} chars)",
+                tier_timeout, timeout, prompt.len()
+            );
+        }
+
         crate::engine::run_engine(
             &self.config.path,
             prompt,
@@ -445,6 +460,11 @@ impl Orchestrator {
 
         // Step 5: Fix loop — only fix issues from the initial scan
         info!("=== Step 5: Fix loop ===");
+        if self.config.skip_fixes {
+            info!("Skipping fix loop (--skip-fixes)");
+            let _ = git::checkout(&self.config.path, &self.config.branch);
+            return Ok(0);
+        }
         let max_issues = if self.config.max_issues > 0 {
             self.config.max_issues
         } else {

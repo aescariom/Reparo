@@ -216,7 +216,6 @@ OPTIONS:
   --min-file-coverage <PCT>        Minimum per-file test coverage [default: 0]
   --coverage-attempts <N>          Test generation / fix retry attempts per issue [default: 3]
   --coverage-rounds <N>            Max rounds per file during coverage boost (0 = unlimited while improving) [default: 3]
-  --max-boost-file-lines <N>       Max file size (total lines) for coverage boost (0 = no limit) [default: 500]
   --final-validation-attempts <N>  Max repair attempts for final full-suite validation [default: 5]
   --max-dedup <N>                  Max deduplication iterations (0 = unlimited) [default: 10]
   --no-pr                          Skip creating a pull request after fixes
@@ -235,6 +234,7 @@ OPTIONS:
 STEP FLAGS (each step can be enabled/disabled independently):
   --skip-format                    Skip the initial format-and-commit step
   --skip-coverage                  Skip the coverage boost step
+  --skip-fixes                     Skip the fix loop (coverage boost and preflight still run)
   --skip-pact                      Skip the pact/contract testing step
   --skip-dedup                     Skip the deduplication step after fixes
   --skip-final-validation          Skip the final full test suite validation
@@ -266,7 +266,6 @@ All parameters can be set via environment variables:
 | `REPARO_NO_PR` | `--no-pr` |
 | `REPARO_COVERAGE_ATTEMPTS` | `--coverage-attempts` |
 | `REPARO_COVERAGE_ROUNDS` | `--coverage-rounds` |
-| `REPARO_MAX_BOOST_FILE_LINES` | `--max-boost-file-lines` |
 | `REPARO_FINAL_VALIDATION_ATTEMPTS` | `--final-validation-attempts` |
 | `REPARO_MAX_DEDUP` | `--max-dedup` |
 
@@ -300,7 +299,6 @@ execution:
   coverage_boost: true          # run coverage boost step (default: true)
   coverage_attempts: 3          # test gen / fix retry attempts per issue (default: 3)
   coverage_rounds: 3            # max rounds per file during boost, 0 = unlimited while improving (default: 3)
-  max_boost_file_lines: 500     # max total lines per file for boost, 0 = no limit (default: 500)
   coverage_exclude:              # glob patterns — skip these files during coverage boost (default: none)
     - "*.html"
     - "**/generated/**"
@@ -384,6 +382,7 @@ Every optional step can be controlled via CLI flags and/or YAML. CLI flags alway
 |------|----------|------------|---------|
 | Initial formatting | `--skip-format` | `execution.format_on_start: false` | enabled |
 | Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled |
+| Fix loop | `--skip-fixes` | — | enabled |
 | Contract/pact testing | `--skip-pact` | `pact.enabled: true` | disabled |
 | Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled |
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled |
@@ -464,7 +463,6 @@ execution:
   min_coverage: 60          # project-wide threshold (0 = disabled)
   min_file_coverage: 50     # per-file threshold (0 = disabled)
   coverage_rounds: 3        # rounds per file (0 = unlimited while improving)
-  max_boost_file_lines: 1000  # skip files larger than this (0 = no limit, default: 500)
   coverage_exclude:           # skip these file patterns during boost (default: none)
     - "*.html"
     - "**/generated/**"

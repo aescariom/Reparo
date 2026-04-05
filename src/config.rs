@@ -127,10 +127,6 @@ pub struct Config {
     #[arg(long, env = "REPARO_COVERAGE_ROUNDS", default_value = "3")]
     pub coverage_rounds: u32,
 
-    /// Maximum file size (total lines) for coverage boost (0 = no limit) [default: 500]
-    #[arg(long, env = "REPARO_MAX_BOOST_FILE_LINES", default_value = "500")]
-    pub max_boost_file_lines: usize,
-
     /// Files to process per wave before running the test suite once (default: 3).
     /// Larger values = fewer test runs but more wasted work if a wave fails.
     #[arg(long, alias = "coverage_wave_size", env = "REPARO_COVERAGE_WAVE_SIZE", default_value = "3")]
@@ -159,6 +155,10 @@ pub struct Config {
     /// Skip the deduplication step after fixing issues
     #[arg(long, default_value = "false")]
     pub skip_dedup: bool,
+
+    /// Skip the fix loop entirely (coverage boost and preflight still run)
+    #[arg(long, default_value = "false")]
+    pub skip_fixes: bool,
 
     /// Maximum number of deduplication iterations (0 = unlimited)
     #[arg(long, env = "REPARO_MAX_DEDUP", default_value = "10")]
@@ -264,8 +264,6 @@ pub struct ValidatedConfig {
     pub coverage_attempts: u32,
     /// Maximum coverage rounds per file during boost (0 = unlimited while improving)
     pub coverage_rounds: u32,
-    /// Maximum file size (total lines) for coverage boost (0 = no limit, default: 500)
-    pub max_boost_file_lines: usize,
     /// Glob patterns to exclude from coverage boost (e.g., ["*.html", "**/generated/**"])
     pub coverage_exclude: Vec<String>,
     /// Files per wave before running the test suite once (default: 3)
@@ -284,6 +282,8 @@ pub struct ValidatedConfig {
     pub skip_dedup: bool,
     /// Maximum dedup iterations (0 = unlimited)
     pub max_dedup: usize,
+    /// Skip the fix loop entirely
+    pub skip_fixes: bool,
     /// Files that Claude must never modify (reverted automatically after each fix).
     /// Matched case-insensitively against the basename of changed files.
     pub protected_files: Vec<String>,
@@ -544,7 +544,6 @@ impl Config {
             skip_format: self.skip_format,
             coverage_attempts: self.coverage_attempts,
             coverage_rounds: self.coverage_rounds,
-            max_boost_file_lines: self.max_boost_file_lines,
             coverage_exclude: self.coverage_exclude.clone(),
             coverage_wave_size: std::cmp::max(1, self.coverage_wave_size),
             coverage_commit_batch: if self.coverage_commit_batch == 0 {
@@ -558,6 +557,7 @@ impl Config {
             final_validation_attempts: self.final_validation_attempts,
             skip_dedup: self.skip_dedup,
             max_dedup: self.max_dedup,
+            skip_fixes: self.skip_fixes,
             protected_files: self.protected_files,
             commit_format: if self.commit_format.is_empty() { "{type}({scope}): {message}".to_string() } else { self.commit_format },
             commit_vars: self.commit_vars,
@@ -838,7 +838,6 @@ mod tests {
             skip_format: false,
             coverage_attempts: 3,
             coverage_rounds: 3,
-            max_boost_file_lines: 500,
             coverage_exclude: vec![],
             coverage_wave_size: 3,
             coverage_commit_batch: 0,
@@ -848,6 +847,7 @@ mod tests {
             final_validation_attempts: 5,
             skip_dedup: false,
             max_dedup: 10,
+            skip_fixes: false,
             protected_files: vec![],
             commit_format: "{type}({scope}): {message}".to_string(),
             commit_vars: std::collections::HashMap::new(),
