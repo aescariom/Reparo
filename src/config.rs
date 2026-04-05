@@ -119,6 +119,13 @@ pub struct Config {
     #[arg(long, default_value = "false")]
     pub skip_format: bool,
 
+    /// Allow running with uncommitted changes in the working tree. The pending
+    /// changes are staged at startup and will be folded into the first commit
+    /// the program creates (format, coverage, or fix). Use this to run Reparo
+    /// on top of in-progress work without having to commit or stash first.
+    #[arg(long, env = "REPARO_ALLOW_WIP", default_value = "false")]
+    pub allow_wip: bool,
+
     /// Number of test generation attempts for coverage (per issue)
     #[arg(long, env = "REPARO_COVERAGE_ATTEMPTS", default_value = "3")]
     pub coverage_attempts: u32,
@@ -260,6 +267,9 @@ pub struct ValidatedConfig {
     pub skip_coverage: bool,
     /// Skip the initial format-and-commit step
     pub skip_format: bool,
+    /// Allow starting with a dirty working tree — pending changes are staged at
+    /// startup and absorbed into the first commit Reparo produces.
+    pub allow_wip: bool,
     /// Number of test generation attempts for coverage (per issue)
     pub coverage_attempts: u32,
     /// Maximum coverage rounds per file during boost (0 = unlimited while improving)
@@ -326,15 +336,20 @@ pub struct DocumentationConfig {
 }
 
 /// Resolved pact/contract testing configuration for runtime use.
-/// All sub-steps default to disabled.
-#[derive(Debug, Clone, Default)]
+///
+/// When a `pact:` section is present in `reparo.yaml`, `configured` is set to true
+/// and `enabled` defaults to true unless explicitly set to false. When the section
+/// is missing entirely, `configured` is false — running the pact phase without
+/// `--skip-pact` in that state is a hard error (see `validate()`).
+#[derive(Debug, Clone)]
 pub struct PactConfig {
+    /// True when a `pact:` section was present in `reparo.yaml`. Distinguishes
+    /// "not configured at all" from "configured but enabled=false".
+    pub configured: bool,
     pub enabled: bool,
     pub pact_dir: Option<String>,
     pub provider_name: Option<String>,
     pub consumer_name: Option<String>,
-    pub broker_url: Option<String>,
-    pub broker_token: Option<String>,
     pub check_contracts: bool,
     pub generate_tests: bool,
     pub verify_before_fix: bool,
@@ -345,58 +360,81 @@ pub struct PactConfig {
     pub api_patterns: Vec<String>,
 }
 
+impl Default for PactConfig {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            // Default to enabled when a section is present (opt-out via --skip-pact).
+            // When `configured == false`, this value is irrelevant because validate()
+            // bails before it is ever consulted.
+            enabled: true,
+            pact_dir: None,
+            provider_name: None,
+            consumer_name: None,
+            check_contracts: false,
+            generate_tests: false,
+            verify_before_fix: false,
+            verify_after_fix: false,
+            verify_command: None,
+            test_command: None,
+            attempts: 3,
+            api_patterns: Vec::new(),
+        }
+    }
+}
+
 impl PactConfig {
-    /// Validate pact configuration and return warnings for potential misconfigurations.
+    /// Validate pact configuration. Hard-errors with `bail!` for missing
+    /// required commands; logs soft issues via `tracing::warn!`.
     ///
-    /// Called at startup to alert the user about missing commands or incomplete setup
-    /// before processing any issues.
-    pub fn validate(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if !self.enabled {
-            return warnings;
+    /// Must only be called when `skip_pact == false` — callers are expected to
+    /// short-circuit when the user has opted out.
+    pub fn validate(&self) -> Result<()> {
+        // Missing section entirely — force the user to make an explicit choice.
+        if !self.configured {
+            bail!(
+                "Pact phase is active but no `pact:` section was found in reparo.yaml. \
+                 Add a `pact:` section (see README) or pass `--skip-pact` to skip this step."
+            );
         }
 
-        // Verify command required when any verification step is enabled
+        // Section present but the user explicitly disabled it — nothing to validate.
+        if !self.enabled {
+            tracing::info!("Pact section present but `enabled: false` — skipping pact phase");
+            return Ok(());
+        }
+
+        // Verify command required when any verification step is enabled.
         if (self.check_contracts || self.verify_before_fix || self.verify_after_fix)
             && self.verify_command.as_ref().map_or(true, |c| c.trim().is_empty())
         {
-            warnings.push(
-                "Pact verification steps enabled but 'verify_command' is not set — \
-                 verification will be skipped"
-                    .into(),
+            bail!(
+                "Pact verification steps are enabled (check_contracts / verify_before_fix / \
+                 verify_after_fix) but `pact.verify_command` is not set. Configure it in \
+                 reparo.yaml or disable the verification sub-steps."
             );
         }
 
-        // Test command strongly recommended when generating tests
+        // Test command required when generating contract tests — otherwise generated
+        // output cannot be validated and silently-broken tests would be committed.
         if self.generate_tests
             && self.test_command.as_ref().map_or(true, |c| c.trim().is_empty())
         {
-            warnings.push(
-                "Pact test generation enabled but 'test_command' is not set — \
-                 generated tests won't be validated"
-                    .into(),
+            bail!(
+                "Pact `generate_tests` is enabled but `pact.test_command` is not set. \
+                 Generated contract tests must be runnable to be validated."
             );
         }
 
-        // Provider/consumer names improve prompt quality
+        // Provider/consumer names improve prompt quality but are not mandatory.
         if self.provider_name.is_none() || self.consumer_name.is_none() {
-            warnings.push(
-                "Pact provider_name/consumer_name not set — \
-                 using generic defaults in prompts"
-                    .into(),
+            tracing::warn!(
+                "Pact provider_name/consumer_name not set — Claude will use generic defaults \
+                 in contract-test prompts"
             );
         }
 
-        // Broker fields are parsed but not yet used
-        if self.broker_url.is_some() || self.broker_token.is_some() {
-            warnings.push(
-                "Pact broker_url/broker_token are configured but not yet supported — \
-                 they will be ignored"
-                    .into(),
-            );
-        }
-
-        warnings
+        Ok(())
     }
 }
 
@@ -542,6 +580,7 @@ impl Config {
             min_file_coverage: if self.skip_coverage { 0.0 } else { self.min_file_coverage },
             skip_coverage: self.skip_coverage,
             skip_format: self.skip_format,
+            allow_wip: self.allow_wip,
             coverage_attempts: self.coverage_attempts,
             coverage_rounds: self.coverage_rounds,
             coverage_exclude: self.coverage_exclude.clone(),
@@ -836,6 +875,7 @@ mod tests {
             min_file_coverage: 0.0,
             skip_coverage: false,
             skip_format: false,
+            allow_wip: false,
             coverage_attempts: 3,
             coverage_rounds: 3,
             coverage_exclude: vec![],

@@ -1383,43 +1383,42 @@ Apply a different fix now."#,
                 };
             }
 
-            // Run contract tests if command is configured
-            if let Some(ref test_cmd) = self.config.pact.test_command {
-                match runner::run_shell_command(&self.config.path, test_cmd, "pact test") {
-                    Ok((true, _)) => {
-                        info!("Contract tests pass on attempt {}", attempt);
-                        return crate::pact::PactTestGenResult::Success {
-                            test_files: new_files,
+            // Run contract tests. `PactConfig::validate()` guarantees that
+            // `test_command` is set whenever `generate_tests` is enabled, so
+            // reaching this point without a command is a configuration bug.
+            let test_cmd = self.config.pact.test_command.as_ref().expect(
+                "pact.test_command must be set when generate_tests is enabled \
+                 (enforced by PactConfig::validate)",
+            );
+            match runner::run_shell_command(&self.config.path, test_cmd, "pact test") {
+                Ok((true, _)) => {
+                    info!("Contract tests pass on attempt {}", attempt);
+                    return crate::pact::PactTestGenResult::Success {
+                        test_files: new_files,
+                    };
+                }
+                Ok((false, output)) => {
+                    last_output = output.clone();
+                    if attempt == max_attempts {
+                        let _ = git::revert_changes(&self.config.path);
+                        return crate::pact::PactTestGenResult::TestsFailed { output };
+                    }
+                    warn!(
+                        "Contract tests fail on attempt {}/{} — retrying",
+                        attempt, max_attempts
+                    );
+                    let _ = git::revert_changes(&self.config.path);
+                }
+                Err(e) => {
+                    last_output = e.to_string();
+                    if attempt == max_attempts {
+                        let _ = git::revert_changes(&self.config.path);
+                        return crate::pact::PactTestGenResult::TestsFailed {
+                            output: e.to_string(),
                         };
                     }
-                    Ok((false, output)) => {
-                        last_output = output.clone();
-                        if attempt == max_attempts {
-                            let _ = git::revert_changes(&self.config.path);
-                            return crate::pact::PactTestGenResult::TestsFailed { output };
-                        }
-                        warn!(
-                            "Contract tests fail on attempt {}/{} — retrying",
-                            attempt, max_attempts
-                        );
-                        let _ = git::revert_changes(&self.config.path);
-                    }
-                    Err(e) => {
-                        last_output = e.to_string();
-                        if attempt == max_attempts {
-                            let _ = git::revert_changes(&self.config.path);
-                            return crate::pact::PactTestGenResult::TestsFailed {
-                                output: e.to_string(),
-                            };
-                        }
-                        let _ = git::revert_changes(&self.config.path);
-                    }
+                    let _ = git::revert_changes(&self.config.path);
                 }
-            } else {
-                // No test command — assume generated tests are valid
-                return crate::pact::PactTestGenResult::Success {
-                    test_files: new_files,
-                };
             }
         }
 

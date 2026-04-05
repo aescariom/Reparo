@@ -3,7 +3,7 @@ mod dedup;
 mod fix_loop;
 pub(crate) mod helpers;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
@@ -138,15 +138,37 @@ impl Orchestrator {
     pub async fn run(&mut self) -> Result<i32> {
         let start = Instant::now();
 
-        // Step 0: Ensure clean git working tree
+        // Step 0: Ensure clean git working tree (or absorb WIP changes if allowed)
         info!("=== Step 0: Checking git status ===");
         match git::has_changes(&self.config.path) {
             Ok(true) => {
-                anyhow::bail!(
-                    "Working tree has uncommitted changes. Commit or stash them before running Reparo.\n\
-                     Run `git status` in {} to see what's changed.",
-                    self.config.path.display()
-                );
+                if self.config.allow_wip {
+                    // --allow-wip: stage all pending changes so the first commit
+                    // Reparo creates (format/coverage/fix) folds them in.
+                    let wip_files = git::changed_files(&self.config.path)
+                        .unwrap_or_default();
+                    warn!(
+                        "Working tree has {} uncommitted change(s) — running in --allow-wip mode. \
+                         Pending changes will be absorbed into the first commit Reparo creates.",
+                        wip_files.len()
+                    );
+                    for f in wip_files.iter().take(20) {
+                        warn!("  WIP: {}", f);
+                    }
+                    if wip_files.len() > 20 {
+                        warn!("  ... and {} more", wip_files.len() - 20);
+                    }
+                    git::add_all(&self.config.path)
+                        .context("Failed to stage WIP changes for --allow-wip mode")?;
+                    info!("WIP changes staged and will be included in the first commit");
+                } else {
+                    anyhow::bail!(
+                        "Working tree has uncommitted changes. Commit or stash them before running Reparo,\n\
+                         or pass --allow-wip to absorb them into the first commit.\n\
+                         Run `git status` in {} to see what's changed.",
+                        self.config.path.display()
+                    );
+                }
             }
             Ok(false) => {
                 info!("Git working tree is clean");
@@ -219,29 +241,30 @@ impl Orchestrator {
         // Step 0.5: Cache test examples once (avoids re-globbing per issue)
         self.cached_test_examples = Some(runner::find_test_examples(&self.config.path).join("\n\n"));
 
-        // Step 0.5: Validate pact configuration if enabled
-        if !self.config.skip_pact && self.config.pact.enabled {
-            let pact_warnings = self.config.pact.validate();
-            for w in &pact_warnings {
-                warn!("Pact config: {}", w);
-            }
+        // Step 0.5: Validate pact configuration unless the user opted out.
+        // validate() hard-errors when the section is missing or required commands
+        // are absent — the program exits before any Sonar work happens.
+        if !self.config.skip_pact {
+            self.config.pact.validate()?;
 
-            // Detect and log framework info
-            let fw_info = crate::pact::detect_pact_framework_info(&self.config.path);
-            if fw_info.name == "unknown" {
-                warn!("Could not detect pact framework — Claude will infer from project context");
-            } else if !fw_info.installed {
-                warn!(
-                    "Pact framework '{}' declared but may not be installed. Run: {}",
-                    fw_info.name, fw_info.install_hint
-                );
-            } else {
-                info!("Detected pact framework: {} (installed)", fw_info.name);
-            }
+            if self.config.pact.enabled {
+                // Detect and log framework info
+                let fw_info = crate::pact::detect_pact_framework_info(&self.config.path);
+                if fw_info.name == "unknown" {
+                    warn!("Could not detect pact framework — Claude will infer from project context");
+                } else if !fw_info.installed {
+                    warn!(
+                        "Pact framework '{}' declared but may not be installed. Run: {}",
+                        fw_info.name, fw_info.install_hint
+                    );
+                } else {
+                    info!("Detected pact framework: {} (installed)", fw_info.name);
+                }
 
-            // Detect project role for better prompts
-            let role = crate::pact::detect_project_role(&self.config.path);
-            info!("Detected project role: {:?}", role);
+                // Detect project role for better prompts
+                let role = crate::pact::detect_project_role(&self.config.path);
+                info!("Detected project role: {:?}", role);
+            }
         }
 
         // Step 1: Validate SonarQube connectivity (US-001, US-016: with retry)

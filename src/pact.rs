@@ -689,60 +689,63 @@ mod tests {
     // --- Tests for PactConfig::validate ---
 
     #[test]
-    fn test_pact_config_validate_disabled_returns_empty() {
-        let config = crate::config::PactConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        assert!(config.validate().is_empty());
+    fn test_pact_config_validate_unconfigured_bails() {
+        // Default = configured: false → hard error unless skip_pact is set.
+        let config = crate::config::PactConfig::default();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("no `pact:` section"));
     }
 
     #[test]
-    fn test_pact_config_validate_verify_steps_without_command() {
+    fn test_pact_config_validate_configured_but_disabled_ok() {
         let config = crate::config::PactConfig {
+            configured: true,
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pact_config_validate_verify_steps_without_command_bails() {
+        let config = crate::config::PactConfig {
+            configured: true,
             enabled: true,
             check_contracts: true,
             ..Default::default()
         };
-        let warnings = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("verify_command")));
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("verify_command"));
     }
 
     #[test]
-    fn test_pact_config_validate_generate_tests_without_test_command() {
+    fn test_pact_config_validate_generate_tests_without_test_command_bails() {
         let config = crate::config::PactConfig {
+            configured: true,
             enabled: true,
             generate_tests: true,
             ..Default::default()
         };
-        let warnings = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("test_command")));
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("test_command"));
     }
 
     #[test]
-    fn test_pact_config_validate_missing_names() {
+    fn test_pact_config_validate_missing_names_is_warning_only() {
+        // provider/consumer are soft — missing them should not fail validation
+        // when the rest of the configuration is sound.
         let config = crate::config::PactConfig {
+            configured: true,
             enabled: true,
             ..Default::default()
         };
-        let warnings = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("provider_name")));
-    }
-
-    #[test]
-    fn test_pact_config_validate_broker_warning() {
-        let config = crate::config::PactConfig {
-            enabled: true,
-            broker_url: Some("https://broker.example.com".into()),
-            ..Default::default()
-        };
-        let warnings = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("broker")));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_pact_config_validate_fully_configured() {
         let config = crate::config::PactConfig {
+            configured: true,
             enabled: true,
             verify_command: Some("npm run pact:verify".into()),
             test_command: Some("npm run pact:test".into()),
@@ -754,8 +757,7 @@ mod tests {
             verify_after_fix: true,
             ..Default::default()
         };
-        let warnings = config.validate();
-        assert!(warnings.is_empty());
+        assert!(config.validate().is_ok());
     }
 
     // --- Tests for detect_project_role ---
