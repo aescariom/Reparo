@@ -199,7 +199,7 @@ impl Orchestrator {
 
             let dedup_tier = claude::classify_dedup_tier(dup_file.duplicated_lines, dup_file.duplication_pct);
             info!("Asking AI to refactor {} to reduce duplication... [{}]", dup_file.file_path, dedup_tier);
-            match self.run_ai(&prompt, &dedup_tier) {
+            match self.run_ai("dedup", &prompt, &dedup_tier) {
                 Ok(_output) => {
                     info!("Claude completed dedup refactoring for {}", dup_file.file_path);
                 }

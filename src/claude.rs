@@ -162,16 +162,93 @@ pub fn classify_dedup_tier(duplicated_lines: u64, duplication_pct: f64) -> Claud
     }
 }
 
-/// Classify test generation difficulty based on number of uncovered lines.
-pub fn classify_test_gen_tier(uncovered_lines: usize, total_file_lines: usize) -> ClaudeTier {
-    if uncovered_lines > 150 || total_file_lines > 500 {
-        ClaudeTier::with_timeout("opus", "high", 1.5)
-    } else if uncovered_lines > 80 || total_file_lines > 300 {
-        ClaudeTier::with_timeout("sonnet", "high", 1.0)
-    } else if uncovered_lines > 30 {
-        ClaudeTier::with_timeout("sonnet", "medium", 0.7)
+/// Build a `ClaudeTier` from a `TierSpec`, using a conventional timeout multiplier
+/// per model.
+fn tier_from_spec(spec: &crate::config::TierSpec) -> ClaudeTier {
+    let mult = match (spec.model.as_str(), spec.effort.as_str()) {
+        ("haiku", _) => 0.3,
+        ("sonnet", "low") => 0.5,
+        ("sonnet", "medium") => 0.7,
+        ("sonnet", "high") => 1.0,
+        ("opus", "high") => 1.5,
+        ("opus", "max") => 2.0,
+        _ => 0.7,
+    };
+    ClaudeTier::with_timeout(
+        model_to_static(&spec.model),
+        effort_to_static(&spec.effort),
+        mult,
+    )
+}
+
+/// Map dynamic model string to a static str. Falls back to "sonnet".
+fn model_to_static(model: &str) -> &'static str {
+    match model {
+        "haiku" => "haiku",
+        "sonnet" => "sonnet",
+        "opus" => "opus",
+        _ => "sonnet",
+    }
+}
+
+/// Map dynamic effort string to a static str. Falls back to "medium".
+fn effort_to_static(effort: &str) -> &'static str {
+    match effort {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "max" => "max",
+        _ => "medium",
+    }
+}
+
+/// Classify test generation difficulty for a whole-file (single-prompt) coverage pass.
+///
+/// Complexity is driven by the number of uncovered lines the AI must reason about,
+/// NOT the total file size — a 600-line file with 5 uncovered lines is an easy task.
+///
+/// The `tiers` parameter supplies the model/effort for each band — defaults come
+/// from `TestGenTiers::default()` and can be overridden in `reparo.yaml`.
+pub fn classify_test_gen_tier(
+    uncovered_lines: usize,
+    _total_file_lines: usize,
+    tiers: &crate::config::TestGenTiers,
+) -> ClaudeTier {
+    if uncovered_lines > 100 {
+        tier_from_spec(&tiers.complex)
+    } else if uncovered_lines > 50 {
+        tier_from_spec(&tiers.high)
+    } else if uncovered_lines > 20 {
+        tier_from_spec(&tiers.medium)
     } else {
-        ClaudeTier::with_timeout("sonnet", "low", 0.5)
+        tier_from_spec(&tiers.low)
+    }
+}
+
+/// Classify test generation difficulty for a single method/block chunk.
+///
+/// Method-level chunks are smaller and more focused than whole-file prompts, so
+/// the thresholds are tighter. The key complexity driver is the number of branches
+/// the method contains (approximated by uncovered line count) and the method's
+/// total size (more context = harder to reason about).
+pub fn classify_chunk_test_gen_tier(
+    uncovered_lines: usize,
+    method_total_lines: usize,
+    tiers: &crate::config::TestGenTiers,
+) -> ClaudeTier {
+    // A method with >60 uncovered lines or >150 total lines is genuinely complex
+    // (deep nesting, state machines, parsers).
+    if uncovered_lines > 60 || method_total_lines > 150 {
+        tier_from_spec(&tiers.complex)
+    } else if uncovered_lines > 30 || method_total_lines > 80 {
+        tier_from_spec(&tiers.high)
+    } else if uncovered_lines > 10 {
+        tier_from_spec(&tiers.medium)
+    } else if uncovered_lines > 5 || method_total_lines > 30 {
+        tier_from_spec(&tiers.low)
+    } else {
+        // ≤5 uncovered lines in a small method — haiku can handle it
+        tier_from_spec(&tiers.trivial)
     }
 }
 
@@ -216,7 +293,7 @@ pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64
     let invocation = crate::engine::EngineInvocation {
         engine_kind: crate::engine::EngineKind::Claude,
         command: "claude".to_string(),
-        base_args: vec!["-d".to_string(), "--output-format".to_string(), "text".to_string()],
+        base_args: vec!["-d".to_string(), "--output-format".to_string(), "json".to_string()],
         model: tier.map(|t| t.model.to_string()),
         effort: tier.map(|t| t.effort.to_string()),
         prompt_flag: "-p".to_string(),
@@ -705,6 +782,68 @@ mod tests {
         assert!(prompt.contains("attempt 2"));
         assert!(prompt.contains("Error: expected 200 got 404"));
         assert!(prompt.contains("Do NOT modify"));
+    }
+
+    #[test]
+    fn test_classify_test_gen_tier_by_uncovered_lines() {
+        let tiers = crate::config::TestGenTiers::default();
+
+        // Few uncovered lines → low effort regardless of file size
+        let small = classify_test_gen_tier(5, 1000, &tiers);
+        assert_eq!(small.model, "sonnet");
+        assert_eq!(small.effort, "low");
+
+        // Medium uncovered count
+        let med = classify_test_gen_tier(30, 50, &tiers);
+        assert_eq!(med.effort, "medium");
+
+        // Many uncovered lines → opus
+        let large = classify_test_gen_tier(120, 200, &tiers);
+        assert_eq!(large.model, "opus");
+    }
+
+    #[test]
+    fn test_classify_chunk_test_gen_tier_method_level() {
+        let tiers = crate::config::TestGenTiers::default();
+
+        // Tiny method with few uncovered lines → haiku (trivial)
+        let tiny = classify_chunk_test_gen_tier(3, 20, &tiers);
+        assert_eq!(tiny.model, "haiku");
+        assert_eq!(tiny.effort, "low");
+
+        // Medium method
+        let med = classify_chunk_test_gen_tier(15, 40, &tiers);
+        assert_eq!(med.effort, "medium");
+
+        // Large method
+        let large = classify_chunk_test_gen_tier(40, 90, &tiers);
+        assert_eq!(large.effort, "high");
+
+        // Very complex method
+        let complex = classify_chunk_test_gen_tier(70, 200, &tiers);
+        assert_eq!(complex.model, "opus");
+    }
+
+    #[test]
+    fn test_classify_chunk_tier_custom_tiers() {
+        use crate::config::{TierSpec, TestGenTiers};
+        let tiers = TestGenTiers {
+            trivial: TierSpec::new("haiku", "low"),
+            low: TierSpec::new("haiku", "medium"),  // override: use haiku for low too
+            medium: TierSpec::new("sonnet", "low"),
+            high: TierSpec::new("sonnet", "high"),
+            complex: TierSpec::new("sonnet", "high"),  // no opus at all
+        };
+
+        // Low band → haiku/medium per custom config
+        let low = classify_chunk_test_gen_tier(8, 35, &tiers);
+        assert_eq!(low.model, "haiku");
+        assert_eq!(low.effort, "medium");
+
+        // Complex band → sonnet/high (no opus)
+        let complex = classify_chunk_test_gen_tier(80, 200, &tiers);
+        assert_eq!(complex.model, "sonnet");
+        assert_eq!(complex.effort, "high");
     }
 
     #[test]

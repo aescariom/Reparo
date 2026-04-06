@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
@@ -64,6 +64,93 @@ pub fn create_branch(project_path: &Path, branch_name: &str, base_branch: &str) 
     }
 
     info!("Created branch: {}", branch_name);
+    Ok(())
+}
+
+/// Create a new branch in a detached worktree from a base ref.
+///
+/// Worktrees start at detached HEAD. This resets to the base ref and creates
+/// a new branch, so the worktree is clean and based on the correct commit.
+pub fn create_branch_in_worktree(
+    worktree_path: &Path,
+    branch_name: &str,
+    base_ref: &str,
+) -> Result<()> {
+    // Reset to the base ref so the worktree starts from the right commit
+    let status = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["checkout", base_ref, "--"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .context("Failed to checkout base ref in worktree")?;
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to checkout {} in worktree {}",
+            base_ref,
+            worktree_path.display()
+        );
+    }
+
+    // Delete branch if it already exists (idempotency)
+    let _ = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["branch", "-D", branch_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let status = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["checkout", "-b", branch_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .context("Failed to create branch in worktree")?;
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to create branch {} in worktree {}",
+            branch_name,
+            worktree_path.display()
+        );
+    }
+
+    info!(
+        "Created branch {} in worktree {}",
+        branch_name,
+        worktree_path.display()
+    );
+    Ok(())
+}
+
+/// Clean a worktree back to detached HEAD for reuse.
+///
+/// Reverts all changes, removes untracked files, and detaches HEAD.
+pub fn clean_worktree(worktree_path: &Path) -> Result<()> {
+    // Revert tracked changes
+    let _ = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["checkout", "--", "."])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+
+    // Remove untracked files
+    let _ = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["clean", "-fd"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+
+    // Detach HEAD
+    let _ = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["checkout", "--detach"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+
     Ok(())
 }
 
@@ -677,6 +764,95 @@ pub fn stash_indices_matching(project_path: &Path, prefix: &str) -> Result<Vec<u
     Ok(indices)
 }
 
+/// Create a detached git worktree at `worktree_path`, based on the current HEAD.
+///
+/// The worktree shares `.git/objects` with the main repo, so creation is fast
+/// and storage is lightweight. The detached HEAD avoids branch name conflicts.
+pub fn worktree_add(project_path: &Path, worktree_path: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .current_dir(project_path)
+        .args(["worktree", "add", "--detach"])
+        .arg(worktree_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .context("Failed to run git worktree add")?;
+    if !status.success() {
+        anyhow::bail!(
+            "git worktree add failed for {}",
+            worktree_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove a git worktree, forcing removal even if it has uncommitted changes.
+pub fn worktree_remove(project_path: &Path, worktree_path: &Path) -> Result<()> {
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+    // Best-effort: also remove the directory if git didn't clean it
+    let _ = std::fs::remove_dir_all(worktree_path);
+    Ok(())
+}
+
+/// Prune stale worktree entries from `.git/worktrees`.
+///
+/// Called at startup to clean up leftovers from a previous crash.
+/// Return the git toplevel directory for a given path.
+///
+/// Runs `git rev-parse --show-toplevel` and returns the canonical path.
+pub fn git_toplevel(project_path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run git rev-parse --show-toplevel")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse --show-toplevel failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(PathBuf::from(toplevel))
+}
+
+/// Compute the subdirectory offset from the git root to `project_path`.
+///
+/// When `project_path` is a subdirectory of the git root (e.g. a monorepo),
+/// git worktrees check out from the root. To locate project files inside a
+/// worktree you need: `worktree_root.join(subdir_in_worktree(project_path))`.
+///
+/// Returns an empty `PathBuf` if `project_path` IS the git root.
+pub fn subdir_in_worktree(project_path: &Path) -> Result<PathBuf> {
+    let toplevel = git_toplevel(project_path)?;
+    let canon_project = std::fs::canonicalize(project_path)
+        .unwrap_or_else(|_| project_path.to_path_buf());
+    let canon_toplevel = std::fs::canonicalize(&toplevel)
+        .unwrap_or_else(|_| toplevel.clone());
+    match canon_project.strip_prefix(&canon_toplevel) {
+        Ok(rel) => Ok(rel.to_path_buf()),
+        Err(_) => Ok(PathBuf::new()), // shouldn't happen; treat as root
+    }
+}
+
+pub fn worktree_prune(project_path: &Path) -> Result<()> {
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["worktree", "prune"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1325,51 @@ mod tests {
 
         ensure_clean_state(tmp.path()).unwrap();
         assert!(!has_changes(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn test_worktree_add_and_remove() {
+        let tmp = git_repo();
+        // Need at least one commit for worktree to attach to HEAD
+        fs::write(tmp.path().join("file.txt"), "content").unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["add", "."]).output().unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["commit", "-m", "init"]).output().unwrap();
+
+        let wt_dir = tmp.path().join("wt-0");
+        worktree_add(tmp.path(), &wt_dir).unwrap();
+        assert!(wt_dir.exists());
+        assert!(wt_dir.join("file.txt").exists());
+
+        worktree_remove(tmp.path(), &wt_dir).unwrap();
+        assert!(!wt_dir.exists());
+    }
+
+    #[test]
+    fn test_worktree_prune_is_safe() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["add", "."]).output().unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["commit", "-m", "init"]).output().unwrap();
+        // Prune on a repo with no stale worktrees should succeed silently
+        worktree_prune(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_changes_are_independent() {
+        let tmp = git_repo();
+        fs::write(tmp.path().join("src.txt"), "original").unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["add", "."]).output().unwrap();
+        Command::new("git").current_dir(tmp.path()).args(["commit", "-m", "init"]).output().unwrap();
+
+        let wt_dir = tmp.path().join("wt-0");
+        worktree_add(tmp.path(), &wt_dir).unwrap();
+
+        // Write a file in the worktree
+        fs::write(wt_dir.join("test_new.txt"), "generated test").unwrap();
+        assert!(wt_dir.join("test_new.txt").exists());
+        // Main tree should NOT have the file
+        assert!(!tmp.path().join("test_new.txt").exists());
+
+        worktree_remove(tmp.path(), &wt_dir).unwrap();
     }
 }

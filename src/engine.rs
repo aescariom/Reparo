@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::claude::ClaudeTier;
+use crate::usage::{self, TokenUsage};
 
 /// Which AI engine to use.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind {
     Claude,
@@ -120,7 +121,9 @@ pub fn default_engines() -> HashMap<String, EngineConfig> {
         "claude".to_string(),
         EngineConfig {
             command: "claude".to_string(),
-            args: vec!["-d".to_string(), "--output-format".to_string(), "text".to_string()],
+            // JSON output lets us extract token usage alongside the final text.
+            // The `result` field of the JSON contains what `--output-format text` used to return.
+            args: vec!["-d".to_string(), "--output-format".to_string(), "json".to_string()],
             enabled: true,
             prompt_flag: "-p".to_string(),
             prompt_via_stdin: false,
@@ -290,12 +293,22 @@ pub fn validate_engines(config: &EngineRoutingConfig) -> Result<()> {
     Ok(())
 }
 
-/// Execute an AI engine with the given prompt.
+/// Result of an engine invocation: the assistant's final text output plus
+/// (when available) token usage reported by the engine.
+#[derive(Debug, Clone, Default)]
+pub struct EngineOutput {
+    /// Final text output from the assistant. For Claude JSON mode this is the
+    /// `result` field; for other engines it's the raw stdout.
+    pub stdout: String,
+    /// Parsed token usage. `None` when the engine didn't report usage or
+    /// parsing failed — callers should record the step as "unknown" in that case.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Backward-compat wrapper: run an engine and return only the text output.
 ///
-/// Handles the differences between CLI tools:
-/// - Claude: `-d --output-format text --model X --effort Y -p <prompt>`
-/// - Gemini: `--model X -p <prompt>`
-/// - Aider: `--yes-always --no-git --model X --message <prompt>`
+/// Existing call sites that don't care about token usage keep using this.
+/// New code that needs usage should call `run_engine_full`.
 pub fn run_engine(
     project_path: &Path,
     prompt: &str,
@@ -304,6 +317,24 @@ pub fn run_engine(
     show_prompt: bool,
     invocation: &EngineInvocation,
 ) -> Result<String> {
+    run_engine_full(project_path, prompt, timeout_secs, skip_permissions, show_prompt, invocation)
+        .map(|o| o.stdout)
+}
+
+/// Execute an AI engine with the given prompt.
+///
+/// Handles the differences between CLI tools:
+/// - Claude: `-d --output-format json --model X --effort Y -p <prompt>` — usage parsed from JSON
+/// - Gemini: `--model X -p <prompt>` — usage parsed best-effort from stdout
+/// - Aider: `--yes-always --no-git --model X --message <prompt>` — usage parsed best-effort from stdout
+pub fn run_engine_full(
+    project_path: &Path,
+    prompt: &str,
+    timeout_secs: u64,
+    skip_permissions: bool,
+    show_prompt: bool,
+    invocation: &EngineInvocation,
+) -> Result<EngineOutput> {
     info!(
         "Running {} (prompt: {} chars, timeout: {}s, model: {})",
         invocation.engine_kind,
@@ -382,7 +413,7 @@ pub fn run_engine(
     match result {
         WaitResult::Completed(output) => {
             let elapsed = start.elapsed().as_secs();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
             if !output.status.success() {
@@ -394,8 +425,8 @@ pub fn run_engine(
                 if elapsed < 10 {
                     let error_detail = if !stderr.is_empty() {
                         stderr.clone()
-                    } else if !stdout.is_empty() {
-                        truncate_str(&stdout, 500)
+                    } else if !raw_stdout.is_empty() {
+                        truncate_str(&raw_stdout, 500)
                     } else {
                         format!("exit status: {} (no output)", output.status)
                     };
@@ -413,7 +444,29 @@ pub fn run_engine(
                 info!("{} completed in {}s", invocation.engine_kind, elapsed);
             }
 
-            Ok(stdout)
+            // Engine-specific usage extraction. For Claude JSON mode, also replace
+            // the returned stdout with the `result` field so downstream callers
+            // see the same text they used to see under `--output-format text`.
+            let (final_stdout, usage) = match invocation.engine_kind {
+                EngineKind::Claude => {
+                    if let Some((result_text, u)) = usage::parse_claude_json(&raw_stdout) {
+                        (result_text, Some(u))
+                    } else {
+                        // Non-JSON output (older CLI, `--output-format text`, or test stubs).
+                        (raw_stdout, None)
+                    }
+                }
+                EngineKind::Gemini => {
+                    let u = usage::parse_gemini_usage(&raw_stdout);
+                    (raw_stdout, u)
+                }
+                EngineKind::Aider => {
+                    let u = usage::parse_aider_usage(&raw_stdout);
+                    (raw_stdout, u)
+                }
+            };
+
+            Ok(EngineOutput { stdout: final_stdout, usage })
         }
         WaitResult::TimedOut => {
             let _ = child.kill();

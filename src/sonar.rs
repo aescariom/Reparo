@@ -154,6 +154,7 @@ struct RuleDetail {
 
 // --- Client ---
 
+#[derive(Clone)]
 pub struct SonarClient {
     base_url: String,
     token: String,

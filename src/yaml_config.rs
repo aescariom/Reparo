@@ -87,6 +87,10 @@ pub struct ExecutionYaml {
     pub coverage_wave_size: Option<u32>,
     /// Files per coverage boost commit (0 = same as coverage_wave_size, 1 = one commit per file)
     pub coverage_commit_batch: Option<u32>,
+    /// Number of files to process in parallel during coverage boost (1 = sequential, default: 1)
+    pub coverage_parallel: Option<u32>,
+    /// Number of issues to fix in parallel using git worktrees (1 = sequential, default: 1)
+    pub parallel: Option<u32>,
     /// Stop coverage boost after N consecutive wave failures (0 = disabled, default: 5)
     pub max_boost_failures: Option<usize>,
     /// Retry failed wave files with error context in per-file fallback (default: true)
@@ -222,6 +226,44 @@ pub struct TestGenerationYaml {
     pub avoid_spring_context: Option<bool>,
     /// Custom instructions appended to every test generation prompt
     pub custom_instructions: Option<String>,
+    /// Override model/effort for test generation tiers.
+    /// Keys: `trivial`, `low`, `medium`, `high`, `complex`.
+    /// Each maps to a `{model, effort}` pair.
+    pub tiers: Option<TestGenTiersYaml>,
+}
+
+/// Per-complexity-band model/effort overrides for test generation.
+///
+/// YAML example:
+/// ```yaml
+/// test_generation:
+///   tiers:
+///     trivial:  { model: haiku, effort: low }
+///     low:      { model: sonnet, effort: low }
+///     medium:   { model: sonnet, effort: medium }
+///     high:     { model: sonnet, effort: high }
+///     complex:  { model: opus, effort: high }
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TestGenTiersYaml {
+    /// ≤10 uncovered lines in a small method, or ≤20 lines file-level
+    pub trivial: Option<TierSpecYaml>,
+    /// 11-20 uncovered (chunk) or 21-50 (file)
+    pub low: Option<TierSpecYaml>,
+    /// Moderate complexity
+    pub medium: Option<TierSpecYaml>,
+    /// High complexity
+    pub high: Option<TierSpecYaml>,
+    /// Very complex methods/files (deep nesting, state machines)
+    pub complex: Option<TierSpecYaml>,
+}
+
+/// A single model + effort pair for YAML config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TierSpecYaml {
+    pub model: String,
+    pub effort: String,
 }
 
 /// Prompt customization per rule or category (US-019).
@@ -534,6 +576,18 @@ pub fn merge_yaml_into_config(
             config.coverage_commit_batch = v;
         }
     }
+    // coverage_parallel: only override if CLI is at default (1)
+    if config.coverage_parallel == 1 {
+        if let Some(v) = yaml.execution.coverage_parallel {
+            config.coverage_parallel = v;
+        }
+    }
+    // parallel: only override if CLI is at default (1)
+    if config.parallel == 1 {
+        if let Some(v) = yaml.execution.parallel {
+            config.parallel = v;
+        }
+    }
     // max_boost_failures: only override if CLI is at default (5)
     if config.max_boost_failures == 5 {
         if let Some(v) = yaml.execution.max_boost_failures {
@@ -652,12 +706,27 @@ pub fn merge_yaml_into_config(
 
     // test_generation: resolve from YAML (US-040)
     let tg = &yaml.test_generation;
+    let mut tiers = crate::config::TestGenTiers::default();
+    if let Some(ref yaml_tiers) = tg.tiers {
+        fn apply(spec: &mut crate::config::TierSpec, yaml: &Option<TierSpecYaml>) {
+            if let Some(ref y) = yaml {
+                spec.model = y.model.clone();
+                spec.effort = y.effort.clone();
+            }
+        }
+        apply(&mut tiers.trivial, &yaml_tiers.trivial);
+        apply(&mut tiers.low, &yaml_tiers.low);
+        apply(&mut tiers.medium, &yaml_tiers.medium);
+        apply(&mut tiers.high, &yaml_tiers.high);
+        apply(&mut tiers.complex, &yaml_tiers.complex);
+    }
     config.test_generation = crate::config::TestGenerationConfig {
         framework: tg.framework.clone(),
         mock_framework: tg.mock_framework.clone(),
         assertion_library: tg.assertion_library.clone(),
         avoid_spring_context: tg.avoid_spring_context.unwrap_or(false),
         custom_instructions: tg.custom_instructions.clone(),
+        tiers,
     };
 }
 
@@ -884,6 +953,11 @@ pub fn merge_personal_into_config(config: &mut crate::config::Config, personal: 
     if let Some(v) = exec.coverage_commit_batch {
         if config.coverage_commit_batch == 0 {
             config.coverage_commit_batch = v;
+        }
+    }
+    if let Some(v) = exec.coverage_parallel {
+        if config.coverage_parallel == 1 {
+            config.coverage_parallel = v;
         }
     }
     if let Some(v) = exec.max_boost_failures {

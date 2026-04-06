@@ -4,11 +4,12 @@ use crate::claude;
 use crate::git;
 use crate::runner;
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 impl Orchestrator {
     /// After each file, verifies no source code was modified, then commits the tests.
-    pub(super) fn boost_coverage_to_threshold(&self, test_command: &str) -> Result<()> {
+    pub(super) async fn boost_coverage_to_threshold(&self, test_command: &str) -> Result<()> {
         let coverage_cmd = self.config.coverage_command.clone()
             .or_else(|| self.config.commands.coverage.clone())
             .or_else(|| runner::detect_coverage_command(&self.config.path));
@@ -178,6 +179,19 @@ impl Orchestrator {
 
         let stash_prefix = "reparo-boost";
 
+        // ── Parallel path: process files concurrently in git worktrees ──
+        if self.config.coverage_parallel > 1 {
+            return self.boost_coverage_parallel(
+                &files_needing_tests,
+                test_framework,
+                &test_examples_str,
+                &framework_context_base,
+                overall_pct,
+                &cov_cmd,
+            ).await;
+        }
+
+        // ── Sequential path (default): original wave-based loop ──
         let mut current_pct = overall_pct;
         let start_pct = overall_pct;
         let mut files_boosted = 0;
@@ -648,9 +662,10 @@ impl Orchestrator {
 
                 for (ci, chunk) in chunks.iter().enumerate() {
                     let chunk_idx = ci + 1;
-                    let chunk_tier = claude::classify_test_gen_tier(
+                    let chunk_tier = claude::classify_chunk_test_gen_tier(
                         chunk.uncovered_count,
                         chunk.snippet.lines().count(),
+                        &self.config.test_generation.tiers,
                     );
 
                     let prompt = claude::build_chunk_test_prompt(
@@ -671,7 +686,7 @@ impl Orchestrator {
                         "  Chunk {}/{}: {} — {} uncovered lines [{}]",
                         chunk_idx, total_chunks, chunk.label, chunk.uncovered_count, chunk_tier
                     );
-                    match self.run_ai(&prompt, &chunk_tier) {
+                    match self.run_ai("coverage_boost_chunk", &prompt, &chunk_tier) {
                         Ok(_) => {
                             info!("  Chunk {}/{} completed", chunk_idx, total_chunks);
                             // Validate: no source files modified by this chunk
@@ -754,9 +769,9 @@ impl Orchestrator {
                 }
 
                 let uncovered = current_uncovered_count as usize;
-                let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize);
+                let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize, &self.config.test_generation.tiers);
                 info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
-                match self.run_ai(&prompt, &test_tier) {
+                match self.run_ai("coverage_boost", &prompt, &test_tier) {
                     Ok(_) => {
                         info!("AI completed test generation for {} ({})", fc.file, round_label);
                     }
@@ -1297,7 +1312,7 @@ impl Orchestrator {
         );
         let tier = claude::classify_repair_tier();
 
-        if let Err(e) = self.run_ai(&prompt, &tier) {
+        if let Err(e) = self.run_ai("coverage_boost_repair", &prompt, &tier) {
             warn!("AI retry failed for {}: {} — discarding definitively", result.file, e);
             let _ = git::revert_changes(&self.config.path);
             return false;
@@ -1605,6 +1620,16 @@ impl Orchestrator {
 
     /// Run the coverage command and return the overall project coverage percentage.
     fn run_coverage_and_measure(&self, cov_cmd: &str) -> Option<f64> {
+        // Delete the old coverage report so we never read stale data.
+        // If the coverage command fails to produce a new report, find_lcov_report_with_hint
+        // will return None — which is the correct behaviour.
+        if let Some(old_report) = runner::find_lcov_report_with_hint(
+            &self.config.path,
+            self.config.commands.coverage_report.as_deref(),
+        ) {
+            let _ = std::fs::remove_file(&old_report);
+        }
+
         let output_text = match runner::run_shell_command(&self.config.path, cov_cmd, "coverage measurement") {
             Ok((true, output)) => output,
             Ok((false, output)) => {
@@ -1633,4 +1658,624 @@ impl Orchestrator {
         }
         overall
     }
+
+    /// Parallel coverage boost: process files concurrently in git worktrees.
+    ///
+    /// Creates a worktree pool, dispatches files in batches of `coverage_parallel`,
+    /// copies results back to the main tree, validates with tests, and commits.
+    async fn boost_coverage_parallel(
+        &self,
+        files: &[&runner::FileCoverage],
+        test_framework: &str,
+        test_examples_str: &str,
+        framework_context: &str,
+        initial_pct: f64,
+        cov_cmd: &str,
+    ) -> Result<()> {
+        let parallelism = self.config.coverage_parallel as usize;
+        info!(
+            "=== Parallel coverage boost: {} files, parallelism={} ===",
+            files.len(),
+            parallelism
+        );
+
+        // Create worktree pool. Fall back to sequential on failure.
+        let pool = match super::worktree_pool::WorktreePool::new(&self.config.path, parallelism) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                warn!(
+                    "Failed to create worktree pool: {} — falling back to sequential mode",
+                    e
+                );
+                // Recursive call with parallel=1 would be complex; just return an error
+                // that the caller can handle. In practice, worktree creation failures are
+                // rare (permission issues, old git version).
+                anyhow::bail!("Worktree pool creation failed: {}", e);
+            }
+        };
+
+        // Build the shared context for parallel tasks
+        let ctx = Arc::new(ParallelGenContext {
+            engine_routing: self.engine_routing.clone(),
+            test_generation: self.config.test_generation.tiers.clone(),
+            coverage_exclude: self.config.coverage_exclude.clone(),
+            claude_timeout: self.config.claude_timeout,
+            skip_permissions: self.config.dangerously_skip_permissions,
+            show_prompts: self.config.show_prompts,
+            test_framework: test_framework.to_string(),
+            test_examples: test_examples_str.to_string(),
+            framework_context: framework_context.to_string(),
+            usage_tracker: Arc::new(crate::usage::UsageTracker::new()),
+        });
+
+        let start_pct = initial_pct;
+        let mut current_pct = initial_pct;
+        let mut _files_boosted = 0usize;
+        let mut consecutive_failures = 0usize;
+        let max_failures = self.config.max_boost_failures;
+
+        // Process in batches of `parallelism`
+        for batch_start in (0..files.len()).step_by(parallelism) {
+            if max_failures > 0 && consecutive_failures >= max_failures {
+                warn!(
+                    "Stopping parallel coverage boost: {} consecutive batch failures",
+                    consecutive_failures
+                );
+                break;
+            }
+
+            // Check if overall threshold already met
+            if current_pct >= self.config.min_coverage {
+                info!(
+                    "Overall coverage {:.1}% meets threshold {:.0}% — stopping",
+                    current_pct, self.config.min_coverage
+                );
+                break;
+            }
+
+            let batch_end = (batch_start + parallelism).min(files.len());
+            let batch = &files[batch_start..batch_end];
+            info!(
+                "--- Parallel batch [{}-{}] of {} files ---",
+                batch_start + 1,
+                batch_end,
+                files.len()
+            );
+
+            // Spawn one blocking task per file in the batch.
+            // Each task: generate tests → copy to main tree → clean worktree.
+            let main_path = self.config.path.clone();
+            let mut handles = Vec::with_capacity(batch.len());
+            for &fc in batch {
+                let pool = Arc::clone(&pool);
+                let ctx = Arc::clone(&ctx);
+                let fc = fc.clone();
+                let main_path = main_path.clone();
+
+                let handle = tokio::task::spawn_blocking(move || {
+                    let wt_root = pool.acquire();
+                    let wt_path = pool.project_dir(&wt_root);
+                    let result = generate_tests_in_worktree(&fc, &wt_path, &ctx);
+
+                    // Copy test files to main tree BEFORE cleaning the worktree
+                    let copied = match &result {
+                        Ok(Some(ref pr)) if !pr.test_files.is_empty() => {
+                            match super::worktree_pool::copy_worktree_results(
+                                &wt_path,
+                                &main_path,
+                                &pr.test_files,
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("[wt] Failed to copy test files for {}: {}", fc.file, e);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    // Clean worktree for reuse (operate on worktree root, not subdir)
+                    let _ = git::revert_changes(&wt_root);
+                    let _ = git::ensure_clean_state(&wt_root);
+                    pool.release(wt_root);
+
+                    // Return the list of files successfully copied to main tree
+                    (result, copied)
+                });
+                handles.push(handle);
+            }
+
+            // Await all tasks and collect results (per-file for fallback support)
+            let mut per_file_results: Vec<(ParallelFileResult, Vec<String>)> = Vec::new();
+            let mut all_copied_files: Vec<String> = Vec::new();
+            let mut batch_had_results = false;
+
+            for handle in handles {
+                match handle.await {
+                    Ok((Ok(Some(result)), copied)) => {
+                        info!(
+                            "Parallel: {} → {} test file(s) copied to main tree",
+                            result.file,
+                            copied.len()
+                        );
+                        all_copied_files.extend(copied.clone());
+                        batch_had_results = true;
+                        per_file_results.push((result, copied));
+                    }
+                    Ok((Ok(None), _)) => {
+                        // File skipped
+                    }
+                    Ok((Err(e), _)) => {
+                        warn!("Parallel: file generation failed: {}", e);
+                    }
+                    Err(e) => {
+                        warn!("Parallel: task panicked: {}", e);
+                    }
+                }
+            }
+
+            if !batch_had_results || all_copied_files.is_empty() {
+                consecutive_failures += 1;
+                continue;
+            }
+
+            // Stage all copied test files in the main tree
+            let stage_refs: Vec<&str> = all_copied_files.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = git::add_files(&self.config.path, &stage_refs) {
+                warn!("Failed to stage parallel test files: {} — reverting", e);
+                let _ = git::revert_changes(&self.config.path);
+                consecutive_failures += 1;
+                continue;
+            }
+
+            // Validate: run tests on the main tree
+            info!(
+                "Running tests to validate {} parallel-generated test file(s)...",
+                all_copied_files.len()
+            );
+            let batch_passed = match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                Ok((true, _)) => {
+                    info!("Tests pass after parallel batch — committing");
+                    true
+                }
+                Ok((false, output)) => {
+                    warn!(
+                        "Tests FAIL after parallel batch — falling back to per-file validation:\n{}",
+                        runner::extract_error_summary(&output, 500)
+                    );
+                    let _ = git::revert_changes(&self.config.path);
+                    let _ = git::ensure_clean_state(&self.config.path);
+                    false
+                }
+                Err(e) => {
+                    warn!("Test execution error: {} — falling back to per-file validation", e);
+                    let _ = git::revert_changes(&self.config.path);
+                    let _ = git::ensure_clean_state(&self.config.path);
+                    false
+                }
+            };
+
+            if !batch_passed {
+                // Per-file fallback: test each file individually, retry failures up to coverage_attempts times
+                let max_attempts = self.config.coverage_attempts.max(1) as usize;
+                let mut any_committed = false;
+
+                for (result, copied) in &per_file_results {
+                    if copied.is_empty() {
+                        continue;
+                    }
+
+                    let mut committed = false;
+                    for attempt in 1..=max_attempts {
+                        // Stage this file's test files
+                        let refs: Vec<&str> = copied.iter().map(|s| s.as_str()).collect();
+                        if git::add_files(&self.config.path, &refs).is_err() {
+                            warn!("Failed to stage test files for {} — skipping", result.file);
+                            let _ = git::revert_changes(&self.config.path);
+                            break;
+                        }
+
+                        match runner::run_tests(&self.config.path, test_framework, self.config.test_timeout) {
+                            Ok((true, _)) => {
+                                info!("Per-file tests pass for {} (attempt {}) — committing", result.file, attempt);
+                                let _ = git::revert_changes(&self.config.path); // clean non-test leftovers
+                                // Re-stage test files after revert
+                                let _ = git::add_files(&self.config.path, &refs);
+                                let msg = format_commit_message(
+                                    &self.config, "test", "coverage",
+                                    &format!("add tests for {} ({:.0}% → boost)", result.file, result.coverage_before),
+                                    "", "", &result.file,
+                                );
+                                if git::commit(&self.config.path, &msg).is_ok() {
+                                    committed = true;
+                                    any_committed = true;
+                                } else {
+                                    warn!("Commit failed for {} — reverting", result.file);
+                                    let _ = git::revert_changes(&self.config.path);
+                                }
+                                break;
+                            }
+                            Ok((false, output)) => {
+                                warn!(
+                                    "Per-file tests FAIL for {} (attempt {}/{}):\n{}",
+                                    result.file, attempt, max_attempts,
+                                    runner::extract_error_summary(&output, 500)
+                                );
+                                // Revert the failing tests
+                                let _ = git::revert_changes(&self.config.path);
+                                let _ = git::ensure_clean_state(&self.config.path);
+
+                                if attempt < max_attempts {
+                                    // Retry: regenerate tests with the error as context
+                                    info!(
+                                        "Retrying test generation for {} with error context (attempt {}/{})",
+                                        result.file, attempt + 1, max_attempts
+                                    );
+                                    let file_class = runner::classify_source_file(&result.file, &self.config.path);
+                                    let per_file_ctx = build_per_file_context(&ctx.framework_context, &file_class, "");
+                                    let prompt = claude::build_test_generation_retry_prompt(
+                                        &result.file,
+                                        &format!(
+                                            "{:.0}% coverage — previous test generation attempt failed. \
+                                             Fix the errors and regenerate working tests.",
+                                            result.coverage_before
+                                        ),
+                                        "",
+                                        test_framework,
+                                        attempt as u32 + 1,
+                                        &truncate(&output, 2000),
+                                        &per_file_ctx,
+                                    );
+                                    let tier = claude::classify_repair_tier();
+                                    if let Err(e) = self.run_ai("coverage_boost_repair", &prompt, &tier) {
+                                        warn!("AI retry failed for {}: {} — giving up", result.file, e);
+                                        let _ = git::revert_changes(&self.config.path);
+                                        break;
+                                    }
+                                    // The AI wrote new test files — loop back to test them
+                                    // Update copied to reflect the new files
+                                    // (we use changed_files instead since the AI may have written different files)
+                                    let changed = git::changed_files(&self.config.path).unwrap_or_default();
+                                    let new_test_files: Vec<String> = changed.iter()
+                                        .filter(|f| is_test_file(f))
+                                        .cloned()
+                                        .collect();
+                                    if new_test_files.is_empty() {
+                                        warn!("No test files generated during retry for {} — giving up", result.file);
+                                        let _ = git::revert_changes(&self.config.path);
+                                        break;
+                                    }
+                                    // Check no source files were modified
+                                    let source_modified: Vec<&String> = changed.iter()
+                                        .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
+                                        .collect();
+                                    if !source_modified.is_empty() {
+                                        warn!(
+                                            "Source files modified during retry for {}: {:?} — giving up",
+                                            result.file, source_modified
+                                        );
+                                        let _ = git::revert_changes(&self.config.path);
+                                        break;
+                                    }
+                                    // Continue to next attempt iteration (test the new files)
+                                    continue;
+                                }
+                                // Exhausted all attempts
+                            }
+                            Err(e) => {
+                                warn!("Test execution error for {}: {} — skipping", result.file, e);
+                                let _ = git::revert_changes(&self.config.path);
+                                let _ = git::ensure_clean_state(&self.config.path);
+                                break;
+                            }
+                        }
+                    }
+                    if !committed {
+                        warn!("Could not produce passing tests for {} after {} attempt(s) — discarding", result.file, max_attempts);
+                        let _ = git::revert_changes(&self.config.path);
+                        let _ = git::ensure_clean_state(&self.config.path);
+                    }
+                }
+
+                if any_committed {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                }
+            } else {
+                // Batch passed — commit all together
+                let file_list: Vec<&str> = batch.iter()
+                    .map(|&fc| fc.file.as_str())
+                    .take(5)
+                    .collect();
+                let msg = format_commit_message(
+                    &self.config,
+                    "test",
+                    "coverage",
+                    &format!(
+                        "add tests for {} file(s): {}{}",
+                        batch.len(),
+                        file_list.join(", "),
+                        if batch.len() > 5 { " ..." } else { "" }
+                    ),
+                    "",
+                    "",
+                    "",
+                );
+                match git::commit(&self.config.path, &msg) {
+                    Ok(()) => {
+                        _files_boosted += batch.len();
+                        consecutive_failures = 0;
+                        info!("Committed parallel batch ({} files)", batch.len());
+                    }
+                    Err(e) => {
+                        warn!("Commit failed: {} — reverting", e);
+                        let _ = git::revert_changes(&self.config.path);
+                        consecutive_failures += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Re-measure coverage
+            if let Some(pct) = self.run_coverage_and_measure(cov_cmd) {
+                color_info!(
+                    "Project-wide coverage after parallel batch: {} (was {})",
+                    cov_vs(pct, self.config.min_coverage),
+                    cov_prev(start_pct)
+                );
+                current_pct = pct;
+            }
+        }
+
+        // Transfer usage entries from the parallel tracker to the main one
+        for entry in ctx.usage_tracker.snapshot() {
+            self.usage_tracker.record(entry);
+        }
+
+        // pool is dropped here — worktrees cleaned up
+        drop(pool);
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel coverage boost: standalone context + generation function
+// ---------------------------------------------------------------------------
+
+/// Read-only config snapshot for parallel test generation.
+///
+/// Extracted from `Orchestrator` so it can be moved into `spawn_blocking`
+/// closures (`Send + Sync + 'static`).
+#[derive(Clone)]
+pub(crate) struct ParallelGenContext {
+    pub engine_routing: crate::engine::EngineRoutingConfig,
+    pub test_generation: crate::config::TestGenTiers,
+    pub coverage_exclude: Vec<String>,
+    pub claude_timeout: u64,
+    pub skip_permissions: bool,
+    pub show_prompts: bool,
+    pub test_framework: String,
+    pub test_examples: String,
+    pub framework_context: String,
+    pub usage_tracker: Arc<crate::usage::UsageTracker>,
+}
+
+/// Result of parallel test generation for a single file.
+#[allow(dead_code)]
+pub(crate) struct ParallelFileResult {
+    pub file: String,
+    pub test_files: Vec<String>,
+    pub coverage_before: f64,
+}
+
+/// Generate tests for a single file inside an isolated worktree.
+///
+/// This is the parallel equivalent of the AI-generation portion of
+/// `generate_tests_for_file`.  It does NOT run tests, commit, stash,
+/// or measure coverage — those happen after results are copied back
+/// to the main tree.  Only one round of generation is performed
+/// (retries are handled at the wave level).
+pub(crate) fn generate_tests_in_worktree(
+    fc: &runner::FileCoverage,
+    wt_path: &std::path::Path,
+    ctx: &ParallelGenContext,
+) -> Result<Option<ParallelFileResult>> {
+    // Skip excluded files
+    if !ctx.coverage_exclude.is_empty() {
+        if ctx.coverage_exclude.iter().any(|pat| {
+            glob::Pattern::new(pat).map(|p| p.matches(&fc.file)).unwrap_or(false)
+        }) {
+            info!("[wt] Skipping excluded file: {}", fc.file);
+            return Ok(None);
+        }
+    }
+
+    if fc.total_lines <= fc.covered_lines {
+        return Ok(None);
+    }
+
+    // Read source from the worktree
+    let full_path = resolve_source_file(wt_path, &fc.file);
+    let source_content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("[wt] Cannot read {} ({}): {} — skipping", fc.file, full_path.display(), e);
+            return Ok(None);
+        }
+    };
+
+    let uncovered_lines: Vec<u32> = fc.uncovered_lines.clone();
+    let use_chunks = uncovered_lines.len() > 15;
+
+    let file_class = runner::classify_source_file(&fc.file, wt_path);
+    let pkg_hint = runner::derive_test_package(&fc.file)
+        .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
+        .unwrap_or_default();
+    let per_file_ctx = build_per_file_context(&ctx.framework_context, &file_class, &pkg_hint);
+
+    // Helper closure: run AI via engine, record usage
+    let run_ai = |step: &str, prompt: &str, tier: &claude::ClaudeTier| -> Result<String> {
+        let invocation = crate::engine::resolve_engine_for_tier(tier, &ctx.engine_routing)?;
+        let tier_timeout = tier.effective_timeout(ctx.claude_timeout);
+        let prompt_floor = ((prompt.len() as u64) / 10 + 120)
+            .min(ctx.claude_timeout.saturating_mul(3));
+        let timeout = tier_timeout.max(prompt_floor);
+
+        let model_label = invocation.model.clone().unwrap_or_else(|| "default".to_string());
+        let engine_kind = invocation.engine_kind.clone();
+
+        let result = crate::engine::run_engine_full(
+            wt_path,
+            prompt,
+            timeout,
+            ctx.skip_permissions,
+            ctx.show_prompts,
+            &invocation,
+        );
+
+        if let Ok(ref out) = result {
+            let (usage, unknown) = match out.usage {
+                Some(u) => (u, false),
+                None => (crate::usage::TokenUsage::default(), true),
+            };
+            ctx.usage_tracker.record(crate::usage::UsageEntry {
+                step: step.to_string(),
+                engine: engine_kind,
+                model: model_label,
+                usage,
+                unknown,
+            });
+        }
+
+        result.map(|o| o.stdout)
+    };
+
+    if use_chunks {
+        // --- Chunked strategy ---
+        let chunks = split_into_method_chunks(&source_content, &uncovered_lines, &fc.file);
+        let total_chunks = chunks.len();
+        info!(
+            "[wt] {} → {} chunks, {} uncovered lines",
+            fc.file, total_chunks, uncovered_lines.len()
+        );
+
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let chunk_idx = ci + 1;
+            let chunk_tier = claude::classify_chunk_test_gen_tier(
+                chunk.uncovered_count,
+                chunk.snippet.lines().count(),
+                &ctx.test_generation,
+            );
+
+            let prompt = claude::build_chunk_test_prompt(
+                &fc.file,
+                &chunk.label,
+                &chunk.snippet,
+                chunk_idx,
+                total_chunks,
+                &ctx.test_framework,
+                &per_file_ctx,
+            );
+
+            info!(
+                "[wt]   Chunk {}/{}: {} — {} uncovered [{}]",
+                chunk_idx, total_chunks, chunk.label, chunk.uncovered_count, chunk_tier
+            );
+            match run_ai("coverage_boost_chunk", &prompt, &chunk_tier) {
+                Ok(_) => {
+                    // Validate: no source files modified
+                    let changed = git::changed_files(wt_path).unwrap_or_default();
+                    let src_modified: Vec<&String> = changed.iter()
+                        .filter(|f| !is_test_file(f) && !is_generated_artifact(f) && !is_internal_file(f))
+                        .collect();
+                    if !src_modified.is_empty() {
+                        warn!("[wt]   Chunk {}/{} modified source: {:?} — reverting", chunk_idx, total_chunks, src_modified);
+                        let _ = git::revert_changes(wt_path);
+                    } else {
+                        let test_files: Vec<String> = changed.iter()
+                            .filter(|f| is_test_file(f) || is_generated_artifact(f))
+                            .cloned()
+                            .collect();
+                        if !test_files.is_empty() {
+                            let refs: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+                            let _ = git::add_files(wt_path, &refs);
+                            let _ = git::revert_changes(wt_path);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[wt]   Chunk {}/{} failed: {} — skipping", chunk_idx, total_chunks, e);
+                    let _ = git::revert_changes(wt_path);
+                }
+            }
+        }
+    } else {
+        // --- Single-prompt strategy ---
+        let uncovered_count = uncovered_lines.len();
+        let covered_count = fc.total_lines.saturating_sub(fc.total_lines - fc.covered_lines);
+        let uncovered_summary = format!(
+            "{:.1}% coverage — {} of {} coverable lines hit, {} uncovered",
+            fc.coverage_pct, covered_count, fc.total_lines, uncovered_count
+        );
+        let uncovered_snippets = extract_uncovered_snippets(&source_content, &uncovered_lines, 80);
+
+        let prompt = claude::build_test_generation_prompt(
+            &fc.file,
+            &uncovered_summary,
+            &uncovered_snippets,
+            &ctx.test_framework,
+            &ctx.test_examples,
+            &per_file_ctx,
+        );
+
+        let test_tier = claude::classify_test_gen_tier(
+            uncovered_count,
+            fc.total_lines as usize,
+            &ctx.test_generation,
+        );
+
+        info!("[wt] {} → single prompt, {} uncovered [{}]", fc.file, uncovered_count, test_tier);
+        match run_ai("coverage_boost", &prompt, &test_tier) {
+            Ok(_) => {
+                info!("[wt] AI completed for {}", fc.file);
+            }
+            Err(e) => {
+                warn!("[wt] AI failed for {}: {}", fc.file, e);
+                let _ = git::revert_changes(wt_path);
+                return Ok(None);
+            }
+        }
+    }
+
+    // Collect test files produced in the worktree
+    // (staged + unstaged — we want everything the AI wrote)
+    let changed = git::changed_files(wt_path).unwrap_or_default();
+    let test_files: Vec<String> = changed.into_iter()
+        .filter(|f| is_test_file(f) || is_generated_artifact(f))
+        .collect();
+
+    // Also check staged files
+    let staged = git::has_staged_changes(wt_path).unwrap_or(false);
+
+    if test_files.is_empty() && !staged {
+        info!("[wt] No test files produced for {}", fc.file);
+        return Ok(None);
+    }
+
+    // Stage everything so `changed_files` picks it up for the copy step
+    if !test_files.is_empty() {
+        let refs: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+        let _ = git::add_files(wt_path, &refs);
+    }
+
+    info!("[wt] {} → {} test file(s) generated", fc.file, test_files.len());
+
+    Ok(Some(ParallelFileResult {
+        file: fc.file.clone(),
+        test_files,
+        coverage_before: fc.coverage_pct,
+    }))
 }

@@ -2,6 +2,8 @@ mod coverage;
 mod dedup;
 mod fix_loop;
 pub(crate) mod helpers;
+mod parallel;
+pub(crate) mod worktree_pool;
 
 use anyhow::{Context, Result};
 use std::time::Instant;
@@ -32,6 +34,8 @@ pub struct Orchestrator {
     pub(crate) engine_routing: crate::engine::EngineRoutingConfig,
     /// Cached test examples (computed once, reused across issues)
     pub(crate) cached_test_examples: Option<String>,
+    /// Token usage tracker — records every AI call with its step label for the end-of-run report.
+    pub(crate) usage_tracker: crate::usage::UsageTracker,
 }
 
 impl Orchestrator {
@@ -82,26 +86,85 @@ impl Orchestrator {
             rule_cache: std::collections::HashMap::new(),
             engine_routing,
             cached_test_examples: None,
+            usage_tracker: crate::usage::UsageTracker::new(),
         })
+    }
+
+    /// Create a lightweight worker Orchestrator for parallel issue processing (US-018).
+    ///
+    /// Shares SonarQube client, rule cache, engine routing, and prompt config with the parent.
+    /// The worker uses a different project path (a git worktree) and a shared usage tracker.
+    pub(crate) fn new_worker(
+        config: ValidatedConfig,
+        client: SonarClient,
+        rule_cache: std::collections::HashMap<String, String>,
+        engine_routing: crate::engine::EngineRoutingConfig,
+        prompt_config: crate::yaml_config::PromptsYaml,
+        cached_test_examples: Option<String>,
+        usage_tracker: crate::usage::UsageTracker,
+    ) -> Self {
+        Self {
+            config,
+            client,
+            results: Vec::new(),
+            total_issues_found: 0,
+            prompt_config,
+            exec_state: None,
+            rule_cache,
+            engine_routing,
+            cached_test_examples,
+            usage_tracker,
+        }
     }
 
     /// Generate a partial report from whatever results are available (US-012).
     /// Called when global timeout is reached or execution is interrupted.
     pub fn generate_partial_report(&self) {
         info!("Generating partial report with {} results so far", self.results.len());
-        report::generate_report(
+        let usage_entries = self.usage_tracker.snapshot();
+        self.print_usage_table(&usage_entries);
+        report::generate_report_with_usage(
             &self.config.path,
             &self.results,
             self.total_issues_found,
             0, // elapsed unknown in timeout case
+            &usage_entries,
         );
     }
 
-    /// Run an AI engine with the given prompt, routing based on the tier.
+    /// Log the token-usage table to the console so the user sees it at the end of the run.
+    fn print_usage_table(&self, entries: &[crate::usage::UsageEntry]) {
+        info!("=== Token usage by step × model ===");
+        let table = crate::usage::render_usage_table(entries);
+        for line in table.lines() {
+            info!("{}", line);
+        }
+    }
+
+    /// Run an AI engine against the main project directory.
+    ///
+    /// Shorthand for `run_ai_at(step, prompt, tier, &self.config.path)`.
+    pub(crate) fn run_ai(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+    ) -> anyhow::Result<String> {
+        self.run_ai_at(step, prompt, tier, &self.config.path)
+    }
+
+    /// Run an AI engine with an explicit `project_path` (may be a worktree).
     ///
     /// Resolves which engine to use from the routing config, computes timeout,
-    /// and dispatches to `engine::run_engine`.
-    pub(crate) fn run_ai(&self, prompt: &str, tier: &claude::ClaudeTier) -> anyhow::Result<String> {
+    /// dispatches to `engine::run_engine_full`, and stores a `UsageEntry` keyed
+    /// by `step` so the end-of-run table can attribute tokens correctly.
+    pub(crate) fn run_ai_at(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+        project_path: &std::path::Path,
+    ) -> anyhow::Result<String> {
         let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
         let tier_timeout = tier.effective_timeout(self.config.claude_timeout);
 
@@ -119,14 +182,36 @@ impl Orchestrator {
             );
         }
 
-        crate::engine::run_engine(
-            &self.config.path,
+        let model_label = invocation.model.clone().unwrap_or_else(|| "default".to_string());
+        let engine_kind = invocation.engine_kind.clone();
+
+        let result = crate::engine::run_engine_full(
+            project_path,
             prompt,
             timeout,
             self.config.dangerously_skip_permissions,
             self.config.show_prompts,
             &invocation,
-        )
+        );
+
+        // Record usage regardless of success — failed calls still cost tokens if the
+        // engine got far enough to report them. On outright spawn/timeout errors the
+        // output has no usage, so we don't record anything in that case.
+        if let Ok(ref out) = result {
+            let (usage, unknown) = match out.usage {
+                Some(u) => (u, false),
+                None => (crate::usage::TokenUsage::default(), true),
+            };
+            self.usage_tracker.record(crate::usage::UsageEntry {
+                step: step.to_string(),
+                engine: engine_kind,
+                model: model_label,
+                usage,
+                unknown,
+            });
+        }
+
+        result.map(|o| o.stdout)
     }
 
     /// Run the full Reparo flow (US-010).
@@ -396,7 +481,7 @@ impl Orchestrator {
         if self.config.skip_coverage {
             info!("=== Step 3b: Coverage boost SKIPPED (--skip-coverage) ===");
         } else if self.config.min_coverage > 0.0 {
-            self.boost_coverage_to_threshold(&test_command)?;
+            self.boost_coverage_to_threshold(&test_command).await?;
         }
 
         // Step 4: Initial SonarQube scan
@@ -499,6 +584,47 @@ impl Orchestrator {
         let original_issue_keys: std::collections::HashSet<String> =
             initial_issues.iter().map(|i| i.key.clone()).collect();
         info!("Tracking {} original issues", original_issue_keys.len());
+
+        // US-018: Parallel mode — dispatch to worktrees
+        if self.config.parallel > 1 && self.config.batch_size <= 1 {
+            info!("=== Parallel mode: {} workers ===", self.config.parallel);
+            self.run_parallel_fix_loop(
+                &initial_issues,
+                &original_issue_keys,
+                &already_processed,
+                max_issues,
+                &test_command,
+            )
+            .await?;
+
+            // Skip sequential loop counters — go straight to post-processing
+            let total_fixed = self.results.iter().filter(|r| matches!(r.status, FixStatus::Fixed)).count();
+            let total_failed = self.results.iter().filter(|r| !matches!(r.status, FixStatus::Fixed | FixStatus::Skipped(_))).count();
+
+            info!(
+                "Processing complete: {} fixed, {} failed/review",
+                total_fixed, total_failed
+            );
+
+            // In parallel mode each issue has its own PR, skip the aggregate PR + dedup + rebase.
+            // Jump to report generation.
+            info!("=== Step 6: Generating report ===");
+            let elapsed = start.elapsed().as_secs();
+            let usage_entries = self.usage_tracker.snapshot();
+            self.print_usage_table(&usage_entries);
+            report::generate_report_with_usage(
+                &self.config.path,
+                &self.results,
+                self.total_issues_found,
+                elapsed,
+                &usage_entries,
+            );
+
+            let exit_code = self.print_summary(elapsed);
+            crate::state::remove_state(&self.config.path);
+
+            return Ok(exit_code);
+        }
 
         let mut total_fixed = 0usize;
         let mut total_failed = 0usize;
@@ -690,7 +816,7 @@ Apply the fix now."#,
                                     truncate(&output, 3000)
                                 );
                                 let repair_tier = claude::classify_repair_tier();
-                                let _ = self.run_ai(&repair_prompt, &repair_tier);
+                                let _ = self.run_ai("final_validation_build_repair", &repair_prompt, &repair_tier);
                                 if let Some(ref fmt_cmd) = self.config.commands.format {
                                     let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
                                 }
@@ -738,7 +864,7 @@ Apply the fix now."#,
                                 truncate(&output, 3000)
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            let _ = self.run_ai(&repair_prompt, &repair_tier);
+                            let _ = self.run_ai("final_validation_test_repair", &repair_prompt, &repair_tier);
                             if let Some(ref fmt_cmd) = self.config.commands.format {
                                 let _ = runner::run_shell_command(&self.config.path, fmt_cmd, "format");
                             }
@@ -776,7 +902,15 @@ Apply the fix now."#,
         // Step 6: Generate report (on the fix branch)
         info!("=== Step 6: Generating report ===");
         let elapsed = start.elapsed().as_secs();
-        report::generate_report(&self.config.path, &self.results, self.total_issues_found, elapsed);
+        let usage_entries = self.usage_tracker.snapshot();
+        self.print_usage_table(&usage_entries);
+        report::generate_report_with_usage(
+            &self.config.path,
+            &self.results,
+            self.total_issues_found,
+            elapsed,
+            &usage_entries,
+        );
 
         // Commit report files to the fix branch
         let _ = git::add_all(&self.config.path);

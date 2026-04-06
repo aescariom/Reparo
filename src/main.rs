@@ -14,6 +14,7 @@ mod runner;
 #[allow(dead_code)]
 mod sonar;
 mod state;
+mod usage;
 mod yaml_config;
 
 use clap::Parser;

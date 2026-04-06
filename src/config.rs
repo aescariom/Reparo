@@ -143,6 +143,17 @@ pub struct Config {
     #[arg(long, env = "REPARO_COVERAGE_COMMIT_BATCH", default_value = "0")]
     pub coverage_commit_batch: u32,
 
+    /// Number of files to process in parallel during coverage boost (1 = sequential).
+    /// Each parallel file gets its own git worktree for isolation.
+    #[arg(long, env = "REPARO_COVERAGE_PARALLEL", default_value = "1")]
+    pub coverage_parallel: u32,
+
+    /// Number of issues to process in parallel using git worktrees (1 = sequential).
+    /// Each parallel issue gets its own worktree, branch, and PR.
+    /// Incompatible with batch_size > 1.
+    #[arg(long, env = "REPARO_PARALLEL", default_value = "1")]
+    pub parallel: u32,
+
     /// Stop coverage boost after N consecutive wave failures (0 = disabled)
     #[arg(long, env = "REPARO_MAX_BOOST_FAILURES", default_value = "5")]
     pub max_boost_failures: usize,
@@ -280,6 +291,10 @@ pub struct ValidatedConfig {
     pub coverage_wave_size: u32,
     /// Files per coverage boost commit (resolved: never 0 at runtime)
     pub coverage_commit_batch: u32,
+    /// Number of files to process in parallel during coverage boost (1 = sequential)
+    pub coverage_parallel: u32,
+    /// Number of issues to fix in parallel using git worktrees (1 = sequential)
+    pub parallel: u32,
     /// Stop coverage boost after N consecutive wave failures (0 = disabled)
     pub max_boost_failures: usize,
     /// Retry failed wave files with error context in per-file fallback
@@ -439,13 +454,66 @@ impl PactConfig {
 }
 
 /// Resolved test generation configuration for framework-aware prompts (US-040).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TestGenerationConfig {
     pub framework: Option<String>,
     pub mock_framework: Option<String>,
     pub assertion_library: Option<String>,
     pub avoid_spring_context: bool,
     pub custom_instructions: Option<String>,
+    /// Resolved model/effort for each test-generation complexity band.
+    pub tiers: TestGenTiers,
+}
+
+impl Default for TestGenerationConfig {
+    fn default() -> Self {
+        Self {
+            framework: None,
+            mock_framework: None,
+            assertion_library: None,
+            avoid_spring_context: false,
+            custom_instructions: None,
+            tiers: TestGenTiers::default(),
+        }
+    }
+}
+
+/// Model/effort pair for a single complexity band.
+#[derive(Debug, Clone)]
+pub struct TierSpec {
+    pub model: String,
+    pub effort: String,
+}
+
+impl TierSpec {
+    pub fn new(model: &str, effort: &str) -> Self {
+        Self { model: model.to_string(), effort: effort.to_string() }
+    }
+}
+
+/// Resolved test-generation tiers: one `TierSpec` per complexity band.
+///
+/// Defaults use haiku for trivial chunks and escalate through sonnet to opus
+/// for the most complex methods.
+#[derive(Debug, Clone)]
+pub struct TestGenTiers {
+    pub trivial: TierSpec,
+    pub low: TierSpec,
+    pub medium: TierSpec,
+    pub high: TierSpec,
+    pub complex: TierSpec,
+}
+
+impl Default for TestGenTiers {
+    fn default() -> Self {
+        Self {
+            trivial:  TierSpec::new("haiku", "low"),
+            low:      TierSpec::new("sonnet", "low"),
+            medium:   TierSpec::new("sonnet", "medium"),
+            high:     TierSpec::new("sonnet", "high"),
+            complex:  TierSpec::new("opus", "high"),
+        }
+    }
 }
 
 /// Which scanner to use and the resolved binary path.
@@ -590,6 +658,16 @@ impl Config {
             } else {
                 self.coverage_commit_batch
             },
+            coverage_parallel: std::cmp::max(1, self.coverage_parallel),
+            parallel: if self.parallel > 1 && self.batch_size > 1 {
+                tracing::warn!(
+                    "--parallel {} ignored: incompatible with --batch-size {} (batch mode is sequential)",
+                    self.parallel, self.batch_size
+                );
+                1
+            } else {
+                std::cmp::max(1, self.parallel)
+            },
             max_boost_failures: self.max_boost_failures,
             retry_failed_wave_files: !self.skip_retry_failed_wave_files,
             skip_final_validation: self.skip_final_validation,
@@ -659,6 +737,9 @@ impl ValidatedConfig {
         }
         if self.min_file_coverage > 0.0 {
             info!("  Min file cov:    {:.0}%", self.min_file_coverage);
+        }
+        if self.parallel > 1 {
+            info!("  Parallel:        {} worktrees", self.parallel);
         }
         self.commands.print_summary();
     }
@@ -881,6 +962,7 @@ mod tests {
             coverage_exclude: vec![],
             coverage_wave_size: 3,
             coverage_commit_batch: 0,
+            coverage_parallel: 1,
             max_boost_failures: 5,
             skip_retry_failed_wave_files: false,
             skip_final_validation: false,
@@ -899,6 +981,7 @@ mod tests {
             restore_personal_yaml: false,
             commit_issue: None,
             test_generation: TestGenerationConfig::default(),
+            parallel: 1,
         }
     }
 

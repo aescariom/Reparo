@@ -92,7 +92,7 @@ impl Orchestrator {
                 info!("Documentation prompt:\n{}", prompt);
             }
 
-            match self.run_ai(&prompt, &tier) {
+            match self.run_ai("documentation", &prompt, &tier) {
                 Ok(_) => {
                     info!("Claude completed documentation for {}", file_path);
                 }
@@ -479,7 +479,7 @@ impl Orchestrator {
         );
         info!("Issue {} classified as tier {} (rule: {}, severity: {})", issue.key, tier, issue.rule, issue.severity);
 
-        let claude_output = match self.run_ai(&prompt, &tier) {
+        let claude_output = match self.run_ai("fix_issue", &prompt, &tier) {
             Ok(output) => output,
             Err(e) => {
                 result.status = FixStatus::Failed(format!("Claude failed: {}", e));
@@ -612,7 +612,7 @@ impl Orchestrator {
                                 &issue.message,
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            match self.run_ai(&repair_prompt, &repair_tier) {
+                            match self.run_ai("fix_build_error", &repair_prompt, &repair_tier) {
                                 Ok(_) => {
                                     info!("Claude applied build fix — retrying...");
                                     continue;
@@ -661,7 +661,7 @@ impl Orchestrator {
                                 &issue.message,
                             );
                             let repair_tier = claude::classify_repair_tier();
-                            match self.run_ai(&repair_prompt, &repair_tier) {
+                            match self.run_ai("fix_test_error", &repair_prompt, &repair_tier) {
                                 Ok(_) => {
                                     // Check Claude didn't modify test files
                                     let repair_changed = git::changed_files(&self.config.path).unwrap_or_default();
@@ -814,7 +814,7 @@ Apply the fixes now."#,
                                 truncate(&output, 3000)
                             );
                             let lint_tier = claude::classify_repair_tier();
-                            match self.run_ai(&lint_prompt, &lint_tier) {
+                            match self.run_ai("fix_lint_error", &lint_prompt, &lint_tier) {
                                 Ok(_) => {
                                     // Format after lint fix
                                     if let Some(ref fmt_cmd) = self.config.commands.format {
@@ -937,7 +937,7 @@ Apply a different fix now."#,
                                         if tier.effort == "low" { "medium" } else { tier.effort },
                                         tier.timeout_multiplier.max(1.0),
                                     );
-                                    match self.run_ai(&retry_prompt, &retry_tier) {
+                                    match self.run_ai("fix_issue_retry", &retry_prompt, &retry_tier) {
                                         Ok(_) => {
                                             info!("Claude applied retry fix — verifying build+tests...");
                                             // Quick build+test check before re-scanning
@@ -1154,8 +1154,8 @@ Apply a different fix now."#,
             };
 
             // Run claude to generate tests
-            let test_tier = claude::classify_test_gen_tier(current_uncovered.len(), file_content.lines().count());
-            match self.run_ai(&prompt, &test_tier) {
+            let test_tier = claude::classify_test_gen_tier(current_uncovered.len(), file_content.lines().count(), &self.config.test_generation.tiers);
+            match self.run_ai("test_generation", &prompt, &test_tier) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 1 {
@@ -1348,7 +1348,7 @@ Apply a different fix now."#,
             // Use a moderate tier for contract test generation
             let tier = claude::classify_contract_test_tier(5); // default estimate
 
-            let claude_result = self.run_ai(&prompt, &tier);
+            let claude_result = self.run_ai("contract_test_generation", &prompt, &tier);
 
             match claude_result {
                 Ok(_output) => {
@@ -1488,7 +1488,7 @@ Apply a different fix now."#,
                 );
 
                 let tier = claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7);
-                match self.run_ai(&prompt, &tier) {
+                match self.run_ai("rebase_conflict", &prompt, &tier) {
                     Ok(_) => {
                         // The AI engine edits files in-place, so we just check the file
                         // no longer has conflict markers
@@ -1681,6 +1681,90 @@ Apply a different fix now."#,
             .collect();
         let severity_refs: Vec<&str> = severity_labels.iter().map(|s| s.as_str()).collect();
         labels.extend(severity_refs);
+
+        git::create_pr(
+            &self.config.path,
+            &title,
+            &body,
+            &self.config.branch,
+            &labels,
+        )
+    }
+
+    /// Create a PR for a single issue (US-018: parallel mode).
+    ///
+    /// Unlike `create_pr()` which batches all results, this creates one PR per issue
+    /// with a focused title and body. Called from the parallel worker after push.
+    pub(crate) fn create_per_issue_pr(
+        &self,
+        result: &IssueResult,
+        branch_name: &str,
+    ) -> Result<String> {
+        // Rebase onto latest base branch to minimize merge conflicts
+        if !self.config.skip_rebase {
+            if let Err(e) = self.rebase_on_latest_base() {
+                warn!("Pre-push rebase failed: {} — pushing without rebase", e);
+            }
+        }
+
+        // Push with retry
+        let path = self.config.path.clone();
+        let branch = branch_name.to_string();
+        crate::retry::retry_sync(3, 3, "git push", || {
+            git::push(&path, &branch)
+        })?;
+
+        // Title
+        let title = format!(
+            "[SonarQube] Fix {} {}: {}",
+            result.severity,
+            result.issue_type.to_lowercase(),
+            truncate(&result.message, 50),
+        );
+
+        // Body
+        let issue_url = format!(
+            "{}/project/issues?id={}&open={}",
+            self.config.sonar_url, self.config.sonar_project_id, result.issue_key,
+        );
+        let mut body = String::from("## Summary\n\n");
+        body.push_str(&format!(
+            "Automated fix for SonarQube issue [{}]({}).\n\n",
+            result.issue_key, issue_url,
+        ));
+        body.push_str(&format!(
+            "| Field | Value |\n|-------|-------|\n\
+             | **Rule** | `{}` |\n\
+             | **Severity** | {} |\n\
+             | **Type** | {} |\n\
+             | **File** | `{}:{}` |\n\n",
+            result.rule, result.severity, result.issue_type, result.file, result.lines,
+        ));
+
+        if !result.change_description.is_empty() {
+            body.push_str(&format!("### Changes\n\n{}\n\n", result.change_description));
+        }
+
+        if !result.tests_added.is_empty() {
+            body.push_str("### Tests added\n\n");
+            for t in &result.tests_added {
+                body.push_str(&format!("- `{}`\n", t));
+            }
+            body.push('\n');
+        }
+
+        if let Some(ref diff) = result.diff_summary {
+            body.push_str(&format!("### Diff\n\n{}\n\n", diff));
+        }
+
+        body.push_str("## Test plan\n\n");
+        body.push_str("- [x] All existing tests pass (verified by Reparo)\n");
+        body.push_str("- [ ] SonarQube re-scan confirms issue resolved\n");
+        body.push_str("- [ ] Code review approved\n\n");
+        body.push_str("Generated with [Reparo](https://github.com/reparo) using Claude\n");
+
+        let severity_label = result.severity.to_lowercase();
+        let labels: Vec<&str> = vec!["sonar-fix", "automated", &severity_label];
 
         git::create_pr(
             &self.config.path,
