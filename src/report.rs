@@ -28,7 +28,11 @@ pub enum FixStatus {
     Fixed,
     NeedsReview(String), // reason
     Failed(String),       // error
-    Skipped(String),      // reason
+    Skipped(String),      // reason (already processed)
+    /// Fix was NOT attempted: pre-fix risk assessment determined this issue has
+    /// cross-cutting impact (e.g., enabling CSRF requires frontend changes).
+    /// The string is a human-readable explanation.
+    RiskSkipped(String),
 }
 
 /// Append an entry to TECHDEBT_CHANGELOG.md (US-013).
@@ -52,6 +56,7 @@ pub fn append_changelog(project_path: &Path, result: &IssueResult) {
         FixStatus::NeedsReview(reason) => format!("NEEDS_REVIEW - {}", reason),
         FixStatus::Failed(err) => format!("FAILED - {}", err),
         FixStatus::Skipped(reason) => format!("SKIPPED - {}", reason),
+        FixStatus::RiskSkipped(reason) => format!("RISK_SKIPPED - {}", reason),
     };
 
     // -- Tests added with count --
@@ -74,9 +79,16 @@ pub fn append_changelog(project_path: &Path, result: &IssueResult) {
         None => String::new(),
     };
 
+    // Tag each entry with its origin so readers can filter at a glance.
+    let origin_tag = if result.rule.starts_with("lint:") {
+        "[lint]"
+    } else {
+        "[sonar]"
+    };
+
     let entry = format!(
         r#"
-## [{now}] {key} - {severity} {issue_type}
+## [{now}] {origin} {key} - {severity} {issue_type}
 - **Rule**: `{rule}` - {message}
 - **Files**: `{file}:{lines}`
 - **Change**: {change}
@@ -85,6 +97,7 @@ pub fn append_changelog(project_path: &Path, result: &IssueResult) {
 {pr}---
 "#,
         now = now,
+        origin = origin_tag,
         key = result.issue_key,
         severity = result.severity,
         issue_type = result.issue_type,
@@ -212,27 +225,62 @@ pub fn append_review_needed(
     let _ = fs::write(&review_path, content);
 }
 
+/// Append to REVIEW_NEEDED.md for issues skipped by the pre-fix risk assessment.
+///
+/// Unlike `append_review_needed` (which is for post-fix failures), this logs
+/// issues that were never attempted because the risk assessment determined they
+/// have cross-cutting impact (e.g., enabling CSRF requires frontend changes).
+pub fn append_risk_skipped(
+    project_path: &Path,
+    result: &IssueResult,
+    risk_reason: &str,
+    suggested_action: &str,
+) {
+    let review_path = project_path.join("REVIEW_NEEDED.md");
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+
+    let entry = format!(
+        r#"
+## [{now}] {key} - {severity} {issue_type} ⚠️ RISK SKIPPED
+- **Rule**: {rule}
+- **Message**: {message}
+- **File**: `{file}:{lines}`
+- **Status**: Fix was NOT attempted — cross-cutting impact detected
+- **Risk reason**: {reason}
+- **Suggested action**: {action}
+---
+"#,
+        now = now,
+        key = result.issue_key,
+        severity = result.severity,
+        issue_type = result.issue_type,
+        rule = result.rule,
+        message = result.message,
+        file = result.file,
+        lines = result.lines,
+        reason = risk_reason,
+        action = suggested_action,
+    );
+
+    if !review_path.exists() {
+        let header = "# Issues Needing Manual Review\n\nThese SonarQube issues could not be automatically fixed because the fix would require modifying existing tests.\n";
+        let _ = fs::write(&review_path, header);
+    }
+
+    let mut content = fs::read_to_string(&review_path).unwrap_or_default();
+    content.push_str(&entry);
+    let _ = fs::write(&review_path, content);
+}
+
 /// Generate the final REPORT.md (US-011).
 ///
-/// Backward-compat wrapper without usage data. New code should call
-/// `generate_report_with_usage` to include the token-cost table.
-#[allow(dead_code)]
+/// Token usage is no longer rendered here — the execution log (SQLite) is the
+/// authoritative source and produces its own markdown summary in `.reparo/`.
 pub fn generate_report(
     project_path: &Path,
     results: &[IssueResult],
     total_issues_found: usize,
     elapsed_secs: u64,
-) {
-    generate_report_with_usage(project_path, results, total_issues_found, elapsed_secs, &[]);
-}
-
-/// Generate the final REPORT.md with a token-usage section.
-pub fn generate_report_with_usage(
-    project_path: &Path,
-    results: &[IssueResult],
-    total_issues_found: usize,
-    elapsed_secs: u64,
-    usage_entries: &[crate::usage::UsageEntry],
 ) {
     let report_path = project_path.join("REPORT.md");
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
@@ -242,6 +290,7 @@ pub fn generate_report_with_usage(
     let needs_review = results.iter().filter(|r| matches!(r.status, FixStatus::NeedsReview(_))).count();
     let failed = results.iter().filter(|r| matches!(r.status, FixStatus::Failed(_))).count();
     let skipped = results.iter().filter(|r| matches!(r.status, FixStatus::Skipped(_))).count();
+    let risk_skipped = results.iter().filter(|r| matches!(r.status, FixStatus::RiskSkipped(_))).count();
     let not_processed = total_issues_found.saturating_sub(processed);
     let total_tests: usize = results.iter().map(|r| r.tests_added.len()).sum();
 
@@ -263,11 +312,34 @@ pub fn generate_report_with_usage(
     let _ = writeln!(report, "| Metric | Count |");
     let _ = writeln!(report, "|--------|------:|");
     let _ = writeln!(report, "| Total issues found | {} |", total_issues_found);
+    // Break down the processed pile by origin so users see at a glance how
+    // much came from the local linter vs SonarQube.
+    let lint_fixed = results
+        .iter()
+        .filter(|r| matches!(r.status, FixStatus::Fixed) && r.rule.starts_with("lint:"))
+        .count();
+    let sonar_fixed = fixed.saturating_sub(lint_fixed);
+    let lint_processed = results
+        .iter()
+        .filter(|r| r.rule.starts_with("lint:"))
+        .count();
+    let sonar_processed = processed.saturating_sub(lint_processed);
     let _ = writeln!(report, "| Issues processed | {} |", processed);
+    if lint_processed > 0 {
+        let _ = writeln!(report, "| &nbsp;&nbsp;…from SonarQube | {} |", sonar_processed);
+        let _ = writeln!(report, "| &nbsp;&nbsp;…from local linter | {} |", lint_processed);
+    }
     let _ = writeln!(report, "| Fixed | {} |", fixed);
+    if lint_processed > 0 {
+        let _ = writeln!(report, "| &nbsp;&nbsp;…sonar fixes | {} |", sonar_fixed);
+        let _ = writeln!(report, "| &nbsp;&nbsp;…linter fixes | {} |", lint_fixed);
+    }
     let _ = writeln!(report, "| Needs manual review | {} |", needs_review);
     let _ = writeln!(report, "| Failed | {} |", failed);
     let _ = writeln!(report, "| Skipped (already processed) | {} |", skipped);
+    if risk_skipped > 0 {
+        let _ = writeln!(report, "| Risk skipped (cross-cutting impact) | {} |", risk_skipped);
+    }
     if not_processed > 0 {
         let _ = writeln!(report, "| **Not processed** | **{}** |", not_processed);
     }
@@ -312,6 +384,30 @@ pub fn generate_report_with_usage(
         }
     }
 
+    // -- Risk Skipped --
+    if risk_skipped > 0 {
+        let _ = writeln!(report, "\n## Risk Skipped (Cross-Cutting Impact)\n");
+        let _ = writeln!(
+            report,
+            "These issues were **not attempted** because the pre-fix risk assessment determined \
+             they require coordinated changes across multiple system layers. \
+             See [`REVIEW_NEEDED.md`](REVIEW_NEEDED.md) for details and suggested actions.\n"
+        );
+        let _ = writeln!(report, "| Issue | Severity | Type | File | Rule | Reason |");
+        let _ = writeln!(report, "|-------|----------|------|------|------|--------|");
+        for r in results.iter().filter(|r| matches!(r.status, FixStatus::RiskSkipped(_))) {
+            let reason = match &r.status {
+                FixStatus::RiskSkipped(s) => s.clone(),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                report,
+                "| {} | {} | {} | `{}` | `{}` | {} |",
+                r.issue_key, r.severity, r.issue_type, r.file, r.rule, reason
+            );
+        }
+    }
+
     // -- Failed --
     if failed > 0 {
         let _ = writeln!(report, "\n## Failed\n");
@@ -345,8 +441,8 @@ pub fn generate_report_with_usage(
 
     // By severity
     let _ = writeln!(report, "### By severity\n");
-    let _ = writeln!(report, "| Severity | Fixed | Review | Failed | Skipped |");
-    let _ = writeln!(report, "|----------|------:|-------:|-------:|--------:|");
+    let _ = writeln!(report, "| Severity | Fixed | Review | Failed | Skipped | Risk Skipped |");
+    let _ = writeln!(report, "|----------|------:|-------:|-------:|--------:|-------------:|");
     for sev in &["BLOCKER", "CRITICAL", "MAJOR", "MINOR", "INFO"] {
         let sev_results: Vec<&IssueResult> = results.iter().filter(|r| r.severity == *sev).collect();
         if sev_results.is_empty() {
@@ -356,13 +452,14 @@ pub fn generate_report_with_usage(
         let sr = sev_results.iter().filter(|r| matches!(r.status, FixStatus::NeedsReview(_))).count();
         let sfa = sev_results.iter().filter(|r| matches!(r.status, FixStatus::Failed(_))).count();
         let ss = sev_results.iter().filter(|r| matches!(r.status, FixStatus::Skipped(_))).count();
-        let _ = writeln!(report, "| {} | {} | {} | {} | {} |", sev, sf, sr, sfa, ss);
+        let srs = sev_results.iter().filter(|r| matches!(r.status, FixStatus::RiskSkipped(_))).count();
+        let _ = writeln!(report, "| {} | {} | {} | {} | {} | {} |", sev, sf, sr, sfa, ss, srs);
     }
 
     // By type
     let _ = writeln!(report, "\n### By type\n");
-    let _ = writeln!(report, "| Type | Fixed | Review | Failed | Skipped |");
-    let _ = writeln!(report, "|------|------:|-------:|-------:|--------:|");
+    let _ = writeln!(report, "| Type | Fixed | Review | Failed | Skipped | Risk Skipped |");
+    let _ = writeln!(report, "|------|------:|-------:|-------:|--------:|-------------:|");
     for typ in &["BUG", "VULNERABILITY", "SECURITY_HOTSPOT", "CODE_SMELL"] {
         let type_results: Vec<&IssueResult> = results.iter().filter(|r| r.issue_type == *typ).collect();
         if type_results.is_empty() {
@@ -372,7 +469,8 @@ pub fn generate_report_with_usage(
         let tr = type_results.iter().filter(|r| matches!(r.status, FixStatus::NeedsReview(_))).count();
         let tfa = type_results.iter().filter(|r| matches!(r.status, FixStatus::Failed(_))).count();
         let ts = type_results.iter().filter(|r| matches!(r.status, FixStatus::Skipped(_))).count();
-        let _ = writeln!(report, "| {} | {} | {} | {} | {} |", typ, tf, tr, tfa, ts);
+        let trs = type_results.iter().filter(|r| matches!(r.status, FixStatus::RiskSkipped(_))).count();
+        let _ = writeln!(report, "| {} | {} | {} | {} | {} | {} |", typ, tf, tr, tfa, ts, trs);
     }
 
     // Tests generated
@@ -393,19 +491,11 @@ pub fn generate_report_with_usage(
         }
     }
 
-    // -- Token usage by step × model --
-    if !usage_entries.is_empty() {
-        let _ = writeln!(report, "\n## Token usage by step and model\n");
-        let _ = writeln!(
-            report,
-            "Aggregated token counts for every AI call made during this run, \
-             broken down by workflow step and model. `Unknown` counts calls where \
-             the engine did not report usage (parsing best-effort per engine)."
-        );
-        let _ = writeln!(report);
-        let table = crate::usage::render_usage_table(usage_entries);
-        report.push_str(&table);
-    }
+    let _ = writeln!(
+        report,
+        "\n> Detailed token usage and per-phase metrics are stored in the execution log \
+         (see `.reparo/execution_*.md` and `~/.reparo/executions.db`)."
+    );
 
     let _ = writeln!(report, "\n---\n*Generated by [Reparo](https://github.com/reparo)*");
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -76,23 +76,9 @@ pub fn create_branch_in_worktree(
     branch_name: &str,
     base_ref: &str,
 ) -> Result<()> {
-    // Reset to the base ref so the worktree starts from the right commit
-    let status = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["checkout", base_ref, "--"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .context("Failed to checkout base ref in worktree")?;
-    if !status.success() {
-        anyhow::bail!(
-            "Failed to checkout {} in worktree {}",
-            base_ref,
-            worktree_path.display()
-        );
-    }
-
-    // Delete branch if it already exists (idempotency)
+    // Delete any stale branch with the same name (idempotency).
+    // Safe because acquired worktrees are always in detached HEAD (see clean_worktree),
+    // so the branch is never checked out here.
     let _ = Command::new("git")
         .current_dir(worktree_path)
         .args(["branch", "-D", branch_name])
@@ -100,18 +86,26 @@ pub fn create_branch_in_worktree(
         .stderr(std::process::Stdio::piped())
         .output();
 
-    let status = Command::new("git")
+    // `checkout -B <new> <base>` creates (or resets) `new` at `base`'s commit and
+    // switches to `new`. Crucially, `base` is treated as a commit ref, not a
+    // branch to switch to — so this works even when `base` is checked out in
+    // another worktree (the main tree, or a stale worktree from a crashed run).
+    // A plain `git checkout <base>` would fail in that case with
+    // "fatal: '<base>' is already checked out at ...".
+    let out = Command::new("git")
         .current_dir(worktree_path)
-        .args(["checkout", "-b", branch_name])
-        .stdout(std::process::Stdio::piped())
+        .args(["checkout", "-B", branch_name, base_ref])
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .context("Failed to create branch in worktree")?;
-    if !status.success() {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!(
-            "Failed to create branch {} in worktree {}",
+            "Failed to create branch {} from {} in worktree {}: {}",
             branch_name,
-            worktree_path.display()
+            base_ref,
+            worktree_path.display(),
+            stderr.trim()
         );
     }
 
@@ -127,29 +121,22 @@ pub fn create_branch_in_worktree(
 ///
 /// Reverts all changes, removes untracked files, and detaches HEAD.
 pub fn clean_worktree(worktree_path: &Path) -> Result<()> {
-    // Revert tracked changes
+    // Use `.output()` (drains pipes) rather than `.status()` with `Stdio::piped()`
+    // (creates pipes but never drains). Any of these commands can emit enough
+    // output — especially `git clean -fd` listing many removed files — to fill
+    // the pipe buffer and deadlock a worker for hours in parallel mode.
     let _ = Command::new("git")
         .current_dir(worktree_path)
         .args(["checkout", "--", "."])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status();
-
-    // Remove untracked files
+        .output();
     let _ = Command::new("git")
         .current_dir(worktree_path)
         .args(["clean", "-fd"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status();
-
-    // Detach HEAD
+        .output();
     let _ = Command::new("git")
         .current_dir(worktree_path)
         .args(["checkout", "--detach"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status();
+        .output();
 
     Ok(())
 }
@@ -381,22 +368,46 @@ pub fn reset_index(project_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Revert all uncommitted changes in the working directory
+/// Revert all uncommitted changes in the working directory.
+///
+/// Uses `.output()` (not `.status()`) for both subprocesses for two reasons:
+///   1. `.output()` defaults stdin to `Stdio::null()`, so nothing in git's chain
+///      (hooks, credential helpers, GPG) can silently block on a tty read.
+///   2. stdout/stderr are drained into buffers rather than inherited, avoiding
+///      pipe-buffer deadlocks on very large `git clean -fd` listings (hundreds
+///      of thousands of files under `target/` in Maven projects, for example).
+///
+/// Tracing brackets the whole call so any hang lands between a visible
+/// "revert: start" and "revert: complete" pair.
 pub fn revert_changes(project_path: &Path) -> Result<()> {
-    let status = Command::new("git")
+    tracing::debug!("revert: git checkout . in {}", project_path.display());
+    let checkout = Command::new("git")
         .current_dir(project_path)
         .args(["checkout", "."])
-        .status()
+        .output()
         .context("Failed to revert changes")?;
+    if !checkout.stdout.is_empty() {
+        // Preserve the familiar "Updated N paths from the index" log line.
+        let s = String::from_utf8_lossy(&checkout.stdout);
+        for line in s.lines() {
+            if !line.is_empty() {
+                info!("git checkout: {}", line);
+            }
+        }
+    }
 
-    // Also clean untracked files that might have been created (new test files)
+    tracing::debug!("revert: git clean -fd in {}", project_path.display());
     let _ = Command::new("git")
         .current_dir(project_path)
         .args(["clean", "-fd"])
-        .status();
+        .output();
+    tracing::debug!("revert: complete");
 
-    if !status.success() {
-        anyhow::bail!("Failed to revert changes");
+    if !checkout.status.success() {
+        anyhow::bail!(
+            "Failed to revert changes: {}",
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -769,18 +780,17 @@ pub fn stash_indices_matching(project_path: &Path, prefix: &str) -> Result<Vec<u
 /// The worktree shares `.git/objects` with the main repo, so creation is fast
 /// and storage is lightweight. The detached HEAD avoids branch name conflicts.
 pub fn worktree_add(project_path: &Path, worktree_path: &Path) -> Result<()> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .current_dir(project_path)
         .args(["worktree", "add", "--detach"])
         .arg(worktree_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .context("Failed to run git worktree add")?;
-    if !status.success() {
+    if !out.status.success() {
         anyhow::bail!(
-            "git worktree add failed for {}",
-            worktree_path.display()
+            "git worktree add failed for {}: {}",
+            worktree_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
@@ -792,9 +802,7 @@ pub fn worktree_remove(project_path: &Path, worktree_path: &Path) -> Result<()> 
         .current_dir(project_path)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status();
+        .output();
     // Best-effort: also remove the directory if git didn't clean it
     let _ = std::fs::remove_dir_all(worktree_path);
     Ok(())
@@ -843,13 +851,63 @@ pub fn subdir_in_worktree(project_path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Return commit SHAs (oldest first) reachable from HEAD but not from `base`.
+///
+/// Used after a worktree finishes a fix to collect the commits to cherry-pick
+/// back onto the main batch branch.
+pub fn get_commits_since(path: &Path, base: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["log", "--format=%H", "--reverse", &format!("{}..HEAD", base)])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("git log failed")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git log failed: {}", stderr);
+    }
+    let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(shas)
+}
+
+/// Cherry-pick a single commit onto HEAD.
+///
+/// On failure the cherry-pick is automatically aborted so the working tree is
+/// left clean for subsequent operations.
+pub fn cherry_pick(path: &Path, sha: &str) -> Result<()> {
+    // `.output()` (not `.status()`) so stdout/stderr are drained — otherwise
+    // a cherry-pick with enough output (large diff, conflict messages) fills
+    // the 64KB pipe buffer and git blocks on write forever.
+    let out = Command::new("git")
+        .current_dir(path)
+        .args(["cherry-pick", "--allow-empty", sha])
+        .output()
+        .context("git cherry-pick failed to spawn")?;
+    if !out.status.success() {
+        // Abort so the tree is clean
+        let _ = Command::new("git")
+            .current_dir(path)
+            .args(["cherry-pick", "--abort"])
+            .output();
+        bail!(
+            "cherry-pick {} failed: {}",
+            sha,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn worktree_prune(project_path: &Path) -> Result<()> {
     let _ = Command::new("git")
         .current_dir(project_path)
         .args(["worktree", "prune"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status();
+        .output();
     Ok(())
 }
 

@@ -222,19 +222,53 @@ impl Orchestrator {
         let total_lines = file_content.lines().count() as u32;
         let (start_line, end_line) = match &issue.text_range {
             Some(tr) if tr.start_line == tr.end_line => {
-                // Single-line range (e.g. function signature for cognitive complexity).
-                // Expand to cover from that line to end of file so the coverage
-                // check includes the full function body.
-                (tr.start_line, total_lines)
+                // Single-line range (e.g. function signature for cognitive
+                // complexity). Scope to the enclosing method so we don't
+                // wrongly attribute coverage of unrelated later methods to
+                // this issue. Falls back to EOF if no method boundary is
+                // detected (e.g. class-level code or unsupported language).
+                enclosing_method_range(&file_content, &file_path, tr.start_line)
+                    .unwrap_or((tr.start_line, total_lines))
             }
             Some(tr) => (tr.start_line, tr.end_line),
             None => (1, total_lines),
         };
 
-        // Step A: Check line-level coverage and generate tests if needed (US-004)
-        // Skip coverage for non-coverable files (CSS, HTML, assets, etc.)
+        // Step A-0: Pre-fix risk assessment — skip issues with cross-cutting impact
+        // (e.g., enabling CSRF protection requires coordinated frontend changes).
+        if let Some(assessment) = crate::orchestrator::risk_assessment::assess_fix_risk(
+            issue,
+            &self.config.risk_assessment,
+            &self.config.path,
+            &file_content,
+            self.config.claude_timeout,
+            self.config.dangerously_skip_permissions,
+            self.config.show_prompts,
+        ) {
+            warn!(
+                "Skipping {} ({}): risk assessment — {}",
+                issue.key, issue.rule, assessment.reason
+            );
+            result.status = FixStatus::RiskSkipped(assessment.reason.clone());
+            report::append_risk_skipped(
+                &self.config.path,
+                &result,
+                &assessment.reason,
+                &assessment.suggested_action,
+            );
+            return result;
+        }
+
+        // Step A: Check line-level coverage and generate tests if needed (US-004).
+        // Skip coverage for:
+        //   - non-coverable files (CSS, HTML, assets) — nothing to instrument
+        //   - test files themselves — they ARE tests; JaCoCo doesn't instrument
+        //     `src/test/**`, so SonarQube reports 0% and we'd try to generate
+        //     tests for tests (nonsensical). Just fix the bug in the test.
         if is_non_coverable_file(&file_path) {
             info!("Skipping coverage check for non-coverable file: {}", file_path);
+        } else if is_test_file(&file_path) {
+            info!("Skipping coverage check for test file: {} (test files aren't coverage-instrumented)", file_path);
         } else if !test_command.is_empty() {
             let cov_result = self
                 .check_coverage(&issue.component, &file_path, start_line, end_line)
@@ -479,7 +513,7 @@ impl Orchestrator {
         );
         info!("Issue {} classified as tier {} (rule: {}, severity: {})", issue.key, tier, issue.rule, issue.severity);
 
-        let claude_output = match self.run_ai("fix_issue", &prompt, &tier) {
+        let claude_output = match self.run_ai_lean("fix_issue", &prompt, &tier) {
             Ok(output) => output,
             Err(e) => {
                 result.status = FixStatus::Failed(format!("Claude failed: {}", e));
@@ -502,48 +536,65 @@ impl Orchestrator {
         // Log which files were changed
         info!("Files changed by fix: {:?}", changed);
 
-        // Check if Claude modified test files — revert ONLY the test changes, keep source changes
-        let modified_test_files: Vec<String> = changed.iter().filter(|f| is_test_file(f)).cloned().collect();
-        if !modified_test_files.is_empty() {
+        // Scope guard: the issue's scope determines which files may be modified.
+        //   - Issue in a SOURCE file → tests are off-limits (don't game the suite)
+        //   - Issue in a TEST file   → source files are off-limits (out of scope)
+        // We never let a single fix touch both scopes.
+        let issue_in_test_file = is_test_file(&file_path);
+        let (out_of_scope, scope_label, in_scope_label): (Vec<String>, &str, &str) = if issue_in_test_file {
+            (
+                changed.iter().filter(|f| !is_test_file(f) && !is_internal_file(f)).cloned().collect(),
+                "source",
+                "test",
+            )
+        } else {
+            (
+                changed.iter().filter(|f| is_test_file(f)).cloned().collect(),
+                "test",
+                "source",
+            )
+        };
+        if !out_of_scope.is_empty() {
             warn!(
-                "Claude modified test file(s) {:?} — reverting test changes only, keeping source fix",
-                modified_test_files
+                "Issue is in a {} file — reverting out-of-scope {} file(s) {:?}, keeping {} fix",
+                in_scope_label, scope_label, out_of_scope, in_scope_label
             );
-            // Revert only the test files, keep source changes
-            for test_file in &modified_test_files {
+            for off in &out_of_scope {
                 let checkout_result = std::process::Command::new("git")
                     .current_dir(&self.config.path)
-                    .args(["checkout", "HEAD", "--", test_file])
+                    .args(["checkout", "HEAD", "--", off])
                     .status();
                 match checkout_result {
                     Ok(s) if s.success() => {
-                        info!("Reverted test file: {}", test_file);
+                        info!("Reverted out-of-scope file: {}", off);
                     }
                     _ => {
                         // File might be newly created (untracked) — remove it
-                        let abs_path = self.config.path.join(test_file);
+                        let abs_path = self.config.path.join(off);
                         if abs_path.exists() {
                             let _ = std::fs::remove_file(&abs_path);
-                            info!("Removed new test file: {}", test_file);
+                            info!("Removed new out-of-scope file: {}", off);
                         }
                     }
                 }
             }
 
-            // Re-check if any source changes remain after reverting test files
+            // Re-check if any in-scope changes remain after the revert
             let remaining = git::changed_files(&self.config.path).unwrap_or_default();
-            let source_changes: Vec<String> = remaining
-                .into_iter()
-                .filter(|f| !is_test_file(f) && !is_internal_file(f))
-                .collect();
-            if source_changes.is_empty() {
-                result.status = FixStatus::Failed(
-                    "Claude only modified test files — no source fix applied".to_string(),
-                );
+            let in_scope_changes: Vec<String> = if issue_in_test_file {
+                remaining.into_iter().filter(|f| is_test_file(f) && !is_internal_file(f)).collect()
+            } else {
+                remaining.into_iter().filter(|f| !is_test_file(f) && !is_internal_file(f)).collect()
+            };
+            if in_scope_changes.is_empty() {
+                result.status = FixStatus::Failed(format!(
+                    "Claude only modified out-of-scope {} files — no {} fix applied",
+                    scope_label, in_scope_label
+                ));
                 let _ = git::revert_changes(&self.config.path);
                 return result;
             }
-            info!("Keeping source changes: {:?}", source_changes);
+            info!("Keeping in-scope ({}) changes: {:?}", in_scope_label, in_scope_changes);
         }
 
         // Revert any changes to protected config files (package.json, tsconfig.json, etc.)
@@ -611,8 +662,17 @@ impl Orchestrator {
                                 &file_path,
                                 &issue.message,
                             );
-                            let repair_tier = claude::classify_repair_tier();
-                            match self.run_ai("fix_build_error", &repair_prompt, &repair_tier) {
+                            // Progressive escalation — same ladder as test repair.
+                            let repair_tier = match fix_attempt {
+                                1 => claude::classify_repair_tier(),
+                                2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+                                _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
+                            };
+                            info!(
+                                "Build-repair tier for {} (attempt {}/{}): {}:{}",
+                                issue.key, fix_attempt, max_fix_attempts, repair_tier.model, repair_tier.effort
+                            );
+                            match self.run_ai_lean("fix_build_error", &repair_prompt, &repair_tier) {
                                 Ok(_) => {
                                     info!("Claude applied build fix — retrying...");
                                     continue;
@@ -640,8 +700,156 @@ impl Orchestrator {
                 }
             }
 
-            // Validate tests — tests MUST NOT be modified
+            // Validate tests — tests MUST NOT be modified.
+            // Strategy: run a targeted Surefire filter first (5-15s) to catch
+            // obvious breakage fast; if targeted passes, run the full suite
+            // for confirmation so we still catch cross-class regressions.
             if !test_command.is_empty() {
+                // Try targeted tests first if enabled and we can derive a filter.
+                //
+                // We derive from the issue's own file_path plus Claude's changelist.
+                // `file_path` guarantees a Java candidate even if scope guards pruned
+                // `changed` down to non-Java paths, so every fix gets at least one
+                // targeted test class.
+                if self.config.targeted_tests_first {
+                    let mut filter_inputs: Vec<String> = Vec::with_capacity(changed.len() + 1);
+                    filter_inputs.push(file_path.clone());
+                    filter_inputs.extend(changed.iter().cloned());
+                    if let Some(filter) = runner::derive_surefire_filter(&filter_inputs) {
+                        match runner::run_targeted_tests(&self.config.path, test_command, &filter) {
+                            Ok(res) if !res.ran_any => {
+                                // Unsupported runner or no tests matched — fall through to full suite
+                            }
+                            Ok(res) if !res.success => {
+                                // Targeted failure is decisive — skip the full suite run
+                                warn!(
+                                    "Targeted tests fail after fix for {} (attempt {}) — skipping full suite, going to repair",
+                                    issue.key, fix_attempt
+                                );
+                                let output = res.output;
+                                let mut repair_applied = false;
+                                if fix_attempt < max_fix_attempts {
+                                    info!("Asking Claude to fix the test failure (without modifying tests)...");
+                                    let repair_prompt = claude::build_fix_error_prompt(
+                                        "test",
+                                        &truncate(&output, 1000),
+                                        &file_path,
+                                        &issue.message,
+                                    );
+                                    // Progressive escalation: haiku for the first repair (most
+                                    // test failures are shallow — wrong signature, missing stub,
+                                    // off-by-one), sonnet:medium for the second, sonnet:high for
+                                    // the last retry before we give up. Only the sonar-rescan
+                                    // retry loop reaches opus, and only after these cheaper
+                                    // attempts have verifiably failed.
+                                    let repair_tier = match fix_attempt {
+                                        1 => claude::classify_test_repair_tier(),
+                                        2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+                                        _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
+                                    };
+                                    info!(
+                                        "Test-repair tier for {} (attempt {}/{}): {}:{}",
+                                        issue.key,
+                                        fix_attempt,
+                                        max_fix_attempts,
+                                        repair_tier.model,
+                                        repair_tier.effort
+                                    );
+                                    match self.run_ai_lean("fix_test_error", &repair_prompt, &repair_tier) {
+                                        Ok(_) => {
+                                            // Scope guard during repair: if issue is in source file,
+                                            // tests are off-limits; if issue is in test file, only the
+                                            // issue's own test file may be modified — other tests are off-limits.
+                                            let repair_changed = git::changed_files(&self.config.path).unwrap_or_default();
+                                            let off_limits: Vec<_> = repair_changed.iter().filter(|f| {
+                                                if issue_in_test_file {
+                                                    is_test_file(f) && f.as_str() != file_path.as_str()
+                                                } else {
+                                                    is_test_file(f)
+                                                }
+                                            }).collect();
+                                            if !off_limits.is_empty() {
+                                                warn!("Claude modified out-of-scope file(s) during repair: {:?} — reverting repair", off_limits);
+                                                let _ = git::revert_changes(&self.config.path);
+                                            } else {
+                                                info!("Claude applied repair — retrying...");
+                                                repair_applied = true;
+                                            }
+                                        }
+                                        Err(e) => warn!("Claude failed to fix tests: {}", e),
+                                    }
+                                }
+                                if repair_applied {
+                                    continue;
+                                }
+                                // No retries left, AI errored, or scope-violation revert —
+                                // the broken fix must not be committed. Revert and fail
+                                // the issue inline (mirror of the full-suite final-failure
+                                // branch below), so the next pre-fix build check finds a
+                                // clean tree.
+                                let failing_tests = parse_failing_tests(&output);
+                                let failure_analysis = analyze_test_failure(
+                                    &issue.rule,
+                                    &issue.message,
+                                    &result.change_description,
+                                    &failing_tests,
+                                    &output,
+                                );
+                                info!("Failing tests: {:?}", failing_tests);
+                                info!("Failure analysis: {}", failure_analysis.reason);
+                                info!("Reverting working tree for {}", issue.key);
+                                let _ = git::revert_changes(&self.config.path);
+                                info!("Revert complete for {}, writing REVIEW_NEEDED entry", issue.key);
+                                result.status = FixStatus::NeedsReview(format!(
+                                    "Fix causes targeted test failure(s) after {} attempts. {}",
+                                    fix_attempt, failure_analysis.reason,
+                                ));
+                                report::append_review_needed(
+                                    &self.config.path,
+                                    &result,
+                                    &failing_tests,
+                                    &failure_analysis,
+                                    &output,
+                                );
+                                info!("Returning NeedsReview for {} (targeted tests failed)", issue.key);
+                                return result;
+                            }
+                            Ok(_) => {
+                                // Targeted tests passed. In batch mode the full suite runs
+                                // once at the batch boundary (see mod.rs squash block), so
+                                // we skip it here — targeted is enough for per-fix verification.
+                                if self.config.batch_size != 1 {
+                                    info!(
+                                        "Targeted tests pass — deferring full suite to batch boundary (batch_size={})",
+                                        self.config.batch_size
+                                    );
+                                    fix_verified = true;
+                                    break;
+                                } else {
+                                    info!("Targeted tests pass — running full suite for confirmation");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Targeted test runner error: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                // In batch mode, the full suite ONLY runs at the batch boundary
+                // (see `mod.rs` batch-boundary full-suite block). Skipping here
+                // covers every fall-through case above: no filter derived,
+                // targeted `ran_any == false`, targeted runner error, or the
+                // targeted-tests-first feature disabled entirely.
+                if self.config.batch_size != 1 {
+                    info!(
+                        "Deferring full test suite to batch boundary (batch_size={}); build+targeted results are enough for per-fix verification",
+                        self.config.batch_size
+                    );
+                    fix_verified = true;
+                    break;
+                }
+
                 info!("Running full test suite to validate fix...");
                 match runner::run_tests(&self.config.path, test_command, self.config.test_timeout) {
                     Ok((true, _)) => {
@@ -656,21 +864,36 @@ impl Orchestrator {
                             info!("Asking Claude to fix the test failure (without modifying tests)...");
                             let repair_prompt = claude::build_fix_error_prompt(
                                 "test",
-                                &truncate(&output, 2000),
+                                &truncate(&output, 1000),
                                 &file_path,
                                 &issue.message,
                             );
-                            let repair_tier = claude::classify_repair_tier();
-                            match self.run_ai("fix_test_error", &repair_prompt, &repair_tier) {
+                            // Progressive escalation — same ladder as the targeted-test branch.
+                            let repair_tier = match fix_attempt {
+                                1 => claude::classify_test_repair_tier(),
+                                2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+                                _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
+                            };
+                            info!(
+                                "Test-repair tier for {} (full-suite, attempt {}/{}): {}:{}",
+                                issue.key, fix_attempt, max_fix_attempts, repair_tier.model, repair_tier.effort
+                            );
+                            match self.run_ai_lean("fix_test_error", &repair_prompt, &repair_tier) {
                                 Ok(_) => {
-                                    // Check Claude didn't modify test files
+                                    // Scope guard during repair: see above for semantics.
                                     let repair_changed = git::changed_files(&self.config.path).unwrap_or_default();
-                                    let test_files_touched: Vec<_> = repair_changed.iter().filter(|f| is_test_file(f)).collect();
-                                    if !test_files_touched.is_empty() {
-                                        warn!("Claude modified test files during repair: {:?} — reverting repair", test_files_touched);
+                                    let off_limits: Vec<_> = repair_changed.iter().filter(|f| {
+                                        if issue_in_test_file {
+                                            is_test_file(f) && f.as_str() != file_path.as_str()
+                                        } else {
+                                            is_test_file(f)
+                                        }
+                                    }).collect();
+                                    if !off_limits.is_empty() {
+                                        warn!("Claude modified out-of-scope file(s) during repair: {:?} — reverting repair", off_limits);
                                         let _ = git::revert_changes(&self.config.path);
                                     } else {
-                                        info!("Claude applied test fix — retrying...");
+                                        info!("Claude applied repair — retrying...");
                                         continue;
                                     }
                                 }
@@ -814,7 +1037,7 @@ Apply the fixes now."#,
                                 truncate(&output, 3000)
                             );
                             let lint_tier = claude::classify_repair_tier();
-                            match self.run_ai("fix_lint_error", &lint_prompt, &lint_tier) {
+                            match self.run_ai_lean("fix_lint_error", &lint_prompt, &lint_tier) {
                                 Ok(_) => {
                                     // Format after lint fix
                                     if let Some(ref fmt_cmd) = self.config.commands.format {
@@ -865,13 +1088,36 @@ Apply the fixes now."#,
         }
 
         // Step C-5: Regenerate coverage report before re-scan
-        // Run coverage command (not just test) so SonarQube picks up fresh lcov data
-        if let Some(ref cov_cmd) = self.config.coverage_command
+        // Skip entirely for rules whose verdict doesn't depend on coverage
+        // metrics (vulnerabilities, bugs, most code smells) — SonarQube will
+        // re-evaluate these from static analysis alone.
+        let needs_coverage = rule_is_coverage_dependent(&issue.rule);
+        // Prefer the report-only command when available: the validation test run
+        // we just executed produced fresh jacoco.exec data, so re-running the
+        // full suite via `mvn verify -Pcoverage` (or similar) is ~79s of waste.
+        let full_cov_cmd = self.config.coverage_command
             .clone()
-            .or_else(|| self.config.commands.coverage.clone())
-        {
-            info!("Regenerating coverage report before SonarQube re-scan...");
-            match runner::run_shell_command(&self.config.path, cov_cmd, "coverage") {
+            .or_else(|| self.config.commands.coverage.clone());
+        let report_only_cmd = self.config.commands.coverage_report_only.clone();
+        let (cov_cmd_opt, using_report_only) = match (&report_only_cmd, &full_cov_cmd) {
+            (Some(ro), _) => (Some(ro.clone()), true),
+            (None, Some(full)) => (Some(full.clone()), false),
+            (None, None) => (None, false),
+        };
+        if !needs_coverage {
+            info!(
+                "Skipping coverage regen for {} (rule {} is static-analysis; not coverage-dependent)",
+                issue.key, issue.rule
+            );
+        }
+        let cov_cmd_to_run = if needs_coverage { cov_cmd_opt } else { None };
+        if let Some(cov_cmd) = cov_cmd_to_run {
+            if using_report_only {
+                info!("Regenerating coverage report (report-only, reusing prior test run)...");
+            } else {
+                info!("Regenerating coverage report before SonarQube re-scan...");
+            }
+            match runner::run_shell_command(&self.config.path, &cov_cmd, "coverage") {
                 Ok((true, _)) => {
                     if runner::find_lcov_report_with_hint(&self.config.path, self.config.commands.coverage_report.as_deref()).is_some() {
                         info!("Coverage report updated");
@@ -879,14 +1125,45 @@ Apply the fixes now."#,
                         warn!("Coverage command succeeded but no report file was produced");
                     }
                 }
-                Ok((false, output)) => warn!("Coverage command failed (non-blocking): {}", truncate(&output, 100)),
+                Ok((false, output)) => {
+                    if using_report_only {
+                        // Report-only failed (e.g. jacoco.exec missing) — fall back to the full command.
+                        warn!(
+                            "Report-only coverage command failed (non-blocking): {} — falling back to full coverage command",
+                            truncate(&output, 100)
+                        );
+                        if let Some(full) = full_cov_cmd {
+                            match runner::run_shell_command(&self.config.path, &full, "coverage") {
+                                Ok((true, _)) => info!("Coverage report updated (full fallback)"),
+                                Ok((false, o)) => warn!("Coverage command failed (non-blocking): {}", truncate(&o, 100)),
+                                Err(e) => warn!("Coverage command error (non-blocking): {}", e),
+                            }
+                        }
+                    } else {
+                        warn!("Coverage command failed (non-blocking): {}", truncate(&output, 100));
+                    }
+                }
                 Err(e) => warn!("Coverage command error (non-blocking): {}", e),
             }
         }
 
-        // Step C-6: Re-scan with SonarQube to verify the issue is resolved (with retries)
+        // Step C-6: Re-scan with SonarQube to verify the issue is resolved (with retries).
+        // Batched: only rescan every `rescan_batch_size` fixes (default 1 = every fix).
+        // The counter is incremented in mod.rs before process_issue is called, so the
+        // first issue has counter=1. Rescan when counter % N == 0 so we also rescan
+        // the Nth, 2Nth, … issues — giving periodic confidence without per-issue cost.
+        let fix_counter = self.fix_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let batch_n = self.config.rescan_batch_size.max(1);
+        let should_rescan = batch_n == 1 || (fix_counter > 0 && fix_counter % batch_n == 0);
+        if !should_rescan {
+            info!(
+                "Skipping per-issue SonarQube rescan for {} (batched: fix {}/{}; rescan every {})",
+                issue.key, fix_counter, batch_n, batch_n
+            );
+        }
         let max_sonar_retries = self.config.coverage_attempts;
-        if let Some(ref scanner) = self.config.scanner {
+        if should_rescan {
+          if let Some(ref scanner) = self.config.scanner {
             for sonar_attempt in 1..=max_sonar_retries {
                 info!("Re-scanning with SonarQube to verify fix for {} (attempt {}/{})...", issue.key, sonar_attempt, max_sonar_retries);
                 match self.client.run_scanner(&self.config.path, scanner, &self.config.branch) {
@@ -906,39 +1183,100 @@ Apply the fixes now."#,
                                 // Issue still reported — retry with Claude or give up
                                 if sonar_attempt < max_sonar_retries {
                                     warn!(
-                                        "SonarQube still reports issue {} (attempt {}/{}) — asking Claude for a different approach...",
+                                        "SonarQube still reports issue {} (attempt {}/{}) — asking Claude to refine the existing fix...",
                                         issue.key, sonar_attempt, max_sonar_retries
                                     );
-                                    // Revert the failed fix
-                                    let _ = git::revert_changes(&self.config.path);
-                                    // Ask Claude to try a different approach
+                                    // Keep the previous fix in the working tree so Claude can
+                                    // iterate on top of it. The final revert only happens if we
+                                    // exhaust all retries (see max_sonar_retries branch below).
+                                    let pre_retry_diff = std::process::Command::new("git")
+                                        .current_dir(&self.config.path)
+                                        .args(["diff", "HEAD"])
+                                        .output()
+                                        .ok()
+                                        .map(|o| o.stdout)
+                                        .unwrap_or_default();
+                                    // Ask Claude to refine the existing in-progress fix
                                     let retry_prompt = format!(
-                                        r#"Your previous fix for SonarQube issue {} did NOT resolve it.
+                                        r#"Your previous fix for SonarQube issue {} is already applied to the working tree but did NOT resolve it.
 
 ## Issue details
 - **Rule**: {} — {}
 - **File**: `{}`
-- **Previous attempt**: The fix compiled and tests passed, but SonarQube still reports the same issue.
+- **State**: Your earlier edits are still in the working tree (uncommitted). The code compiles and tests pass, but SonarQube still reports the same issue.
 
 ## Instructions:
-1. Try a DIFFERENT approach to fix this issue
-2. The previous fix was insufficient — the code still violates rule {}
-3. Read the file, understand why the rule is still triggered, and apply a more thorough fix
+1. Read the current state of the file — do NOT start over from HEAD
+2. Identify why rule {} is still triggered despite your previous edits
+3. Refine or extend the existing fix to make SonarQube accept it
 4. Do NOT modify any test files
-5. Ensure the fix compiles and tests still pass
+5. Ensure the fix still compiles and tests still pass
 
-Apply a different fix now."#,
+Refine the fix now."#,
                                         issue.key, issue.rule, issue.message,
                                         file_path, issue.rule
                                     );
-                                    // Retry uses same tier but bumped up since first attempt failed
-                                    let retry_tier = claude::ClaudeTier::with_timeout(
-                                        if tier.model == "haiku" { "sonnet" } else { tier.model },
-                                        if tier.effort == "low" { "medium" } else { tier.effort },
-                                        tier.timeout_multiplier.max(1.0),
+                                    // Progressive retry escalation: each attempt that SonarQube
+                                    // reports still-unresolved is a stronger signal that sonnet
+                                    // isn't going to crack this issue alone. We escalate a rung
+                                    // per retry so opus only fires when cheaper tiers have
+                                    // verifiably failed, not speculatively up-front.
+                                    //
+                                    //   attempt 1 (first retry): lift haiku→sonnet, low→medium
+                                    //   attempt 2:               sonnet→sonnet:high
+                                    //   attempt 3+:              opus:high (last-resort fallback)
+                                    //
+                                    // Opus entering here is evidence-based: two cheaper attempts
+                                    // have demonstrably not solved it, so the ~4× cost of opus
+                                    // is justified rather than speculative.
+                                    let retry_tier = match sonar_attempt {
+                                        1 => claude::ClaudeTier::with_timeout(
+                                            if tier.model == "haiku" { "sonnet" } else { tier.model },
+                                            if tier.effort == "low" { "medium" } else { tier.effort },
+                                            tier.timeout_multiplier.max(0.7),
+                                        ),
+                                        2 => claude::ClaudeTier::with_timeout(
+                                            "sonnet",
+                                            "high",
+                                            tier.timeout_multiplier.max(1.0),
+                                        ),
+                                        _ => claude::ClaudeTier::with_timeout(
+                                            "opus",
+                                            "high",
+                                            tier.timeout_multiplier.max(1.5),
+                                        ),
+                                    };
+                                    info!(
+                                        "Retry tier for {} (attempt {}/{}): {}:{}",
+                                        issue.key,
+                                        sonar_attempt,
+                                        max_sonar_retries,
+                                        retry_tier.model,
+                                        retry_tier.effort
                                     );
-                                    match self.run_ai("fix_issue_retry", &retry_prompt, &retry_tier) {
+                                    match self.run_ai_lean("fix_issue_retry", &retry_prompt, &retry_tier) {
                                         Ok(_) => {
+                                            // Guard against no-op retries: compare the full working-tree
+                                            // diff before and after the retry. If unchanged, Claude
+                                            // didn't touch anything — another rescan would just loop.
+                                            let post_retry_diff = std::process::Command::new("git")
+                                                .current_dir(&self.config.path)
+                                                .args(["diff", "HEAD"])
+                                                .output()
+                                                .ok()
+                                                .map(|o| o.stdout)
+                                                .unwrap_or_default();
+                                            if post_retry_diff == pre_retry_diff {
+                                                warn!(
+                                                    "Retry made no file changes for {} — aborting retry loop",
+                                                    issue.key
+                                                );
+                                                let _ = git::revert_changes(&self.config.path);
+                                                result.status = FixStatus::NeedsReview(
+                                                    "Claude retry produced no changes on top of the previous fix; manual review required.".to_string()
+                                                );
+                                                return result;
+                                            }
                                             info!("Claude applied retry fix — verifying build+tests...");
                                             // Quick build+test check before re-scanning
                                             if let Some(ref fmt_cmd) = self.config.commands.format {
@@ -954,9 +1292,43 @@ Apply a different fix now."#,
                                                     }
                                                 }
                                             }
+                                            // Mirror the main-path strategy: try a targeted
+                                            // Surefire filter first when batching is on. Targeted
+                                            // passing is sufficient for per-issue verification;
+                                            // the full suite runs once at the batch boundary.
+                                            let all_retry_changed = git::changed_files(&self.config.path)
+                                                .unwrap_or_default();
+                                            let mut filter_inputs: Vec<String> =
+                                                Vec::with_capacity(all_retry_changed.len() + 1);
+                                            filter_inputs.push(file_path.clone());
+                                            filter_inputs.extend(all_retry_changed.into_iter());
+                                            let mut skipped_full = false;
+                                            if self.config.batch_size != 1 && self.config.targeted_tests_first {
+                                                if let Some(filter) = runner::derive_surefire_filter(&filter_inputs) {
+                                                    match runner::run_targeted_tests(&self.config.path, test_command, &filter) {
+                                                        Ok(res) if res.ran_any && res.success => {
+                                                            info!(
+                                                                "Retry targeted tests pass — deferring full suite to batch boundary (batch_size={})",
+                                                                self.config.batch_size
+                                                            );
+                                                            skipped_full = true;
+                                                        }
+                                                        Ok(res) if res.ran_any && !res.success => {
+                                                            warn!("Retry fix broke targeted tests — reverting");
+                                                            let _ = git::revert_changes(&self.config.path);
+                                                            break;
+                                                        }
+                                                        _ => {
+                                                            // Unsupported runner or no match — fall through to full suite
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if skipped_full {
+                                                continue;
+                                            }
                                             match runner::run_tests(&self.config.path, test_command, self.config.test_timeout) {
                                                 Ok((true, _)) => {
-                                                    // Build+tests pass, loop will re-scan
                                                     continue;
                                                 }
                                                 _ => {
@@ -993,6 +1365,7 @@ Apply a different fix now."#,
                     }
                 }
             }
+          }
         }
 
         // Step D: Commit the fix (US-008)
@@ -1030,11 +1403,36 @@ Apply a different fix now."#,
                 changed_files_str,
                 issue_url,
             );
-            if let Err(e) = git::commit(&self.config.path, &msg) {
-                result.status = FixStatus::Failed(format!("Commit failed: {}", e));
-                return result;
+
+            // When fix_commit_batch != 1, use a WIP commit that will be squashed later.
+            // fix_commit_batch == 1 → real commit immediately (default/individual behavior).
+            // fix_commit_batch == 0 → one commit per branch (all WIP, squashed at end).
+            // fix_commit_batch >  1 → squash every N fixes into one commit.
+            let use_wip = self.config.fix_commit_batch != 1;
+            if use_wip {
+                let wip_msg = format!(
+                    "reparo-wip: fix {} - {}\n\nRule: {}\nSeverity: {}\nFile: {}:{}\nModified: {}\nIssue: {}",
+                    issue.key,
+                    truncate(&issue.message, 72),
+                    issue.rule,
+                    issue.severity,
+                    file_path,
+                    lines,
+                    changed_files_str,
+                    issue_url,
+                );
+                if let Err(e) = git::commit_no_verify(&self.config.path, &wip_msg) {
+                    result.status = FixStatus::Failed(format!("Commit failed: {}", e));
+                    return result;
+                }
+                info!("WIP commit for {} (pending batch squash)", issue.key);
+            } else {
+                if let Err(e) = git::commit(&self.config.path, &msg) {
+                    result.status = FixStatus::Failed(format!("Commit failed: {}", e));
+                    return result;
+                }
+                info!("Committed fix for {}", issue.key);
             }
-            info!("Committed fix for {}", issue.key);
 
             // US-021: Capture diff summary for PR body
             result.diff_summary = capture_diff_summary(&self.config.path);
@@ -1044,7 +1442,102 @@ Apply a different fix now."#,
         result
     }
 
+    /// Squash N temporary "reparo-wip: fix" commits into a single real commit.
+    ///
+    /// Used when `fix_commit_batch > 1` or `fix_commit_batch == 0` (one per branch).
+    /// `issues` is a slice of `(issue_key, issue_message)` pairs for the commit body.
+    pub(super) fn squash_fix_commits(&self, n: usize, issues: &[(String, String)]) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+
+        info!("Squashing {} WIP fix commit(s) into one real commit...", n);
+
+        // Safety check: verify the last n commits are all "reparo-wip: fix" commits.
+        let log_output = std::process::Command::new("git")
+            .current_dir(&self.config.path)
+            .args(["log", "--oneline", &format!("-{}", n)])
+            .output();
+
+        if let Ok(out) = log_output {
+            let log_str = String::from_utf8_lossy(&out.stdout);
+            let non_wip: Vec<&str> = log_str.lines()
+                .filter(|l| !l.contains("reparo-wip:"))
+                .collect();
+            if !non_wip.is_empty() {
+                warn!(
+                    "Cannot squash fix commits: last {} commits contain non-wip entries: {:?}",
+                    n, non_wip
+                );
+                return Ok(());
+            }
+        }
+
+        // Soft-reset to unstage all WIP commits back to the index in one shot.
+        let reset_status = std::process::Command::new("git")
+            .current_dir(&self.config.path)
+            .args(["reset", "--soft", &format!("HEAD~{}", n)])
+            .status();
+
+        match reset_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                warn!("git reset --soft HEAD~{} failed (exit {})", n, s);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to run git reset: {}", e);
+                return Ok(());
+            }
+        }
+
+        // Build the squash commit message.
+        let keys: Vec<&str> = issues.iter().map(|(k, _)| k.as_str()).collect();
+        let subject = if issues.len() == 1 {
+            format_commit_message(
+                &self.config, "fix", "sonar",
+                &format!("{} - {}", keys[0], truncate(&issues[0].1, 72)),
+                keys[0], "", "",
+            )
+        } else {
+            format_commit_message(
+                &self.config, "fix", "sonar",
+                &format!("{} issues [{}]", issues.len(), keys.join(", ")),
+                "", "", "",
+            )
+        };
+        let body: String = issues.iter()
+            .map(|(k, m)| format!("- {}: {}", k, truncate(m, 100)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = format!("{}\n\n{}", subject, body);
+
+        match git::commit(&self.config.path, &msg) {
+            Ok(()) => {
+                info!("Squash commit successful ({} fix(es))", issues.len());
+            }
+            Err(e) => {
+                warn!("Squash commit failed: {} — WIP commits remain as-is", e);
+            }
+        }
+        Ok(())
+    }
+
     /// Check line-level coverage for the affected lines of an issue (US-004).
+    ///
+    /// Source precedence:
+    ///   1. **Frozen baseline snapshot** — `self.config.baseline_lcov_path`.
+    ///      Captured once after preflight + coverage boost, it reflects the
+    ///      "last complete test run" and is immutable for the rest of the
+    ///      fix loop. Every worker (parallel or sequential) reads the same
+    ///      file, so fixes happening concurrently cannot contaminate each
+    ///      other's coverage view.
+    ///   2. **SonarQube** — the project-wide reference. Used when the
+    ///      baseline is missing or doesn't contain the target file.
+    ///
+    /// NOTE: the per-worktree lcov is deliberately NOT consulted. That lcov
+    /// mutates as workers run their own validation coverage, which leaks
+    /// cross-worker state into what should be a per-issue decision.
     async fn check_coverage(
         &self,
         component: &str,
@@ -1052,6 +1545,30 @@ Apply a different fix now."#,
         start_line: u32,
         end_line: u32,
     ) -> CoverageCheck {
+        // 1. Frozen baseline (set once before the fix loop starts).
+        if let Some(ref baseline) = self.config.baseline_lcov_path {
+            if let Some(cov) =
+                runner::check_local_coverage(baseline, file_path, start_line, end_line)
+            {
+                if cov.fully_covered {
+                    return CoverageCheck::FullyCovered;
+                }
+                if cov.covered.is_empty() && cov.uncovered.is_empty() {
+                    return CoverageCheck::FullyCovered;
+                }
+                return CoverageCheck::NeedsCoverage {
+                    uncovered_lines: cov.uncovered,
+                    coverage_pct: cov.coverage_pct,
+                };
+            }
+            info!(
+                "Baseline coverage report {} has no data for {} — falling back to SonarQube",
+                baseline.display(),
+                file_path
+            );
+        }
+
+        // 2. SonarQube — general reference.
         match self
             .client
             .get_line_coverage(component, start_line, end_line)
@@ -1062,7 +1579,6 @@ Apply a different fix now."#,
                 if cov.fully_covered {
                     CoverageCheck::FullyCovered
                 } else if cov.uncovered_lines.is_empty() && cov.covered_lines.is_empty() {
-                    // All lines non-coverable, or no data
                     CoverageCheck::FullyCovered
                 } else {
                     CoverageCheck::NeedsCoverage {
@@ -1126,12 +1642,22 @@ Apply a different fix now."#,
             );
 
             // Build prompt — first attempt or retry with context
-            let file_class = runner::classify_source_file(file_path, &self.config.path);
+            let file_class = self.classify_source_file_cached(file_path);
             let pkg_hint = runner::derive_test_package(file_path)
                 .map(|p| format!("The test class should be in package `{}` under `src/test/java/`.", p))
                 .unwrap_or_default();
             let prompt = if attempt == 1 {
                 let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, &pkg_hint);
+                // US-067: detect boundary/negative testing hints for the fix-loop test generation path
+                let boundary_hints = detect_boundary_hints(&uncovered_snippets);
+                // US-066: compliance trace context for tests generated inside the fix loop
+                let compliance_ctx = if self.config.compliance_enabled {
+                    let ctx = claude::ComplianceTraceContext::new(
+                        self.exec_log.run_id(),
+                        format!("ISSUE:{}", file_path),
+                    );
+                    Some(if self.config.health_mode { ctx.with_risk_class("A") } else { ctx })
+                } else { None };
                 claude::build_test_generation_prompt(
                     file_path,
                     &uncovered_summary,
@@ -1139,6 +1665,9 @@ Apply a different fix now."#,
                     &framework,
                     &examples_str,
                     &per_file_ctx,
+                    &boundary_hints,
+                    compliance_ctx.as_ref(),
+                    None,
                 )
             } else {
                 let per_file_ctx = build_per_file_context(&framework_ctx_base, &file_class, "");
@@ -1617,6 +2146,7 @@ Apply a different fix now."#,
                 FixStatus::NeedsReview(_) => "Needs review",
                 FixStatus::Failed(_) => "Failed",
                 FixStatus::Skipped(_) => "Skipped",
+                FixStatus::RiskSkipped(_) => "Risk skipped",
             };
             body.push_str(&format!(
                 "| {} | {} | {} | `{}` | `{}` | {} |\n",

@@ -43,6 +43,81 @@ pub(crate) struct BoostFileResult {
     pub rounds_completed: u32,
     /// File coverage percentage before boost
     pub coverage_before: f64,
+    /// Overall project coverage already measured during the boost (individual mode only).
+    /// When `Some`, the caller can skip a redundant `run_coverage_and_measure` call.
+    pub measured_overall_pct: Option<f64>,
+}
+
+/// Returns true when the SonarQube rule's verdict depends on code coverage
+/// metrics (e.g. `common-java:InsufficientLineCoverage`). For these rules
+/// we must regenerate the coverage report before the rescan, otherwise
+/// SonarQube will still see the stale numbers.
+///
+/// For every other rule (vulnerabilities, bugs, most code smells) the
+/// verdict comes from static analysis and the coverage report is irrelevant,
+/// so we can skip the ~79s coverage regeneration.
+pub(crate) fn rule_is_coverage_dependent(rule_key: &str) -> bool {
+    let k = rule_key.to_lowercase();
+    // Linter-origin rules (synthetic `lint:<format>:<rule>` keys) are
+    // static-analysis findings. Coverage regen is never needed for them.
+    if k.starts_with("lint:") {
+        return false;
+    }
+    // Known SonarQube coverage rule keywords. Kept narrow on purpose —
+    // a false negative (skipping regen when we shouldn't) triggers a rescan
+    // retry in fix_loop, so the loop is self-healing.
+    k.contains("coverage") || k.contains("uncovered") || k.contains("linecoverage") || k.contains("branchcoverage")
+}
+
+/// Merge linter-derived and SonarQube-derived issues into a single severity-
+/// interleaved queue. Within a severity bucket, linter findings are placed
+/// before sonar findings so the new phase's work gets a fair chance.
+///
+/// When `reverse_severity` is true, the ordering is flipped (INFO → BLOCKER).
+pub(crate) fn merge_lint_and_sonar_issues(
+    lint: Vec<sonar::Issue>,
+    sonar: Vec<sonar::Issue>,
+    reverse_severity: bool,
+) -> Vec<sonar::Issue> {
+    fn rank(sev: &str) -> u8 {
+        match sev.to_uppercase().as_str() {
+            "BLOCKER" => 0,
+            "CRITICAL" => 1,
+            "MAJOR" => 2,
+            "MINOR" => 3,
+            "INFO" => 4,
+            _ => 5,
+        }
+    }
+
+    // Bucket each list by severity rank; preserve input order within a bucket.
+    let mut buckets: Vec<Vec<sonar::Issue>> = (0..=5).map(|_| Vec::new()).collect();
+    for i in lint {
+        let r = rank(&i.severity) as usize;
+        buckets[r].push(i);
+    }
+    // Mark the split point per bucket so lint items stay ahead of sonar.
+    let lint_lens: Vec<usize> = buckets.iter().map(|b| b.len()).collect();
+    for i in sonar {
+        let r = rank(&i.severity) as usize;
+        buckets[r].push(i);
+    }
+
+    // Re-order each bucket: [lint..., sonar...] is already the layout we have.
+    // Nothing else to do — we pushed lint first then sonar.
+    let _ = lint_lens;
+
+    let mut out: Vec<sonar::Issue> = Vec::new();
+    if reverse_severity {
+        for b in buckets.into_iter().rev() {
+            out.extend(b);
+        }
+    } else {
+        for b in buckets.into_iter() {
+            out.extend(b);
+        }
+    }
+    out
 }
 
 /// Parse test output to extract names of failing tests (US-007).
@@ -367,6 +442,49 @@ pub(crate) fn build_framework_context(
         parts.push(format!("Detected test dependencies: {}", detected_deps));
     }
 
+    // Framework-specific project-level rules — injected once per run, not per file.
+    // Per-file guidance (component type, decorators, etc.) comes from classify_source_file.
+    if detected_deps.contains("Angular") {
+        parts.push("Always import { TestBed, ComponentFixture } from '@angular/core/testing' — never from '@angular/core'.".to_string());
+        parts.push("Never instantiate a @Component with new — always go through TestBed.createComponent().".to_string());
+        parts.push("Declare every component/directive/pipe used in the template inside the same TestBed.configureTestingModule({ declarations: [...] }).".to_string());
+        if detected_deps.contains("Karma") {
+            parts.push("Test runner is Karma (browser Zone.js). Use fakeAsync/tick for timer-based async; waitForAsync/fixture.whenStable() for promise-based async. Plain async in it() blocks is unreliable with Karma.".to_string());
+        } else {
+            parts.push("Test runner is Jest (Node). async/await works natively; fakeAsync/tick is also available.".to_string());
+        }
+    } else if detected_deps.contains("NestJS") {
+        parts.push("Use @nestjs/testing: Test.createTestingModule({ providers: [...] }).compile() — never new Service() directly.".to_string());
+        parts.push("Always provide mocks as { provide: RealDep, useValue: { method: jest.fn() } } in the providers array.".to_string());
+        parts.push("Retrieve instances via moduleRef.get(ServiceClass) after compile().".to_string());
+    } else if detected_deps.contains("Next.js") {
+        parts.push("Use @testing-library/react for component tests. Always mock routing before rendering.".to_string());
+        parts.push("For App Router: jest.mock('next/navigation', () => ({ useRouter: () => ({ push: jest.fn() }), usePathname: () => '/', useSearchParams: () => new URLSearchParams() })).".to_string());
+        parts.push("For Pages Router: jest.mock('next/router', () => ({ useRouter: () => ({ push: jest.fn(), pathname: '/', query: {} }) })).".to_string());
+    } else if detected_deps.starts_with("React") {
+        parts.push("Use @testing-library/react. Prefer query priority: getByRole > getByLabelText > getByText > getByTestId.".to_string());
+        parts.push("Use userEvent from @testing-library/user-event for interactions — it wraps act() automatically.".to_string());
+        if detected_deps.contains("MSW") {
+            parts.push("Use MSW (Mock Service Worker) to intercept HTTP requests in tests — do not mock fetch/axios directly.".to_string());
+        }
+    } else if detected_deps.starts_with("Vue") {
+        parts.push("Use @vue/test-utils. Use shallowMount to isolate the component under test (stubs children); use mount when child behaviour matters.".to_string());
+        parts.push("Trigger events asynchronously: await wrapper.trigger('click'); call await wrapper.vm.$nextTick() after data mutations before asserting DOM.".to_string());
+    } else if detected_deps.contains("Laravel") {
+        parts.push("Extend Tests\\TestCase (not bare PHPUnit TestCase) to get Laravel test helpers.".to_string());
+        parts.push("Use RefreshDatabase trait whenever the test touches the database.".to_string());
+        parts.push("Use model factories (ModelClass::factory()->create()) instead of raw DB inserts.".to_string());
+    } else if detected_deps.contains("Symfony") {
+        parts.push("Extend WebTestCase for HTTP tests, KernelTestCase for service/repository tests, plain TestCase for value objects and utilities.".to_string());
+        parts.push("Access services in KernelTestCase via static::getContainer()->get(ServiceClass::class).".to_string());
+    } else if detected_deps.contains("RSpec") {
+        parts.push("Use described_class to refer to the class under test — avoids hard-coding the name.".to_string());
+        parts.push("Use let for lazy-evaluated setup; let! for eager setup. Use subject for the primary object under test.".to_string());
+        if detected_deps.contains("FactoryBot") {
+            parts.push("Use FactoryBot.create(:factory_name) for persisted records, build for in-memory only.".to_string());
+        }
+    }
+
     // YAML overrides / supplements
     if let Some(ref fw) = tg.framework {
         parts.push(format!("Test framework: {}", fw));
@@ -384,6 +502,21 @@ pub(crate) fn build_framework_context(
         parts.push(custom.clone());
     }
 
+    parts.join("\n")
+}
+
+/// Build a slim framework context for retry rounds (US-056).
+///
+/// On round > 1 the AI already knows the framework from its previous attempt.
+/// Only flags that directly affect *how* to write tests (not which deps exist) are included.
+pub(crate) fn build_slim_framework_context(tg: &crate::config::TestGenerationConfig) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if tg.avoid_spring_context {
+        parts.push("IMPORTANT: Do NOT use @SpringBootTest for unit tests. Use @ExtendWith(MockitoExtension.class) or plain JUnit 5 instead.".to_string());
+    }
+    if let Some(ref custom) = tg.custom_instructions {
+        parts.push(custom.clone());
+    }
     parts.join("\n")
 }
 
@@ -414,6 +547,106 @@ pub(crate) fn build_per_file_context(base: &str, file_classification: &str, pack
 /// >46: uncoveredLine
 ///  53: nextLine              ← context
 /// ```
+/// US-067: Scan a source snippet for boundary/negative testing opportunities
+/// and return a list of hints that will be injected into the generation prompt.
+///
+/// The hints are heuristic — regex-based, not semantic — so they only cover
+/// the most obvious patterns:
+/// - Numeric comparisons against literals (`x > 100`, `len >= MAX`) → test at boundary
+/// - String/collection emptiness (`isEmpty`, `is_empty`, `== ""`) → test with empty
+/// - Exception throws (`throw`, `raise`, `return Err`) → test the error path
+/// - Nullability (`null`, `None`, `undefined`, `.orElse`, `Optional`) → test with null
+/// - Array/list access (`arr[i]`, `list.get(i)`) → test index=0, index=last, OOB
+///
+/// Returns an empty string when no hints are detected (keeps the prompt lean
+/// for trivial files). The caller decides whether to include the "Mandatory
+/// categories" section based on emptiness.
+pub(crate) fn detect_boundary_hints(source_snippet: &str) -> String {
+    let mut hints: Vec<String> = Vec::new();
+
+    // Precompile regexes once per call; regex crate caches internally.
+    let num_cmp = regex::Regex::new(r"([<>]=?|==|!=)\s*(-?\d+|MIN|MAX|MAX_VALUE|MIN_VALUE|Integer\.MAX_VALUE|Integer\.MIN_VALUE|\w+\.MAX|\w+\.MIN)").unwrap();
+    let empty_check = regex::Regex::new(r#"(isEmpty|is_empty|\.len\(\)\s*==\s*0|==\s*"")"#).unwrap();
+    let throw_re = regex::Regex::new(r"\b(throw|raise)\s+\w").unwrap();
+    let err_return = regex::Regex::new(r"\breturn\s+(Err|Error|None|null|false)\b").unwrap();
+    let null_usage = regex::Regex::new(r"\b(null|None|undefined|Optional\.|\.orElse|\.unwrap|\.unwrap_or|\?\?)").unwrap();
+    let index_access = regex::Regex::new(r"\w+\s*\[\s*\w+\s*\]|\.get\(\s*\w+\s*\)").unwrap();
+
+    for (i, raw_line) in source_snippet.lines().enumerate() {
+        // Skip comments and annotation-only lines in the snippet
+        let trimmed = raw_line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '#');
+        if trimmed.trim_start().starts_with("//") || trimmed.trim_start().starts_with("#") {
+            continue;
+        }
+        // The snippet lines are annotated like " 42:     if (x > 100) {"
+        // Extract the actual code after the `:` for cleaner hint content.
+        let code = match trimmed.find(':') {
+            Some(idx) if idx < 6 => trimmed[idx + 1..].trim(),
+            _ => trimmed.trim(),
+        };
+        if code.is_empty() { continue; }
+
+        // Numeric comparison → boundary test
+        if let Some(cap) = num_cmp.captures(code) {
+            let op = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let val = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            hints.push(format!(
+                "- Line {}: numeric comparison `{} {}` — test values at the boundary, one unit below, one unit above, plus 0 / MIN / MAX.",
+                i + 1, op, val
+            ));
+            continue;
+        }
+        // Empty check
+        if empty_check.is_match(code) {
+            hints.push(format!(
+                "- Line {}: empty-check pattern — test with empty, single-element, and populated inputs.",
+                i + 1
+            ));
+            continue;
+        }
+        // Explicit throw / raise
+        if throw_re.is_match(code) {
+            hints.push(format!(
+                "- Line {}: explicit throw/raise — generate a negative test that triggers this exception and verifies the exception type and message.",
+                i + 1
+            ));
+            continue;
+        }
+        // Early error return
+        if err_return.is_match(code) {
+            hints.push(format!(
+                "- Line {}: early-return error path — test that the function returns the error value under the triggering condition.",
+                i + 1
+            ));
+            continue;
+        }
+        // Null/Option/undefined handling
+        if null_usage.is_match(code) {
+            hints.push(format!(
+                "- Line {}: null/Optional/undefined usage — test with null (or None/Optional.empty) to verify defensive behaviour.",
+                i + 1
+            ));
+            continue;
+        }
+        // Index access
+        if index_access.is_match(code) {
+            hints.push(format!(
+                "- Line {}: index access — test index=0, index=last, and an out-of-bounds index (expect the documented exception or defensive return).",
+                i + 1
+            ));
+            continue;
+        }
+    }
+
+    // Deduplicate identical lines while keeping order
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    hints.retain(|h| seen.insert(h.clone()));
+
+    // Cap at ~10 hints to keep the prompt bounded
+    hints.truncate(10);
+    hints.join("\n")
+}
+
 pub(crate) fn extract_uncovered_snippets(
     source_content: &str,
     uncovered_lines: &[u32],
@@ -491,6 +724,99 @@ pub(crate) struct MethodChunk {
     pub uncovered_count: usize,
 }
 
+/// Group method chunks into batches to reduce the number of AI calls.
+///
+/// Two cost drivers per chunk call:
+///   - API round-trip overhead (fixed cost regardless of payload size)
+///   - Output tokens (test code generated — roughly proportional to complexity)
+///
+/// Batching rules:
+/// - A chunk is **solo** if it has >25 uncovered lines OR >100 snippet lines.
+///   Large/complex methods need focused attention and produce enough output
+///   that a dedicated call is justified.
+/// - Small chunks are accumulated into a batch until adding the next one would:
+///   - Push total uncovered lines over 30, OR
+///   - Push total snippet lines over 120, OR
+///   - Exceed 3 chunks in the batch.
+/// - **Simple-method fast path**: when every chunk in the accumulating batch has
+///   ≤5 uncovered lines AND ≤30 snippet lines (getters, trivial accessors, etc.),
+///   the batch limits are raised to 8 chunks / 40 uncovered / 240 snippet lines.
+///   This merges many tiny AI calls into one, sharing context and cutting cost.
+///
+/// This typically reduces 4-6 tiny-method calls to 1-2 calls while keeping
+/// complex methods in dedicated calls where Claude can reason clearly.
+pub(crate) fn group_chunks_into_batches(chunks: Vec<MethodChunk>) -> Vec<Vec<MethodChunk>> {
+    const SOLO_UNCOVERED: usize = 25;
+    const SOLO_SNIPPET_LINES: usize = 100;
+    // Regular batch limits
+    const MAX_BATCH_UNCOVERED: usize = 30;
+    const MAX_BATCH_SNIPPET_LINES: usize = 120;
+    const MAX_BATCH_SIZE: usize = 3;
+    // Simple-method batch limits (getters / trivial accessors merged into one call)
+    const SIMPLE_UNCOVERED: usize = 5;
+    const SIMPLE_SNIPPET_LINES: usize = 30;
+    const SIMPLE_MAX_BATCH_SIZE: usize = 8;
+    const SIMPLE_MAX_BATCH_UNCOVERED: usize = 40; // 8 × 5
+    const SIMPLE_MAX_BATCH_SNIPPET_LINES: usize = 240; // 8 × 30
+
+    let mut batches: Vec<Vec<MethodChunk>> = Vec::new();
+    let mut current_batch: Vec<MethodChunk> = Vec::new();
+    let mut current_uncovered = 0usize;
+    let mut current_snippet_lines = 0usize;
+    // True while every chunk accumulated so far in the current batch is "simple"
+    let mut batch_all_simple = true;
+
+    for chunk in chunks {
+        let chunk_snippet_lines = chunk.snippet.lines().count();
+        let is_solo =
+            chunk.uncovered_count > SOLO_UNCOVERED || chunk_snippet_lines > SOLO_SNIPPET_LINES;
+        let chunk_is_simple =
+            chunk.uncovered_count <= SIMPLE_UNCOVERED && chunk_snippet_lines <= SIMPLE_SNIPPET_LINES;
+
+        if is_solo {
+            // Flush any accumulated small chunks first, then push solo.
+            if !current_batch.is_empty() {
+                batches.push(std::mem::take(&mut current_batch));
+                current_uncovered = 0;
+                current_snippet_lines = 0;
+                batch_all_simple = true;
+            }
+            batches.push(vec![chunk]);
+        } else {
+            // Use enlarged limits only when adding this chunk keeps the whole batch simple.
+            let would_stay_simple = batch_all_simple && chunk_is_simple;
+            let (max_size, max_uncov, max_snip) = if would_stay_simple {
+                (SIMPLE_MAX_BATCH_SIZE, SIMPLE_MAX_BATCH_UNCOVERED, SIMPLE_MAX_BATCH_SNIPPET_LINES)
+            } else {
+                (MAX_BATCH_SIZE, MAX_BATCH_UNCOVERED, MAX_BATCH_SNIPPET_LINES)
+            };
+
+            let would_overflow = !current_batch.is_empty()
+                && (current_uncovered + chunk.uncovered_count > max_uncov
+                    || current_snippet_lines + chunk_snippet_lines > max_snip
+                    || current_batch.len() >= max_size);
+
+            if would_overflow {
+                batches.push(std::mem::take(&mut current_batch));
+                current_uncovered = 0;
+                current_snippet_lines = 0;
+                batch_all_simple = true;
+            }
+
+            batch_all_simple = batch_all_simple && chunk_is_simple;
+            current_uncovered += chunk.uncovered_count;
+            current_snippet_lines += chunk_snippet_lines;
+            current_batch.push(chunk);
+        }
+    }
+
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+
+    batches
+}
+
 /// Split uncovered lines into method-level chunks for targeted test generation.
 ///
 /// Uses language-aware heuristics to find method/function boundaries, then groups
@@ -514,6 +840,11 @@ pub(crate) fn split_into_method_chunks(
     let methods = detect_method_boundaries(&source_lines, file_path);
 
     if methods.is_empty() {
+        // US-058: log the fallback trigger so we can measure detector quality in the wild.
+        tracing::debug!(
+            "Method detection fell back to contiguous groups for {} — {} uncovered lines, {} source lines",
+            file_path, uncovered_lines.len(), source_lines.len()
+        );
         // Fallback: split into groups of ~20 contiguous uncovered lines
         return split_by_contiguous_groups(source_content, uncovered_lines, &source_lines, 20);
     }
@@ -580,11 +911,107 @@ pub(crate) fn split_into_method_chunks(
     method_chunks
 }
 
+/// Compact an annotated method snippet when it exceeds `max_lines` (US-053).
+///
+/// Produces a focused view with:
+/// - The method header comment ("// Method: name (lines X-Y)")
+/// - The first 5 body lines (function signature and opening)
+/// - For each uncovered line (marked `>`): a ±5 line context window
+/// - The last body line (closing `}` or `end`)
+/// - `// ... (N lines omitted — read file for full context)` gaps between sections
+///
+/// When `max_lines == 0` or the snippet is already within the limit, the original
+/// snippet is returned unchanged.
+pub(crate) fn compact_method_snippet(snippet: &str, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return snippet.to_string();
+    }
+
+    let all_lines: Vec<&str> = snippet.lines().collect();
+    if all_lines.len() <= max_lines {
+        return snippet.to_string();
+    }
+
+    // Line 0 is the header "// Method: name (lines X-Y)"; body starts at index 1.
+    let header = all_lines[0];
+    let body = &all_lines[1..];
+    let body_len = body.len();
+    if body_len == 0 {
+        return snippet.to_string();
+    }
+
+    // Collect indices of uncovered body lines (those starting with '>').
+    let uncovered_body_indices: Vec<usize> = body.iter().enumerate()
+        .filter(|(_, line)| line.starts_with('>'))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Build the set of body-line indices to include.
+    let mut include: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
+    // First 5 body lines (signature + opening brace)
+    for i in 0..body_len.min(5) {
+        include.insert(i);
+    }
+    // Last body line (closing brace / end)
+    include.insert(body_len - 1);
+    // ±5 context window around each uncovered line
+    for &ui in &uncovered_body_indices {
+        let lo = ui.saturating_sub(5);
+        let hi = (ui + 5).min(body_len - 1);
+        for j in lo..=hi {
+            include.insert(j);
+        }
+    }
+
+    // Build output with gap comments between non-contiguous sections.
+    let mut out = String::new();
+    out.push_str(header);
+    out.push('\n');
+
+    let indices: Vec<usize> = include.into_iter().collect();
+    let mut prev: Option<usize> = None;
+    for &idx in &indices {
+        if let Some(p) = prev {
+            let gap = idx.saturating_sub(p + 1);
+            if gap > 0 {
+                out.push_str(&format!("// ... ({} lines omitted — read file for full context)\n", gap));
+            }
+        }
+        out.push_str(body[idx]);
+        out.push('\n');
+        prev = Some(idx);
+    }
+
+    out
+}
+
 /// A detected method/function boundary in source code.
 struct MethodBoundary {
     name: String,
     start_line: usize, // 1-indexed, inclusive
     end_line: usize,   // 1-indexed, inclusive
+}
+
+/// Find the enclosing method's (start_line, end_line) for a given 1-indexed line,
+/// using language-aware method-boundary detection. Returns `None` if the line
+/// is not inside any detected method (e.g. class-level code, or unsupported
+/// language). The returned range is 1-indexed and inclusive, matching
+/// SonarQube's line numbering.
+pub(crate) fn enclosing_method_range(
+    file_content: &str,
+    file_path: &str,
+    line: u32,
+) -> Option<(u32, u32)> {
+    let lines: Vec<&str> = file_content.lines().collect();
+    let methods = detect_method_boundaries(&lines, file_path);
+    let idx = line as usize;
+    // Prefer the innermost (smallest) enclosing method in case of nested functions.
+    methods
+        .into_iter()
+        .filter(|m| idx >= m.start_line && idx <= m.end_line)
+        .min_by_key(|m| m.end_line - m.start_line)
+        .map(|m| (m.start_line as u32, m.end_line as u32))
 }
 
 /// Detect method/function boundaries using language-aware heuristics.
@@ -608,28 +1035,60 @@ fn detect_method_boundaries(lines: &[&str], file_path: &str) -> Vec<MethodBounda
     }
 }
 
-/// Java/Kotlin: method = line with access modifier + return type + name + `(`, ending at balanced `}`.
-/// Excludes class/interface/enum declarations.
+/// US-058: Java/Kotlin/Scala method detection.
+///
+/// Detects methods (and Kotlin extension functions) with access modifiers, returning
+/// their start/end line boundaries. Includes preceding annotation lines in the
+/// boundary so the AI sees `@Transactional`, `@Override`, etc. in the snippet.
+///
+/// Handles:
+/// - Java methods with nested generics: `Map<String, List<Integer>> foo()`
+/// - Kotlin extension functions: `fun String.toSnakeCase()`
+/// - Methods with multiple annotations on preceding lines
+/// - Excludes class/interface/enum/record declarations
 fn detect_java_methods(lines: &[&str]) -> Vec<MethodBoundary> {
+    // Access modifier + permissive return type (generics with spaces OK) + name + `(`.
+    // We allow anything up to the last `\w+\s*\(` on the line, which handles
+    // `public Map<String, List<Order>> process()` correctly.
     let method_re = regex::Regex::new(
-        r"^\s*(public|private|protected|static|final|abstract|synchronized|default|override\s)[\s\w<>\[\],?]*\s+(\w+)\s*\("
+        r"^\s*(?:public|private|protected|static|final|abstract|synchronized|default|override)\b[^(;=]*?(\w+)\s*\("
+    ).unwrap();
+    // Kotlin: `fun [visibility?] [extensionReceiver.]methodName(` — no modifier required
+    let kotlin_re = regex::Regex::new(
+        r"^\s*(?:public\s+|private\s+|protected\s+|internal\s+)?(?:inline\s+|suspend\s+|operator\s+|override\s+|open\s+|tailrec\s+|external\s+|infix\s+)*fun\s+(?:<[^>]*>\s+)?(?:[\w.<>]+\.)?(\w+)\s*\("
     ).unwrap();
     let class_re = regex::Regex::new(
-        r"\b(class|interface|enum|record)\s+"
+        r"\b(class|interface|enum|record|object|trait)\s+"
     ).unwrap();
+    // Annotation line: `@Something` possibly with parens `@Something(x)`
+    let annotation_re = regex::Regex::new(r"^\s*@\w").unwrap();
+
     let mut methods = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if let Some(caps) = method_re.captures(lines[i]) {
+        let caps = method_re.captures(lines[i]).or_else(|| kotlin_re.captures(lines[i]));
+        if let Some(caps) = caps {
             // Skip class/interface/enum declarations
             if class_re.is_match(lines[i]) {
                 i += 1;
                 continue;
             }
-            let name = caps.get(2).map(|m| m.as_str().to_string())
+            let name = caps.get(1).map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| format!("anonymous_{}", i + 1));
-            let start = i + 1;
-            // Find balanced braces
+
+            // US-058: walk backwards to include preceding annotation/decorator lines.
+            // Stops at the first non-annotation, non-blank line.
+            let mut boundary_start = i;
+            while boundary_start > 0 {
+                let prev = lines[boundary_start - 1].trim();
+                if prev.is_empty() || annotation_re.is_match(prev) {
+                    boundary_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let start = boundary_start + 1; // 1-indexed
+            // Find balanced braces starting from the signature line
             let mut brace_depth = 0i32;
             let mut found_open = false;
             let mut j = i;
@@ -663,11 +1122,77 @@ fn detect_rust_functions(lines: &[&str]) -> Vec<MethodBoundary> {
     detect_brace_delimited(lines, &fn_re, 3)
 }
 
+/// US-058: JS/TS function detection with async + arrow functions + method shorthand.
+///
+/// Handles:
+/// - `function foo()` / `async function foo()` / `export function foo()`
+/// - `const foo = () => { ... }` / `const foo = async (x) => { ... }`
+/// - Class/object method shorthand: `foo() { ... }` / `async foo() { ... }`
+/// - TypeScript decorators: `@Component` lines included in boundary
 fn detect_js_functions(lines: &[&str]) -> Vec<MethodBoundary> {
+    // Three alternatives captured into 3 distinct groups so we can pick whichever matched:
+    //   1) function foo / async function foo / export [async] function foo
+    //   2) const/let/var foo = [async] ( ... ) => { OR = function ( ... ) {
+    //   3) method shorthand foo() { ... } / async foo() { ... }
     let func_re = regex::Regex::new(
-        r"(?:^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)|^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(?|^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{)"
+        r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)|^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?(?:function\s*\*?\s*\w*\s*)?\([^)]*\)\s*(?:=>|\{)|^\s*(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+)*(?:async\s+|\*\s*)?(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^{=]+)?\s*\{"
     ).unwrap();
-    detect_brace_delimited_multi_capture(lines, &func_re, &[1, 2, 3])
+    let decorator_re = regex::Regex::new(r"^\s*@\w").unwrap();
+
+    let mut methods = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(caps) = func_re.captures(lines[i]) {
+            let name = [1usize, 2, 3]
+                .iter()
+                .filter_map(|&g| caps.get(g).map(|m| m.as_str().to_string()))
+                .find(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("anonymous_{}", i + 1));
+
+            // Exclude common keywords that might match group 3 (if, for, while, switch, catch)
+            if matches!(name.as_str(), "if" | "for" | "while" | "switch" | "catch" | "return" | "throw" | "do") {
+                i += 1;
+                continue;
+            }
+
+            // Walk back to include decorators
+            let mut boundary_start = i;
+            while boundary_start > 0 {
+                let prev = lines[boundary_start - 1].trim();
+                if prev.is_empty() || decorator_re.is_match(prev) {
+                    boundary_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let start = boundary_start + 1;
+
+            // Find balanced braces
+            let mut brace_depth = 0i32;
+            let mut found_open = false;
+            let mut j = i;
+            while j < lines.len() {
+                for ch in lines[j].chars() {
+                    if ch == '{' { brace_depth += 1; found_open = true; }
+                    else if ch == '}' { brace_depth -= 1; }
+                }
+                if found_open && brace_depth == 0 {
+                    methods.push(MethodBoundary {
+                        name,
+                        start_line: start,
+                        end_line: j + 1,
+                    });
+                    i = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_open || brace_depth != 0 { i += 1; }
+        } else {
+            i += 1;
+        }
+    }
+    methods
 }
 
 /// Generic brace-delimited function detector.
@@ -727,30 +1252,68 @@ fn detect_brace_delimited_multi_capture(
     methods
 }
 
-/// Python: function = `def name(` with indentation-based end detection.
+/// US-058: Python function/method detection with async + decorator support.
+///
+/// Handles:
+/// - `def name(` and `async def name(`
+/// - Decorators (`@pytest.fixture`, `@property`, etc.) — included in the boundary
+/// - Multi-line docstrings (`"""..."""` / `'''...'''`) — indented code inside a
+///   docstring no longer prematurely terminates the function body
+/// - Inner functions — detected as independent boundaries with the outer function's name prefix
 fn detect_python_functions(lines: &[&str]) -> Vec<MethodBoundary> {
-    let def_re = regex::Regex::new(r"^(\s*)def\s+(\w+)\s*\(").unwrap();
+    let def_re = regex::Regex::new(r"^(\s*)(?:async\s+)?def\s+(\w+)\s*\(").unwrap();
+    let decorator_re = regex::Regex::new(r"^\s*@\w").unwrap();
+
+    // Helper: does this line contain triple-quote string delimiters that would
+    // open/close a docstring? We only care about `"""` / `'''` at start-of-content.
+    fn count_triple_quotes(line: &str) -> (u32, u32) {
+        // (double_triple, single_triple)
+        let d = line.matches("\"\"\"").count() as u32;
+        let s = line.matches("'''").count() as u32;
+        (d, s)
+    }
+
     let mut methods = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if let Some(caps) = def_re.captures(lines[i]) {
             let indent = caps.get(1).map(|m| m.as_str().len()).unwrap_or(0);
             let name = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let start = i + 1; // 1-indexed
 
-            // Function body: all subsequent lines with indent > function def indent,
-            // or blank lines within the body
+            // Walk backwards to include decorator lines
+            let mut boundary_start = i;
+            while boundary_start > 0 {
+                let prev = lines[boundary_start - 1];
+                if prev.trim().is_empty() || decorator_re.is_match(prev) {
+                    boundary_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let start = boundary_start + 1; // 1-indexed
+
+            // Function body: lines with indent > function def indent, tracking
+            // whether we're inside a triple-quoted docstring so dedented lines
+            // there don't end the function prematurely.
             let mut end = i;
             let mut j = i + 1;
+            let mut in_triple_double = false;
+            let mut in_triple_single = false;
             while j < lines.len() {
                 let line = lines[j];
+
+                // Update docstring state based on triple-quote occurrences in this line.
+                let (d, s) = count_triple_quotes(line);
+                if d % 2 == 1 { in_triple_double = !in_triple_double; }
+                if s % 2 == 1 { in_triple_single = !in_triple_single; }
+                let in_docstring = in_triple_double || in_triple_single;
+
                 if line.trim().is_empty() {
-                    // Blank lines are part of the body
                     j += 1;
                     continue;
                 }
                 let line_indent = line.len() - line.trim_start().len();
-                if line_indent > indent {
+                if in_docstring || line_indent > indent {
                     end = j;
                     j += 1;
                 } else {
@@ -765,7 +1328,9 @@ fn detect_python_functions(lines: &[&str]) -> Vec<MethodBoundary> {
                     end_line: end + 1, // 1-indexed
                 });
             }
-            i = end + 1;
+            // Advance by 1 (not `end + 1`) so nested functions inside this method
+            // are discovered as separate boundaries.
+            i += 1;
         } else {
             i += 1;
         }
@@ -1073,6 +1638,133 @@ pub(crate) use color_info;
 mod tests {
     use super::*;
 
+    // -- enclosing_method_range --
+
+    #[test]
+    fn enclosing_method_range_java_picks_method_not_file_end() {
+        let src = "\
+public class Foo {
+    public void a() {
+        int x = 1;
+        int y = 2;
+    }
+
+    public void b() {
+        int z = 3;
+    }
+
+    public void c() {
+        int w = 4;
+    }
+}
+";
+        // Line 3 is inside a() — should return (2, 5), not (2, 15).
+        let range = enclosing_method_range(src, "Foo.java", 3);
+        assert_eq!(range, Some((2, 5)));
+    }
+
+    #[test]
+    fn enclosing_method_range_returns_none_for_class_level_line() {
+        let src = "\
+public class Foo {
+    public void a() {
+        int x = 1;
+    }
+}
+";
+        // Line 1 is the class declaration — no enclosing method.
+        assert_eq!(enclosing_method_range(src, "Foo.java", 1), None);
+    }
+
+    // -- rule_is_coverage_dependent --
+
+    #[test]
+    fn rule_coverage_dependent_sonar_common() {
+        assert!(rule_is_coverage_dependent("common-java:InsufficientLineCoverage"));
+        assert!(rule_is_coverage_dependent("common-java:InsufficientBranchCoverage"));
+        assert!(rule_is_coverage_dependent("common-js:InsufficientLineCoverage"));
+    }
+
+    #[test]
+    fn rule_coverage_dependent_generic_coverage_keyword() {
+        assert!(rule_is_coverage_dependent("custom:UncoveredLines"));
+        assert!(rule_is_coverage_dependent("some:new_coverage_rule"));
+    }
+
+    #[test]
+    fn rule_not_coverage_dependent_vulnerability() {
+        assert!(!rule_is_coverage_dependent("java:S5542"));        // weak crypto
+        assert!(!rule_is_coverage_dependent("java:S2589"));        // dead code
+        assert!(!rule_is_coverage_dependent("python:S1481"));      // unused local
+        assert!(!rule_is_coverage_dependent("javascript:S1481"));
+    }
+
+    #[test]
+    fn rule_not_coverage_dependent_duplication() {
+        // Duplication is a metric but not coverage — regen not required for rescan
+        assert!(!rule_is_coverage_dependent("common-java:DuplicatedBlocks"));
+    }
+
+    #[test]
+    fn rule_linter_is_static_not_coverage_dependent() {
+        assert!(!rule_is_coverage_dependent("lint:clippy:unused_imports"));
+        assert!(!rule_is_coverage_dependent("lint:eslint:no-unused-vars"));
+        assert!(!rule_is_coverage_dependent("lint:ruff:F401"));
+    }
+
+    // -- merge_lint_and_sonar_issues --
+
+    fn fake_issue(key: &str, rule: &str, severity: &str) -> sonar::Issue {
+        sonar::Issue {
+            key: key.to_string(),
+            rule: rule.to_string(),
+            severity: severity.to_string(),
+            component: "proj:src/x".to_string(),
+            issue_type: "CODE_SMELL".to_string(),
+            message: String::new(),
+            text_range: None,
+            status: "OPEN".to_string(),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn merge_orders_by_severity_lint_first() {
+        let lint = vec![
+            fake_issue("L1", "lint:clippy:a", "MAJOR"),
+            fake_issue("L2", "lint:clippy:b", "BLOCKER"),
+        ];
+        let sonar_is = vec![
+            fake_issue("S1", "java:S1", "MAJOR"),
+            fake_issue("S2", "java:S2", "BLOCKER"),
+        ];
+        let merged = merge_lint_and_sonar_issues(lint, sonar_is, false);
+        let keys: Vec<&str> = merged.iter().map(|i| i.key.as_str()).collect();
+        // BLOCKER bucket: L2 before S2; then MAJOR bucket: L1 before S1
+        assert_eq!(keys, vec!["L2", "S2", "L1", "S1"]);
+    }
+
+    #[test]
+    fn merge_handles_empty_lists() {
+        let only_lint = vec![fake_issue("L1", "lint:r", "MAJOR")];
+        let merged = merge_lint_and_sonar_issues(only_lint.clone(), vec![], false);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].key, "L1");
+
+        let only_sonar = vec![fake_issue("S1", "java:r", "MAJOR")];
+        let merged2 = merge_lint_and_sonar_issues(vec![], only_sonar, false);
+        assert_eq!(merged2[0].key, "S1");
+    }
+
+    #[test]
+    fn merge_reverse_severity_flips_order() {
+        let lint = vec![fake_issue("L_INFO", "lint:x", "INFO")];
+        let sonar_is = vec![fake_issue("S_BLOCKER", "java:y", "BLOCKER")];
+        let merged = merge_lint_and_sonar_issues(lint, sonar_is, true);
+        assert_eq!(merged[0].key, "L_INFO");
+        assert_eq!(merged[1].key, "S_BLOCKER");
+    }
+
     // -- is_test_file --
 
     #[test]
@@ -1228,6 +1920,40 @@ mod tests {
     #[test]
     fn test_truncate_tail_long() {
         assert_eq!(truncate_tail("hello world", 5), "...world");
+    }
+
+    // -- build_slim_framework_context (US-056) --
+
+    #[test]
+    fn test_build_slim_framework_context_empty() {
+        let tg = crate::config::TestGenerationConfig::default();
+        assert!(build_slim_framework_context(&tg).is_empty());
+    }
+
+    #[test]
+    fn test_build_slim_framework_context_avoids_spring() {
+        let tg = crate::config::TestGenerationConfig {
+            avoid_spring_context: true,
+            ..Default::default()
+        };
+        let ctx = build_slim_framework_context(&tg);
+        assert!(ctx.contains("MockitoExtension"));
+        // Must NOT include auto-detected dep info (the "Detected test dependencies: ..." prefix)
+        assert!(!ctx.contains("Detected test dependencies"));
+        // Must NOT include library-specific declarations (framework/mock/assertion_library fields)
+        assert!(!ctx.contains("Test framework:"));
+        assert!(!ctx.contains("Mock framework:"));
+    }
+
+    #[test]
+    fn test_build_slim_framework_context_custom_instructions_only() {
+        let tg = crate::config::TestGenerationConfig {
+            custom_instructions: Some("Use AssertJ fluent assertions.".to_string()),
+            ..Default::default()
+        };
+        let ctx = build_slim_framework_context(&tg);
+        assert!(ctx.contains("AssertJ fluent assertions"));
+        assert!(!ctx.contains("Detected test dependencies"));
     }
 
     // -- capture_diff_summary (US-021) --
@@ -1612,6 +2338,137 @@ FAIL src/components/Button.test.tsx
         assert!(extract_uncovered_snippets("line1\n", &[], 80).is_empty());
     }
 
+    // -- detect_boundary_hints (US-067) --
+
+    #[test]
+    fn detect_boundary_hints_numeric_comparison() {
+        let snippet = "// Lines 42-42 (UNCOVERED):\n>  42:     if (value > 100) { return; }\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.contains("numeric comparison"), "got: {}", hints);
+        assert!(hints.contains("> 100"));
+    }
+
+    #[test]
+    fn detect_boundary_hints_throw_statement() {
+        let snippet = "// Lines 5-5 (UNCOVERED):\n>   5:     throw new IllegalArgumentException(\"bad\");\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.contains("explicit throw"), "got: {}", hints);
+    }
+
+    #[test]
+    fn detect_boundary_hints_empty_check() {
+        let snippet = "// Lines 10-10 (UNCOVERED):\n>  10:     if (list.isEmpty()) return null;\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.contains("empty-check"), "got: {}", hints);
+    }
+
+    #[test]
+    fn detect_boundary_hints_null_usage() {
+        let snippet = "// Lines 20-20 (UNCOVERED):\n>  20:     if (user == null) return;\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.contains("null"), "got: {}", hints);
+    }
+
+    #[test]
+    fn detect_boundary_hints_index_access() {
+        let snippet = "// Lines 30-30 (UNCOVERED):\n>  30:     return items.get(idx);\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.contains("index access"), "got: {}", hints);
+    }
+
+    #[test]
+    fn detect_boundary_hints_empty_input_returns_empty() {
+        let hints = detect_boundary_hints("");
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn detect_boundary_hints_trivial_code_returns_empty() {
+        // Pure assignments shouldn't trigger any hint
+        let snippet = "// Lines 1-1:\n>   1:     let x = other;\n";
+        let hints = detect_boundary_hints(snippet);
+        assert!(hints.is_empty(), "got: {}", hints);
+    }
+
+    #[test]
+    fn detect_boundary_hints_deduplicates() {
+        // Two identical lines shouldn't produce two identical hints
+        let snippet = "\
+>   1:     if (x > 10) return;
+>   2:     if (x > 10) return;
+";
+        let hints = detect_boundary_hints(snippet);
+        // Both hints are "Line N: numeric..." with different line numbers so
+        // they're distinct — this verifies dedup doesn't eat distinct lines.
+        assert_eq!(hints.matches("numeric comparison").count(), 2);
+    }
+
+    #[test]
+    fn detect_boundary_hints_capped_at_10() {
+        // Generate 15 uncovered lines with comparisons
+        let mut snippet = String::new();
+        for i in 1..=15 {
+            snippet.push_str(&format!(">  {}:     if (a{} > 5) return;\n", i, i));
+        }
+        let hints = detect_boundary_hints(&snippet);
+        assert_eq!(hints.lines().count(), 10, "should be capped at 10");
+    }
+
+    // -- compact_method_snippet (US-053) --
+
+    #[test]
+    fn test_compact_method_snippet_short_unchanged() {
+        let snippet = "// Method: foo (lines 1-5)\n 1: fn foo() {\n 2:     let x = 1;\n>3:     x\n 4: }\n";
+        let result = compact_method_snippet(snippet, 80);
+        assert_eq!(result, snippet, "Short snippet should not be modified");
+    }
+
+    #[test]
+    fn test_compact_method_snippet_zero_max_unchanged() {
+        let body = (1..=100).map(|i| format!(" {:>4}: line_{}\n", i, i)).collect::<String>();
+        let snippet = format!("// Method: big (lines 1-100)\n{}", body);
+        let result = compact_method_snippet(&snippet, 0);
+        assert_eq!(result, snippet, "max_lines=0 should always return full snippet");
+    }
+
+    #[test]
+    fn test_compact_method_snippet_large_method_is_smaller() {
+        // Build a 120-line method with uncovered lines at 60 and 61
+        let mut body = String::new();
+        for i in 1..=120usize {
+            let marker = if i == 60 || i == 61 { ">" } else { " " };
+            body.push_str(&format!("{}{:>4}: line_{}\n", marker, i, i));
+        }
+        let snippet = format!("// Method: big (lines 1-120)\n{}", body);
+
+        let result = compact_method_snippet(&snippet, 80);
+        let original_lines = snippet.lines().count();
+        let result_lines = result.lines().count();
+
+        assert!(result_lines < original_lines, "Compact result ({} lines) should be shorter than original ({} lines)", result_lines, original_lines);
+        // Should include the uncovered lines
+        assert!(result.contains(">  60: line_60"), "Should include uncovered line 60");
+        assert!(result.contains(">  61: line_61"), "Should include uncovered line 61");
+        // Should include the header
+        assert!(result.contains("// Method: big"), "Should include header");
+        // Should include a gap comment
+        assert!(result.contains("lines omitted"), "Should include omission comment");
+    }
+
+    #[test]
+    fn test_compact_method_snippet_preserves_closing_brace() {
+        // Build a 100-line method; uncovered line at line 20 only
+        let mut body = String::new();
+        for i in 1..=100usize {
+            let marker = if i == 20 { ">" } else { " " };
+            body.push_str(&format!("{}{:>4}: line_{}\n", marker, i, i));
+        }
+        let snippet = format!("// Method: m (lines 1-100)\n{}", body);
+        let result = compact_method_snippet(&snippet, 80);
+        // Last body line (line_100) must be preserved as the closing brace equivalent
+        assert!(result.contains("line_100"), "Should preserve the last body line");
+    }
+
     // -- split_into_method_chunks / method detection --
 
     #[test]
@@ -1711,5 +2568,240 @@ public class Foo {
         let chunks = split_into_method_chunks(java_src, &uncovered, "Foo.java");
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].label.contains("lines"));
+    }
+
+    // -- US-058: robustness improvements to method detector --
+
+    #[test]
+    fn test_java_detects_nested_generics_with_spaces() {
+        let java_src = "\
+public class Service {
+    public Map<String, List<Order>> processAll(List<Request> reqs) {
+        return reqs.stream()
+            .map(this::process)
+            .collect(Collectors.toMap(Order::getId, Function.identity()));
+    }
+}
+";
+        let uncovered = vec![3];
+        let chunks = split_into_method_chunks(java_src, &uncovered, "Service.java");
+        // Should find `processAll` via method detector, NOT fall back
+        assert!(!chunks.is_empty());
+        // Fallback label format is "Lines X-Y (N uncovered)", so if we see a method name we're good.
+        let has_method_label = chunks.iter().any(|c| c.label == "processAll");
+        assert!(has_method_label, "Expected to detect processAll method, got labels: {:?}",
+            chunks.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_java_includes_annotations_in_boundary() {
+        // Annotation line 3, method signature line 4, uncovered line 5 inside method.
+        let java_src = "\
+public class S {
+
+    @Override
+    public void foo() {
+        bar();
+    }
+}
+";
+        let uncovered = vec![5];
+        let chunks = split_into_method_chunks(java_src, &uncovered, "S.java");
+        assert!(!chunks.is_empty());
+        let foo_chunk = chunks.iter().find(|c| c.label == "foo").expect("foo not found");
+        // The annotation line 3 should appear in the snippet
+        assert!(foo_chunk.snippet.contains("@Override"),
+            "Expected @Override annotation in snippet, got:\n{}", foo_chunk.snippet);
+    }
+
+    #[test]
+    fn test_kotlin_extension_function() {
+        let kt_src = "\
+fun String.toSnakeCase(): String {
+    return this
+        .replace(Regex(\"([a-z])([A-Z])\"), \"$1_$2\")
+        .lowercase()
+}
+";
+        let uncovered = vec![3];
+        let chunks = split_into_method_chunks(kt_src, &uncovered, "StringExt.kt");
+        let has = chunks.iter().any(|c| c.label == "toSnakeCase");
+        assert!(has, "Expected toSnakeCase detected, got: {:?}",
+            chunks.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_python_async_def() {
+        let py_src = "\
+async def fetch_data(url):
+    async with session.get(url) as resp:
+        return await resp.json()
+";
+        let uncovered = vec![3];
+        let chunks = split_into_method_chunks(py_src, &uncovered, "client.py");
+        let has = chunks.iter().any(|c| c.label == "fetch_data");
+        assert!(has);
+    }
+
+    #[test]
+    fn test_python_decorator_included() {
+        let py_src = "\
+@pytest.fixture
+def sample_data():
+    return {'key': 'value'}
+";
+        let uncovered = vec![3];
+        let chunks = split_into_method_chunks(py_src, &uncovered, "test_foo.py");
+        let fc = chunks.iter().find(|c| c.label == "sample_data").expect("function not found");
+        assert!(fc.snippet.contains("@pytest.fixture"));
+    }
+
+    #[test]
+    fn test_python_docstring_does_not_end_function() {
+        let py_src = "\
+def foo():
+    \"\"\"
+    Example:
+x = 1
+    \"\"\"
+    return 42
+";
+        let uncovered = vec![6];
+        let chunks = split_into_method_chunks(py_src, &uncovered, "mod.py");
+        let fc = chunks.iter().find(|c| c.label == "foo").expect("foo not found");
+        // The `return 42` line must be within foo's boundary
+        assert!(fc.snippet.contains("return 42"),
+            "Expected 'return 42' in foo snippet, got:\n{}", fc.snippet);
+    }
+
+    #[test]
+    fn test_js_arrow_function_with_const() {
+        let js_src = "\
+export const handleClick = async (e) => {
+    await processEvent(e);
+    return true;
+};
+";
+        let uncovered = vec![2];
+        let chunks = split_into_method_chunks(js_src, &uncovered, "handler.ts");
+        let has = chunks.iter().any(|c| c.label == "handleClick");
+        assert!(has, "Expected handleClick detected, got: {:?}",
+            chunks.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_js_class_method_shorthand() {
+        let ts_src = "\
+class Service {
+    async fetchUser(id: string): Promise<User> {
+        return this.client.get(id);
+    }
+}
+";
+        let uncovered = vec![3];
+        let chunks = split_into_method_chunks(ts_src, &uncovered, "service.ts");
+        let has = chunks.iter().any(|c| c.label == "fetchUser");
+        assert!(has, "Expected fetchUser detected, got: {:?}",
+            chunks.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    // -- group_chunks_into_batches --
+
+    fn make_chunk(label: &str, uncovered_count: usize, snippet_lines: usize) -> MethodChunk {
+        let snippet = (0..snippet_lines).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        MethodChunk {
+            label: label.to_string(),
+            uncovered_lines: (1..=uncovered_count as u32).collect(),
+            snippet,
+            uncovered_count,
+        }
+    }
+
+    #[test]
+    fn test_group_chunks_empty() {
+        assert!(group_chunks_into_batches(vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_group_chunks_single_small() {
+        // A single small chunk → one batch of one
+        let batches = group_chunks_into_batches(vec![make_chunk("a", 5, 30)]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+    }
+
+    #[test]
+    fn test_group_chunks_large_solo() {
+        // A chunk with >25 uncovered lines → its own batch
+        let batches = group_chunks_into_batches(vec![make_chunk("big", 30, 50)]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].label, "big");
+    }
+
+    #[test]
+    fn test_group_chunks_large_snippet_solo() {
+        // A chunk with >100 snippet lines → solo even if few uncovered lines
+        let batches = group_chunks_into_batches(vec![make_chunk("wide", 5, 110)]);
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn test_group_chunks_two_small_batched_together() {
+        // Two small chunks that fit within the budget → single batch
+        let chunks = vec![make_chunk("a", 5, 30), make_chunk("b", 5, 30)];
+        let batches = group_chunks_into_batches(chunks);
+        assert_eq!(batches.len(), 1, "two small chunks should be one batch");
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn test_group_chunks_simple_merged_into_one_batch() {
+        // Four simple chunks (≤5 uncovered, ≤30 snippet) → all merged into one batch
+        // (simple-method fast path raises the batch-size limit to 8).
+        let chunks = vec![
+            make_chunk("a", 3, 10),
+            make_chunk("b", 3, 10),
+            make_chunk("c", 3, 10),
+            make_chunk("d", 3, 10),
+        ];
+        let batches = group_chunks_into_batches(chunks);
+        assert_eq!(batches.len(), 1, "four simple chunks should be one batch");
+        assert_eq!(batches[0].len(), 4);
+    }
+
+    #[test]
+    fn test_group_chunks_regular_max_three_per_batch() {
+        // Four moderate chunks (>5 uncovered, not simple) → first three batched, fourth starts new.
+        let chunks = vec![
+            make_chunk("a", 8, 40),
+            make_chunk("b", 8, 40),
+            make_chunk("c", 8, 40),
+            make_chunk("d", 8, 40),
+        ];
+        let batches = group_chunks_into_batches(chunks);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 3);
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    #[test]
+    fn test_group_chunks_overflow_uncovered_splits_batch() {
+        // Two chunks whose combined uncovered lines exceed MAX_BATCH_UNCOVERED (30) → two batches
+        let chunks = vec![make_chunk("a", 20, 20), make_chunk("b", 20, 20)];
+        let batches = group_chunks_into_batches(chunks);
+        assert_eq!(batches.len(), 2);
+    }
+
+    #[test]
+    fn test_group_chunks_solo_flushes_pending_small() {
+        // A pending small batch should be flushed before a solo large chunk
+        let chunks = vec![
+            make_chunk("small", 5, 20),
+            make_chunk("big",   30, 50),
+        ];
+        let batches = group_chunks_into_batches(chunks);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0][0].label, "small");
+        assert_eq!(batches[1][0].label, "big");
     }
 }

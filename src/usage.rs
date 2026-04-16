@@ -1,19 +1,15 @@
-//! Token usage tracking across all AI engine invocations.
+//! Token usage data types and per-engine parsers.
 //!
-//! Provides a shared collector that records input/output tokens per (step, engine, model)
-//! so the orchestrator can print a summary table at the end of a run.
+//! This module provides:
+//! - `TokenUsage` / `UsageEntry`: data structures describing one AI invocation's cost
+//! - Parsers that extract usage from each engine's stdout (Claude JSON, Aider, Gemini)
 //!
-//! Each engine exposes usage differently:
-//! - **Claude** (`--output-format json`): usage is a structured field in the result JSON.
-//! - **Gemini**: best-effort parsing from stdout (unstable format).
-//! - **Aider**: best-effort regex on stdout (e.g., "Tokens: 1.2k sent, 340 received").
-//!
-//! When parsing fails, the step is still recorded with zero tokens so the user sees
-//! the call happened even if counts are unknown.
+//! Historical note: an in-memory `UsageTracker` used to accumulate entries for a
+//! run-end summary table. That responsibility has moved to `execution_log`
+//! (SQLite-backed) — the summary is now computed directly from the database,
+//! so this module keeps only the parsing primitives.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use crate::engine::EngineKind;
 
@@ -52,7 +48,8 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
-/// A single recorded invocation.
+/// A single recorded invocation. Produced by the engine layer and forwarded
+/// directly to the execution log (SQLite).
 #[derive(Debug, Clone)]
 pub struct UsageEntry {
     pub step: String,
@@ -63,43 +60,14 @@ pub struct UsageEntry {
     pub unknown: bool,
 }
 
-/// Shared, thread-safe accumulator of usage entries.
-#[derive(Debug, Default)]
-pub struct UsageTracker {
-    entries: Mutex<Vec<UsageEntry>>,
-}
-
-impl UsageTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record(&self, entry: UsageEntry) {
-        if let Ok(mut v) = self.entries.lock() {
-            v.push(entry);
-        }
-    }
-
-    pub fn snapshot(&self) -> Vec<UsageEntry> {
-        self.entries.lock().map(|v| v.clone()).unwrap_or_default()
-    }
-
-    /// Merge all entries from another tracker into this one.
-    /// Used to collect usage from parallel workers.
-    pub fn merge_from(&self, other: &UsageTracker) {
-        let entries = other.snapshot();
-        if let Ok(mut v) = self.entries.lock() {
-            v.extend(entries);
-        }
-    }
-}
-
 // --- Claude JSON output parsing ---
 
 #[derive(Debug, Deserialize)]
 struct ClaudeResultJson {
+    // `result` can be a plain string OR an array of content blocks depending on
+    // the Claude CLI version — use Value so a type mismatch never silently drops the line.
     #[serde(default)]
-    result: Option<String>,
+    result: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<ClaudeUsageJson>,
 }
@@ -123,13 +91,24 @@ struct ClaudeUsageJson {
 /// `--output-format text`. Returns `None` when stdout is not JSON or doesn't
 /// match the expected schema (in which case callers should fall back to raw stdout).
 pub fn parse_claude_json(stdout: &str) -> Option<(String, TokenUsage)> {
-    let trimmed = stdout.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let parsed: ClaudeResultJson = serde_json::from_str(trimmed).ok()?;
-    let result = parsed.result.unwrap_or_default();
-    let usage = parsed.usage.map(|u| TokenUsage {
+    // `claude --output-format json` emits streaming NDJSON: one JSON object per line.
+    // The line with `"type":"result"` contains both the assistant text and usage.
+    // We filter on `usage.is_some()` rather than `result.is_some()` so that lines where
+    // `result` is an array (content blocks) instead of a plain string are still accepted.
+    let result_line = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .filter_map(|l| serde_json::from_str::<ClaudeResultJson>(l).ok())
+        .filter(|p| p.usage.is_some())
+        .last()?;
+
+    // Coerce result value to a string regardless of its JSON type.
+    let result = match result_line.result {
+        Some(serde_json::Value::String(s)) => s,
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    let usage = result_line.usage.map(|u| TokenUsage {
         input: u.input_tokens,
         output: u.output_tokens,
         cache_read: u.cache_read_input_tokens,
@@ -174,78 +153,6 @@ pub fn parse_gemini_usage(stdout: &str) -> Option<TokenUsage> {
     Some(TokenUsage { input, output, cache_read: 0, cache_creation: 0 })
 }
 
-/// Render a markdown table of usage grouped by (step, model).
-///
-/// Each row is one (step, model) pair with aggregated tokens. A final TOTAL row
-/// sums across all entries.
-pub fn render_usage_table(entries: &[UsageEntry]) -> String {
-    if entries.is_empty() {
-        return "_No AI calls recorded._\n".to_string();
-    }
-
-    // Aggregate by (step, model) — BTreeMap for stable ordering.
-    let mut agg: BTreeMap<(String, String, EngineKind), (TokenUsage, u32, u32)> = BTreeMap::new();
-    for e in entries {
-        let key = (e.step.clone(), e.model.clone(), e.engine.clone());
-        let slot = agg.entry(key).or_insert((TokenUsage::default(), 0, 0));
-        slot.0 += e.usage;
-        slot.1 += 1;
-        if e.unknown {
-            slot.2 += 1;
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str("| Step | Engine | Model | Calls | Input | Cache read | Output | Unknown |\n");
-    out.push_str("|------|--------|-------|------:|------:|-----------:|-------:|--------:|\n");
-
-    let mut total = TokenUsage::default();
-    let mut total_calls: u32 = 0;
-    let mut total_unknown: u32 = 0;
-
-    for ((step, model, engine), (usage, calls, unknown)) in &agg {
-        out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
-            step,
-            engine,
-            model,
-            calls,
-            fmt_num(usage.input),
-            fmt_num(usage.cache_read),
-            fmt_num(usage.output),
-            unknown,
-        ));
-        total += *usage;
-        total_calls += calls;
-        total_unknown += unknown;
-    }
-
-    out.push_str(&format!(
-        "| **TOTAL** | — | — | **{}** | **{}** | **{}** | **{}** | **{}** |\n",
-        total_calls,
-        fmt_num(total.input),
-        fmt_num(total.cache_read),
-        fmt_num(total.output),
-        total_unknown,
-    ));
-
-    out
-}
-
-fn fmt_num(n: u64) -> String {
-    // Thousands separator for readability.
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,11 +175,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_json_missing_usage_defaults_to_zero() {
+    fn parse_claude_json_missing_usage_returns_none() {
+        // No `usage` field → filtered out; function returns None (caller falls back to raw stdout).
         let stdout = r#"{"result":"done"}"#;
+        assert!(parse_claude_json(stdout).is_none());
+    }
+
+    #[test]
+    fn parse_claude_json_result_as_array_content_blocks() {
+        // Newer Claude CLI versions may emit result as an array of content blocks.
+        // The function must still return usage even when result is not a plain string.
+        let stdout = r#"{"type":"result","subtype":"success","result":[{"type":"text","text":"Fixed."}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        let (_text, usage) = parse_claude_json(stdout).unwrap();
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+    }
+
+    #[test]
+    fn parse_claude_json_multiline_ndjson() {
+        // claude --output-format json emits one JSON object per line (NDJSON).
+        // The result+usage live on the last line with "type":"result".
+        let stdout = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"abc\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fixing...\"}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Fixed.\",",
+            "\"usage\":{\"input_tokens\":500,\"output_tokens\":120,",
+            "\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":0}}\n",
+        );
         let (text, usage) = parse_claude_json(stdout).unwrap();
-        assert_eq!(text, "done");
-        assert_eq!(usage, TokenUsage::default());
+        assert_eq!(text, "Fixed.");
+        assert_eq!(usage.input, 500);
+        assert_eq!(usage.output, 120);
+        assert_eq!(usage.cache_read, 300);
     }
 
     #[test]
@@ -297,58 +231,24 @@ mod tests {
     }
 
     #[test]
-    fn tracker_records_and_snapshots() {
-        let t = UsageTracker::new();
-        t.record(UsageEntry {
-            step: "fix".into(),
-            engine: EngineKind::Claude,
-            model: "sonnet".into(),
-            usage: TokenUsage { input: 10, output: 20, cache_read: 0, cache_creation: 0 },
-            unknown: false,
-        });
-        let snap = t.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].usage.input, 10);
+    fn parse_claude_json_actual_cli_output() {
+        // Real output from `claude 2.1.x --output-format json`.
+        // The `usage` object has nested sub-objects (server_tool_use, cache_creation,
+        // iterations) that are NOT in our struct — they must be silently ignored.
+        let stdout = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1224,"num_turns":1,"result":"ok","#,
+            r#""stop_reason":"end_turn","session_id":"abc","total_cost_usd":0.036,"#,
+            r#""usage":{"input_tokens":2,"cache_creation_input_tokens":8743,"cache_read_input_tokens":12030,"output_tokens":4,"#,
+            r#""server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","#,
+            r#""cache_creation":{"ephemeral_1h_input_tokens":8743,"ephemeral_5m_input_tokens":0},"inference_geo":"","#,
+            r#""iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":12030,"cache_creation_input_tokens":8743}],"speed":"standard"}}"#,
+        );
+        let (text, usage) = parse_claude_json(stdout).expect("must parse real CLI output");
+        assert_eq!(text, "ok");
+        assert_eq!(usage.input, 2);
+        assert_eq!(usage.output, 4);
+        assert_eq!(usage.cache_read, 12030);
+        assert_eq!(usage.cache_creation, 8743);
     }
 
-    #[test]
-    fn render_table_aggregates_by_step_model() {
-        let entries = vec![
-            UsageEntry {
-                step: "fix".into(),
-                engine: EngineKind::Claude,
-                model: "sonnet".into(),
-                usage: TokenUsage { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
-                unknown: false,
-            },
-            UsageEntry {
-                step: "fix".into(),
-                engine: EngineKind::Claude,
-                model: "sonnet".into(),
-                usage: TokenUsage { input: 200, output: 80, cache_read: 0, cache_creation: 0 },
-                unknown: false,
-            },
-            UsageEntry {
-                step: "coverage".into(),
-                engine: EngineKind::Claude,
-                model: "haiku".into(),
-                usage: TokenUsage { input: 30, output: 10, cache_read: 0, cache_creation: 0 },
-                unknown: false,
-            },
-        ];
-        let table = render_usage_table(&entries);
-        assert!(table.contains("fix"));
-        assert!(table.contains("sonnet"));
-        assert!(table.contains("haiku"));
-        assert!(table.contains("300")); // aggregated input for fix/sonnet
-        assert!(table.contains("TOTAL"));
-    }
-
-    #[test]
-    fn fmt_num_adds_thousands_separator() {
-        assert_eq!(fmt_num(0), "0");
-        assert_eq!(fmt_num(999), "999");
-        assert_eq!(fmt_num(1000), "1,000");
-        assert_eq!(fmt_num(1234567), "1,234,567");
-    }
 }

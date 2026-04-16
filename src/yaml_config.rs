@@ -33,6 +33,15 @@ pub struct YamlConfig {
     /// Test generation hints for framework-aware prompts (US-040)
     #[serde(default)]
     pub test_generation: TestGenerationYaml,
+    /// Compliance configuration (US-069, US-073).
+    /// When present, activates IEC 62304 risk classification, requirements traceability, etc.
+    #[serde(default)]
+    pub compliance: ComplianceYaml,
+    /// Pre-fix risk assessment: skip cross-cutting issues that cannot be safely
+    /// fixed in isolation (e.g., CSRF, CORS, security headers that require
+    /// coordinated frontend/infrastructure changes).
+    #[serde(default)]
+    pub risk_assessment: RiskAssessmentYaml,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -43,6 +52,13 @@ pub struct SonarYaml {
     pub token: Option<String>,
     pub skip_scan: Option<bool>,
     pub scanner_path: Option<String>,
+    /// Include TEST-scope issues in the fetch. Default false (MAIN only).
+    pub include_test_issues: Option<bool>,
+    /// Ant-style globs to exclude from processing. Merged with reparo's
+    /// `--exclude` CLI flags and with whatever `sonar.exclusions` is
+    /// declared in the project's `sonar-project.properties`.
+    #[serde(default)]
+    pub exclusions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -70,6 +86,9 @@ pub struct ExecutionYaml {
     pub log_format: Option<String>,
     pub test_timeout: Option<u64>,
     pub claude_timeout: Option<u64>,
+    /// Directory (relative to project root) where the execution summary markdown
+    /// is written at the end of each run. Defaults to `.reparo`.
+    pub execution_log_report_dir: Option<String>,
     pub min_coverage: Option<f64>,
     pub min_file_coverage: Option<f64>,
     /// Run formatter and commit before starting fixes (default: true)
@@ -87,12 +106,16 @@ pub struct ExecutionYaml {
     pub coverage_wave_size: Option<u32>,
     /// Files per coverage boost commit (0 = same as coverage_wave_size, 1 = one commit per file)
     pub coverage_commit_batch: Option<u32>,
+    /// Issues per git commit during the fix step (0 = one per branch, 1 = one per issue, N = batch)
+    pub fix_commit_batch: Option<u32>,
     /// Number of files to process in parallel during coverage boost (1 = sequential, default: 1)
     pub coverage_parallel: Option<u32>,
     /// Number of issues to fix in parallel using git worktrees (1 = sequential, default: 1)
     pub parallel: Option<u32>,
     /// Stop coverage boost after N consecutive wave failures (0 = disabled, default: 5)
     pub max_boost_failures: Option<usize>,
+    /// Max lines to embed in a method chunk snippet for coverage boost (0 = always full, default: 80)
+    pub chunk_snippet_max_lines: Option<usize>,
     /// Retry failed wave files with error context in per-file fallback (default: true)
     pub retry_failed_wave_files: Option<bool>,
     /// Enable final validation — run full test suite after all fixes (default: true)
@@ -105,6 +128,27 @@ pub struct ExecutionYaml {
     pub max_dedup: Option<usize>,
     /// Rebase fix branch onto latest base before push/PR (default: true)
     pub auto_rebase: Option<bool>,
+    /// Run a targeted subset of tests (Surefire `-Dtest=`) before the full suite
+    /// during per-fix validation. If targeted tests pass, the full suite still
+    /// runs once to catch cross-class regressions. Saves ~half the test wall time
+    /// on the repair path. Maven-only; no-op for other runners. Default: true.
+    pub targeted_tests_first: Option<bool>,
+    /// Run SonarQube rescan verification every N fixes (default 1 = after each).
+    /// N > 1 saves ~20s × (N-1) per batch in sequential mode.
+    pub rescan_batch_size: Option<u32>,
+    /// Enable the test overlap detection phase (Step 3a, advisory).
+    /// Default: true. Set to false to skip.
+    pub test_overlap: Option<bool>,
+    /// Enable the local linter discovery phase (Step 3d). When true,
+    /// Reparo runs `commands.lint`, parses its output per `commands.lint_format`,
+    /// and folds findings into the fix queue. Default: true.
+    pub linter_scan: Option<bool>,
+    /// Run the linter's native autofix (e.g. `clippy --fix`) before parsing
+    /// findings. Default: false.
+    pub linter_autofix: Option<bool>,
+    /// Cap the number of linter findings forwarded to the fix loop (0 = no cap).
+    /// Default: 200.
+    pub max_linter_findings: Option<u32>,
 }
 
 /// Project commands that Reparo executes directly (no heuristics, no LLM).
@@ -121,16 +165,32 @@ pub struct CommandsYaml {
     pub test: Option<String>,
     /// Run tests with coverage
     pub coverage: Option<String>,
+    /// Regenerate the coverage report WITHOUT re-running the tests (reuses
+    /// prior jacoco.exec / .coverage data). When set, Reparo uses this
+    /// after post-fix validation tests have just run, saving the duplicate
+    /// full test suite execution. Auto-derived for Maven/Gradle when unset.
+    pub coverage_report_only: Option<String>,
     /// Format code after fix
     pub format: Option<String>,
     /// Lint/static analysis after tests (non-blocking)
     pub lint: Option<String>,
+    /// Output format of the configured `lint` command. Controls how Reparo
+    /// parses the linter's output into issue records for the fix loop.
+    ///
+    /// Supported values: "auto" (detect from the command string), "clippy",
+    /// "eslint", "ruff", "golangci-lint", "checkstyle", "sarif". Default: "auto".
+    pub lint_format: Option<String>,
     /// Path to the coverage report file (bypasses auto-detection)
     pub coverage_report: Option<String>,
     /// Documentation generation/validation command (e.g., "npx typedoc", "javadoc", "pydoc")
     pub docs: Option<String>,
     /// Fast compile-only command for tests (e.g., "mvn test-compile"). Falls back to `build`.
     pub test_compile: Option<String>,
+    /// US-059: When true, `coverage` already executes tests internally — Reparo
+    /// will skip the separate `test` invocation and derive pass/fail from the
+    /// coverage command's output. When None, Reparo auto-detects based on
+    /// common patterns (Maven, Gradle, pytest, npm).
+    pub tests_embedded_in_coverage: Option<bool>,
 }
 
 /// Documentation quality standards configuration.
@@ -210,6 +270,80 @@ pub struct PactYaml {
     pub api_patterns: Vec<String>,
 }
 
+// ─── Compliance YAML (US-069, US-073) ────────────────────────────────────────
+
+/// Top-level compliance configuration section in reparo.yaml.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ComplianceYaml {
+    /// Enable compliance features (must also pass --compliance CLI flag).
+    pub enabled: Option<bool>,
+    /// Default risk class when no pattern matches ("A" | "B" | "C").
+    pub default_risk_class: Option<String>,
+    /// Risk class rules for IEC 62304 classification (US-069).
+    #[serde(default)]
+    pub risk_classes: Vec<RiskClassYaml>,
+    /// Explicit requirements from the SRS (US-073).
+    #[serde(default)]
+    pub requirements: Vec<RequirementYaml>,
+    /// Standards targeted (for compliance report display).
+    #[serde(default)]
+    pub standards: Vec<String>,
+    /// When true, a FAIL verdict aborts the process with non-zero exit.
+    pub fail_on_violation: Option<bool>,
+    /// Directory for traceability matrix output (relative to project path).
+    pub traceability_dir: Option<String>,
+}
+
+/// One risk class entry (US-069).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RiskClassYaml {
+    /// "A", "B", or "C"
+    pub class: String,
+    pub description: Option<String>,
+    /// Glob patterns for files in this class.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Per-class policy overrides (optional).
+    #[serde(default)]
+    pub policy: RiskPolicyYaml,
+}
+
+/// Per-class testing policy overrides (US-069).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RiskPolicyYaml {
+    pub min_file_coverage: Option<f64>,
+    pub min_branch_coverage: Option<f64>,
+    pub coverage_rounds: Option<u32>,
+    pub require_negative_tests: Option<bool>,
+    pub require_boundary_tests: Option<bool>,
+    pub require_mcdc: Option<bool>,
+}
+
+/// One requirement entry in `compliance.requirements` (US-073).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RequirementYaml {
+    pub id: String,
+    pub description: String,
+    /// "A" | "B" | "C" (optional; if missing, inherits from file class)
+    pub risk_class: Option<String>,
+    /// Source document reference (e.g. "SRS v1.3 §4.2.1")
+    pub source: Option<String>,
+    /// ISO 14971 risk control reference (e.g. "RC-005")
+    pub risk_control: Option<String>,
+    /// Glob patterns for source files this requirement applies to.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Acceptance criteria text (appended to the test generation prompt).
+    pub acceptance_criteria: Option<String>,
+    /// If "manual", no automatic test is expected.
+    pub verification: Option<String>,
+    /// Notes about manual verification (e.g. "PR template + CODEOWNERS").
+    pub verified_by: Option<String>,
+}
+
 /// Test generation hints for framework-aware prompts (US-040).
 /// Allows users to specify the test framework, mock library, assertions, etc.
 /// so that generated tests compile and work with the project's actual setup.
@@ -230,6 +364,25 @@ pub struct TestGenerationYaml {
     /// Keys: `trivial`, `low`, `medium`, `high`, `complex`.
     /// Each maps to a `{model, effort}` pair.
     pub tiers: Option<TestGenTiersYaml>,
+    /// Where to write test files.
+    /// null / absent → colocated next to the source file (default).
+    /// Set to a directory path (e.g. "src/test/unit" or "projects/lib/test/unit")
+    /// to mirror the source tree under that directory instead.
+    pub test_dir: Option<String>,
+    /// Source root to strip before mirroring into `test_dir`.
+    /// Only used when `test_dir` is set.
+    /// If omitted the longest common path prefix between `test_dir` and the
+    /// source file is used automatically.
+    pub test_source_root: Option<String>,
+    /// When set, consolidate test files for sub-module source files into a
+    /// single spec file by keeping only the first N dot-separated name segments.
+    ///
+    /// Example (`test_spec_segments: 2`):
+    ///   `calendar.component.datesRender.ts`  →  `calendar.component.spec.ts`
+    ///   `calendar.component.eventDrop.ts`    →  `calendar.component.spec.ts`
+    ///
+    /// Null / absent → one spec file per source file (default behaviour).
+    pub test_spec_segments: Option<usize>,
 }
 
 /// Per-complexity-band model/effort overrides for test generation.
@@ -266,6 +419,28 @@ pub struct TierSpecYaml {
     pub effort: String,
 }
 
+/// Pre-fix risk assessment configuration (YAML mirror of `RiskAssessmentConfig`).
+///
+/// ```yaml
+/// risk_assessment:
+///   enabled: true
+///   ai_assessment: false   # Use Claude (haiku) to assess risk — adds latency per issue
+///   skip_threshold: "high" # "high" (default) or "medium"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RiskAssessmentYaml {
+    /// Enable risk assessment (default: false — must be explicitly opted in).
+    pub enabled: Option<bool>,
+    /// Use Claude (haiku, low effort) to assess risk for issues not caught by
+    /// static patterns. Adds one lightweight AI call per issue. Default: false.
+    pub ai_assessment: Option<bool>,
+    /// Skip the fix when assessed risk is >= this level.
+    /// "high" (default): only skip clearly cross-cutting issues.
+    /// "medium": also skip borderline cases.
+    pub skip_threshold: Option<String>,
+}
+
 /// Prompt customization per rule or category (US-019).
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -289,6 +464,89 @@ pub struct RulePrompt {
 pub struct CategoryPrompt {
     #[serde(default)]
     pub hint: Option<String>,
+}
+
+/// Resolve `ComplianceYaml` into a `ComplianceConfig` for runtime use.
+///
+/// Returns `Err` if any glob patterns are invalid or requirements fail validation.
+pub fn resolve_compliance_config(
+    yaml: &ComplianceYaml,
+    project_path: &Path,
+) -> anyhow::Result<crate::compliance::ComplianceConfig> {
+    use crate::compliance::{
+        ComplianceConfig, Requirement, RiskClass, RiskClassRule, RiskPolicy,
+        validate_requirements, validate_risk_class_patterns, warn_orphan_requirement_files,
+    };
+
+    let default_class = yaml.default_risk_class.as_deref()
+        .and_then(RiskClass::from_str)
+        .unwrap_or(RiskClass::A);
+
+    // Parse risk_classes
+    let risk_classes: anyhow::Result<Vec<RiskClassRule>> = yaml.risk_classes.iter().map(|rc| {
+        let class = RiskClass::from_str(&rc.class)
+            .ok_or_else(|| anyhow::anyhow!(
+                "compliance.risk_classes: invalid class '{}' (must be A, B, or C)", rc.class
+            ))?;
+        let policy = RiskPolicy {
+            min_file_coverage: rc.policy.min_file_coverage,
+            min_branch_coverage: rc.policy.min_branch_coverage,
+            coverage_rounds: rc.policy.coverage_rounds,
+            require_negative_tests: rc.policy.require_negative_tests.unwrap_or(false),
+            require_boundary_tests: rc.policy.require_boundary_tests.unwrap_or(false),
+            require_mcdc: rc.policy.require_mcdc.unwrap_or(false),
+        };
+        Ok(RiskClassRule {
+            class,
+            description: rc.description.clone(),
+            patterns: rc.patterns.clone(),
+            policy,
+        })
+    }).collect();
+    let risk_classes = risk_classes?;
+
+    // Validate glob patterns
+    validate_risk_class_patterns(&risk_classes)?;
+
+    // Parse requirements
+    let requirements: anyhow::Result<Vec<Requirement>> = yaml.requirements.iter().map(|r| {
+        let risk_class = r.risk_class.as_deref()
+            .and_then(RiskClass::from_str)
+            .unwrap_or(default_class);
+        if r.risk_class.is_some() && RiskClass::from_str(r.risk_class.as_deref().unwrap_or("")).is_none() {
+            anyhow::bail!(
+                "compliance.requirements: requirement '{}' has invalid risk_class '{}' (must be A, B, or C)",
+                r.id,
+                r.risk_class.as_deref().unwrap_or("")
+            );
+        }
+        Ok(Requirement {
+            id: r.id.clone(),
+            description: r.description.clone(),
+            risk_class,
+            source: r.source.clone(),
+            risk_control: r.risk_control.clone(),
+            files: r.files.clone(),
+            acceptance_criteria: r.acceptance_criteria.clone(),
+            verification: r.verification.clone(),
+            verified_by: r.verified_by.clone(),
+        })
+    }).collect();
+    let requirements = requirements?;
+
+    validate_requirements(&requirements)?;
+    warn_orphan_requirement_files(&requirements, project_path);
+
+    Ok(ComplianceConfig {
+        enabled: yaml.enabled.unwrap_or(false),
+        risk_classes,
+        default_risk_class: default_class,
+        requirements,
+        standards: yaml.standards.clone(),
+        fail_on_violation: yaml.fail_on_violation.unwrap_or(false),
+        traceability_dir: yaml.traceability_dir.clone(),
+        include_risk_class_column: false, // set by health_mode in config.rs
+    })
 }
 
 /// Resolve the prompt hint for a given issue rule and type (US-019).
@@ -332,12 +590,22 @@ pub struct ProjectCommands {
     pub build: Option<String>,
     pub test: Option<String>,
     pub coverage: Option<String>,
+    /// Regenerate the coverage report without re-running tests. Used after
+    /// post-fix validation tests have just run to avoid a duplicate suite.
+    /// Resolved from YAML or auto-derived for Maven/Gradle.
+    pub coverage_report_only: Option<String>,
     pub format: Option<String>,
     pub lint: Option<String>,
+    /// Resolved linter output format (one of the values supported by
+    /// `CommandsYaml::lint_format`). Defaults to "auto" when not set.
+    pub lint_format: Option<String>,
     /// Explicit path to the coverage report file (bypasses auto-detection)
     pub coverage_report: Option<String>,
     /// Fast compile-only command for tests (e.g., "mvn test-compile"). Falls back to `build`.
     pub test_compile: Option<String>,
+    /// US-059: resolved flag indicating the coverage command already runs tests.
+    /// Computed from YAML, CLI flag, or auto-detection heuristics.
+    pub tests_embedded_in_coverage: bool,
 }
 
 impl ProjectCommands {
@@ -464,6 +732,18 @@ pub fn merge_yaml_into_config(
             config.sonar_token = v.clone();
         }
     }
+    // YAML can enable TEST-scope fetching; CLI `--include-test-issues` still wins
+    // because this only overrides when the config value is the default (false).
+    if !config.include_test_issues {
+        if let Some(true) = yaml.sonar.include_test_issues {
+            config.include_test_issues = true;
+        }
+    }
+    // Append YAML exclusions to any passed via CLI (`--exclude`). No de-dup
+    // here — SonarClient::new does that after merging with the properties file.
+    if !yaml.sonar.exclusions.is_empty() {
+        config.sonar_exclusions.extend(yaml.sonar.exclusions.iter().cloned());
+    }
     // NOTE: git.branch from YAML is NOT merged into config.branch here.
     // config.branch is only set via CLI --branch. If not set, validate() detects
     // the current checked-out branch. This ensures re-running on a fix branch
@@ -576,6 +856,12 @@ pub fn merge_yaml_into_config(
             config.coverage_commit_batch = v;
         }
     }
+    // fix_commit_batch: only override if CLI is at default (1)
+    if config.fix_commit_batch == 1 {
+        if let Some(v) = yaml.execution.fix_commit_batch {
+            config.fix_commit_batch = v;
+        }
+    }
     // coverage_parallel: only override if CLI is at default (1)
     if config.coverage_parallel == 1 {
         if let Some(v) = yaml.execution.coverage_parallel {
@@ -594,6 +880,18 @@ pub fn merge_yaml_into_config(
             config.max_boost_failures = v;
         }
     }
+    // chunk_snippet_max_lines: only override if CLI is at default (80)
+    if config.chunk_snippet_max_lines == 80 {
+        if let Some(v) = yaml.execution.chunk_snippet_max_lines {
+            config.chunk_snippet_max_lines = v;
+        }
+    }
+    // execution_log_report_dir: only override if CLI is at default (".reparo")
+    if config.execution_log_report_dir == ".reparo" {
+        if let Some(ref v) = yaml.execution.execution_log_report_dir {
+            config.execution_log_report_dir = v.clone();
+        }
+    }
     // retry_failed_wave_files: YAML can disable retry (default: true)
     if !config.skip_retry_failed_wave_files {
         if let Some(false) = yaml.execution.retry_failed_wave_files {
@@ -604,6 +902,24 @@ pub fn merge_yaml_into_config(
     if !config.skip_final_validation {
         if let Some(false) = yaml.execution.final_validation {
             config.skip_final_validation = true;
+        }
+    }
+    // targeted_tests_first: YAML can disable (default: true)
+    if !config.skip_targeted_tests {
+        if let Some(false) = yaml.execution.targeted_tests_first {
+            config.skip_targeted_tests = true;
+        }
+    }
+    // rescan_batch_size: only override if CLI is at default (1)
+    if config.rescan_batch_size == 1 {
+        if let Some(v) = yaml.execution.rescan_batch_size {
+            config.rescan_batch_size = v.max(1);
+        }
+    }
+    // test_overlap: YAML can disable the overlap phase (default: true)
+    if !config.skip_overlap {
+        if let Some(false) = yaml.execution.test_overlap {
+            config.skip_overlap = true;
         }
     }
     // final_validation_attempts: only override if CLI is at default (5)
@@ -628,6 +944,24 @@ pub fn merge_yaml_into_config(
     if !config.skip_rebase {
         if let Some(false) = yaml.execution.auto_rebase {
             config.skip_rebase = true;
+        }
+    }
+    // linter_scan: YAML can disable the linter phase (default: true)
+    if !config.skip_linter_scan {
+        if let Some(false) = yaml.execution.linter_scan {
+            config.skip_linter_scan = true;
+        }
+    }
+    // linter_autofix: only override if CLI is at default (false)
+    if !config.linter_autofix {
+        if let Some(true) = yaml.execution.linter_autofix {
+            config.linter_autofix = true;
+        }
+    }
+    // max_linter_findings: only override if CLI is at default (200)
+    if config.max_linter_findings == 200 {
+        if let Some(v) = yaml.execution.max_linter_findings {
+            config.max_linter_findings = v;
         }
     }
     // protected_files: always take from YAML (no CLI equivalent)
@@ -707,9 +1041,9 @@ pub fn merge_yaml_into_config(
     // test_generation: resolve from YAML (US-040)
     let tg = &yaml.test_generation;
     let mut tiers = crate::config::TestGenTiers::default();
-    if let Some(ref yaml_tiers) = tg.tiers {
+    if let Some(yaml_tiers) = &tg.tiers {
         fn apply(spec: &mut crate::config::TierSpec, yaml: &Option<TierSpecYaml>) {
-            if let Some(ref y) = yaml {
+            if let Some(y) = yaml {
                 spec.model = y.model.clone();
                 spec.effort = y.effort.clone();
             }
@@ -727,6 +1061,17 @@ pub fn merge_yaml_into_config(
         avoid_spring_context: tg.avoid_spring_context.unwrap_or(false),
         custom_instructions: tg.custom_instructions.clone(),
         tiers,
+        test_dir: tg.test_dir.clone(),
+        test_source_root: tg.test_source_root.clone(),
+        test_spec_segments: tg.test_spec_segments,
+    };
+
+    // risk_assessment: resolve from YAML
+    let ra = &yaml.risk_assessment;
+    config.risk_assessment = crate::config::RiskAssessmentConfig {
+        enabled: ra.enabled.unwrap_or(false),
+        ai_assessment: ra.ai_assessment.unwrap_or(false),
+        skip_threshold: ra.skip_threshold.clone().unwrap_or_else(|| "high".to_string()),
     };
 }
 
@@ -741,18 +1086,151 @@ pub fn resolve_commands(
         .cloned()
         .unwrap_or_default();
 
+    // CLI overrides YAML for test/coverage
+    let test = cli_test_command.clone().or(base.test);
+    let coverage = cli_coverage_command.clone().or(base.coverage);
+
+    // US-059: resolve whether tests are embedded in the coverage command.
+    // Priority: explicit YAML flag > auto-detection heuristic.
+    let tests_embedded_in_coverage = match base.tests_embedded_in_coverage {
+        Some(v) => v,
+        None => detect_tests_embedded_in_coverage(test.as_deref(), coverage.as_deref()),
+    };
+
+    // Report-only coverage command: explicit YAML wins, else derive for Maven/Gradle.
+    let coverage_report_only = base
+        .coverage_report_only
+        .or_else(|| derive_coverage_report_only(coverage.as_deref()));
+
     ProjectCommands {
         setup: base.setup,
         clean: base.clean,
         build: base.build,
-        // CLI overrides YAML for test/coverage
-        test: cli_test_command.clone().or(base.test),
-        coverage: cli_coverage_command.clone().or(base.coverage),
+        test,
+        coverage,
+        coverage_report_only,
         format: base.format,
         lint: base.lint,
+        lint_format: base.lint_format,
         coverage_report: base.coverage_report,
         test_compile: base.test_compile,
+        tests_embedded_in_coverage,
     }
+}
+
+/// Derive a "regenerate coverage report without re-running tests" command
+/// from the configured coverage command. Returns None when the build tool
+/// can't be detected or doesn't support report-only generation trivially.
+///
+/// Preserves environment prefixes (e.g. `export JAVA_HOME=… &&`) so the
+/// derived command works in the same environment as the original.
+pub fn derive_coverage_report_only(coverage_cmd: Option<&str>) -> Option<String> {
+    let cmd = coverage_cmd?;
+    let lower = cmd.to_lowercase();
+
+    // Split on `&&` to separate env-prefix from the actual build command
+    let (prefix, tail) = match cmd.rfind("&&") {
+        Some(idx) => (&cmd[..idx + 2], cmd[idx + 2..].trim_start()),
+        None => ("", cmd.trim_start()),
+    };
+    let tail_lower = tail.to_lowercase();
+    let _ = lower; // kept for future ecosystem detection
+
+    // Maven: replace the whole tail with `mvn jacoco:report`, preserving -P profile flags.
+    // If jacoco plugin isn't actually configured in the POM, the command fails and
+    // fix_loop falls back to the full coverage command, so we can be permissive.
+    if tail_lower.contains("mvn") || tail_lower.contains("./mvnw") {
+        let mvn_bin = if tail_lower.contains("./mvnw") { "./mvnw" } else { "mvn" };
+        let mut derived = format!("{} jacoco:report", mvn_bin);
+        for tok in tail.split_whitespace() {
+            if tok.starts_with("-P") && tok.len() > 2 {
+                derived.push(' ');
+                derived.push_str(tok);
+            }
+        }
+        return Some(format!("{}{}", prefix, if prefix.is_empty() { derived } else { format!(" {}", derived) }));
+    }
+
+    // Gradle: jacocoTestReport — same fallback semantics apply.
+    if tail_lower.contains("gradle") || tail_lower.contains("./gradlew") {
+        let gradle_bin = if tail_lower.contains("./gradlew") { "./gradlew" } else { "gradle" };
+        let derived = format!("{} jacocoTestReport", gradle_bin);
+        return Some(format!("{}{}", prefix, if prefix.is_empty() { derived } else { format!(" {}", derived) }));
+    }
+
+    // Other ecosystems (pytest, jest, go test, sbt) don't have a clean
+    // "report without re-running tests" counterpart — skip.
+    None
+}
+
+/// US-059: Heuristic to detect whether `coverage_cmd` already executes the full
+/// test suite as a side effect (so running `test_cmd` separately is wasted work).
+///
+/// Returns `true` when the coverage command matches a known pattern:
+/// - Maven/Gradle: contains `test`, `verify`, `check`, `package`, or `build`
+///   (all of these run Surefire tests on their way to producing jacoco data)
+/// - pytest: starts with `pytest` (pytest --cov instruments the same run)
+/// - Jest/Vitest/npm: contains `test` AND (`coverage` or `--coverage`)
+/// - sbt: contains `test`
+///
+/// Conservative default: `false` — only return `true` when the pattern is unambiguous.
+pub fn detect_tests_embedded_in_coverage(
+    test_cmd: Option<&str>,
+    coverage_cmd: Option<&str>,
+) -> bool {
+    let Some(cov) = coverage_cmd else { return false };
+    let cov_lower = cov.to_lowercase();
+
+    // If coverage command literally contains the whole test command (common Maven/Gradle case)
+    if let Some(t) = test_cmd {
+        let t_trim = t.trim().to_lowercase();
+        if !t_trim.is_empty() && cov_lower.contains(&t_trim) {
+            return true;
+        }
+    }
+
+    // Maven: `mvn test`, `mvn verify`, `mvn package`, `mvn jacoco:report` (only when chained with test/verify)
+    if cov_lower.contains("mvn") || cov_lower.contains("./mvnw") {
+        return cov_lower.contains(" test")
+            || cov_lower.contains(" verify")
+            || cov_lower.contains(" package")
+            || cov_lower.contains(" check");
+    }
+
+    // Gradle: `./gradlew test jacocoTestReport`, `gradle check`, etc.
+    if cov_lower.contains("gradle") || cov_lower.contains("./gradlew") {
+        return cov_lower.contains(" test")
+            || cov_lower.contains(" check")
+            || cov_lower.contains(" build");
+    }
+
+    // pytest: `pytest --cov=...` or `python -m pytest --cov=...`
+    if cov_lower.starts_with("pytest") || cov_lower.contains(" pytest") {
+        return cov_lower.contains("--cov") || cov_lower.contains("cov=");
+    }
+
+    // Jest / Vitest / npm: `npm test -- --coverage`, `yarn test --coverage`, `vitest run --coverage`
+    if (cov_lower.contains("npm ") || cov_lower.contains("yarn ") || cov_lower.contains("pnpm "))
+        && cov_lower.contains("test")
+        && (cov_lower.contains("coverage") || cov_lower.contains("--coverage"))
+    {
+        return true;
+    }
+    if cov_lower.contains("vitest") || cov_lower.contains("jest") {
+        return cov_lower.contains("coverage") || cov_lower.contains("--coverage");
+    }
+
+    // sbt: coverage plugins always run tests
+    if cov_lower.contains("sbt") && cov_lower.contains("test") {
+        return true;
+    }
+
+    // go test -cover
+    if cov_lower.contains("go test") && (cov_lower.contains("-cover") || cov_lower.contains("coverprofile")) {
+        return true;
+    }
+
+    false
 }
 
 /// Validate that command binaries exist in PATH.
@@ -855,23 +1333,54 @@ pub fn load_personal_config() -> Result<PersonalConfig> {
     let mut config: PersonalConfig = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse personal config: {}", path.display()))?;
 
-    // Version check
+    // Version check + engine arg migration
     let current_version = env!("CARGO_PKG_VERSION");
-    match &config.reparo_version {
-        Some(stored) if stored != current_version => {
-            warn!(
-                "Personal config {} was created by Reparo v{}, \
-                 but you are running v{}. Run --restore-personal-yaml to update defaults.",
-                path.display(), stored, current_version
+    let version_stale = match &config.reparo_version {
+        Some(stored) => stored != current_version,
+        None => true,
+    };
+
+    if version_stale {
+        // Auto-migrate engine args to current defaults.
+        // When the base args for a known engine change between versions (e.g. adding
+        // --output-format json), old personal configs silently break token tracking.
+        // We reset each engine's args/prompt fields to the current defaults while
+        // preserving the user's routing, sonar, and other preferences.
+        let defaults = crate::engine::default_engines();
+        let mut migrated = false;
+        for (name, default_engine) in &defaults {
+            if let Some(existing) = config.engines.get_mut(name) {
+                if existing.args != default_engine.args
+                    || existing.prompt_flag != default_engine.prompt_flag
+                    || existing.prompt_via_stdin != default_engine.prompt_via_stdin
+                {
+                    tracing::info!(
+                        "Migrating personal config engine '{}' args from {:?} to {:?}",
+                        name, existing.args, default_engine.args
+                    );
+                    existing.args = default_engine.args.clone();
+                    existing.prompt_flag = default_engine.prompt_flag.clone();
+                    existing.prompt_via_stdin = default_engine.prompt_via_stdin;
+                    migrated = true;
+                }
+            }
+        }
+        config.reparo_version = Some(current_version.to_string());
+        if migrated {
+            tracing::warn!(
+                "Personal config updated: engine args migrated to v{} defaults ({}). \
+                 Run --restore-personal-yaml to reset all settings.",
+                current_version, path.display()
+            );
+        } else {
+            tracing::info!(
+                "Personal config {} version updated to v{}.",
+                path.display(), current_version
             );
         }
-        None => {
-            // Stamp version and rewrite
-            config.reparo_version = Some(current_version.to_string());
-            write_personal_config(&path, &config)?;
-            info!("Stamped version {} in personal config", current_version);
+        if let Err(e) = write_personal_config(&path, &config) {
+            tracing::warn!("Could not save migrated personal config: {}", e);
         }
-        _ => {}
     }
 
     Ok(config)
@@ -955,6 +1464,11 @@ pub fn merge_personal_into_config(config: &mut crate::config::Config, personal: 
             config.coverage_commit_batch = v;
         }
     }
+    if let Some(v) = exec.fix_commit_batch {
+        if config.fix_commit_batch == 1 {
+            config.fix_commit_batch = v;
+        }
+    }
     if let Some(v) = exec.coverage_parallel {
         if config.coverage_parallel == 1 {
             config.coverage_parallel = v;
@@ -963,6 +1477,16 @@ pub fn merge_personal_into_config(config: &mut crate::config::Config, personal: 
     if let Some(v) = exec.max_boost_failures {
         if config.max_boost_failures == 5 {
             config.max_boost_failures = v;
+        }
+    }
+    if let Some(v) = exec.chunk_snippet_max_lines {
+        if config.chunk_snippet_max_lines == 80 {
+            config.chunk_snippet_max_lines = v;
+        }
+    }
+    if let Some(ref v) = exec.execution_log_report_dir {
+        if config.execution_log_report_dir == ".reparo" {
+            config.execution_log_report_dir = v.clone();
         }
     }
     // Merge git defaults
@@ -981,10 +1505,10 @@ mod tests {
 
     #[test]
     fn test_interpolate_env_vars() {
-        std::env::set_var("REPARO_TEST_VAR_A", "hello");
+        unsafe { std::env::set_var("REPARO_TEST_VAR_A", "hello"); }
         let result = interpolate_env_vars("url: ${REPARO_TEST_VAR_A}/api");
         assert_eq!(result, "url: hello/api");
-        std::env::remove_var("REPARO_TEST_VAR_A");
+        unsafe { std::env::remove_var("REPARO_TEST_VAR_A"); }
     }
 
     #[test]
@@ -995,12 +1519,16 @@ mod tests {
 
     #[test]
     fn test_interpolate_multiple_vars() {
-        std::env::set_var("REPARO_TEST_X", "foo");
-        std::env::set_var("REPARO_TEST_Y", "bar");
+        unsafe {
+            std::env::set_var("REPARO_TEST_X", "foo");
+            std::env::set_var("REPARO_TEST_Y", "bar");
+        }
         let result = interpolate_env_vars("${REPARO_TEST_X}-${REPARO_TEST_Y}");
         assert_eq!(result, "foo-bar");
-        std::env::remove_var("REPARO_TEST_X");
-        std::env::remove_var("REPARO_TEST_Y");
+        unsafe {
+            std::env::remove_var("REPARO_TEST_X");
+            std::env::remove_var("REPARO_TEST_Y");
+        }
     }
 
     #[test]
@@ -1626,5 +2154,174 @@ execution:
         merge_yaml_into_config(&mut config, &yaml);
         // CLI already disabled, YAML should NOT re-enable
         assert!(config.skip_retry_failed_wave_files);
+    }
+
+    // -- US-059: detect_tests_embedded_in_coverage --
+
+    #[test]
+    fn detect_embedded_maven_test_jacoco() {
+        assert!(detect_tests_embedded_in_coverage(
+            Some("mvn test"),
+            Some("mvn test jacoco:report"),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_maven_verify() {
+        assert!(detect_tests_embedded_in_coverage(None, Some("mvn verify")));
+        assert!(detect_tests_embedded_in_coverage(None, Some("./mvnw verify -Pcoverage")));
+    }
+
+    #[test]
+    fn detect_embedded_gradle_test_jacoco() {
+        assert!(detect_tests_embedded_in_coverage(
+            Some("./gradlew test"),
+            Some("./gradlew test jacocoTestReport"),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_gradle_check() {
+        assert!(detect_tests_embedded_in_coverage(None, Some("gradle check")));
+    }
+
+    #[test]
+    fn detect_embedded_pytest_cov() {
+        assert!(detect_tests_embedded_in_coverage(
+            Some("pytest"),
+            Some("pytest --cov=src --cov-report=lcov"),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_vitest_coverage() {
+        assert!(detect_tests_embedded_in_coverage(
+            Some("npm test"),
+            Some("vitest run --coverage"),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_go_test_cover() {
+        assert!(detect_tests_embedded_in_coverage(
+            Some("go test ./..."),
+            Some("go test -coverprofile=c.out ./..."),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_not_detected_on_unrelated_command() {
+        assert!(!detect_tests_embedded_in_coverage(
+            Some("npm test"),
+            Some("nyc report --reporter=lcov"),
+        ));
+    }
+
+    #[test]
+    fn detect_embedded_no_coverage_command() {
+        assert!(!detect_tests_embedded_in_coverage(Some("mvn test"), None));
+    }
+
+    // -- derive_coverage_report_only --
+
+    #[test]
+    fn derive_report_only_maven_simple() {
+        // -Pcoverage is preserved so the jacoco profile stays active
+        assert_eq!(
+            derive_coverage_report_only(Some("mvn verify -Pcoverage")).as_deref(),
+            Some("mvn jacoco:report -Pcoverage"),
+        );
+    }
+
+    #[test]
+    fn derive_report_only_maven_preserves_profile() {
+        // -P<profile> must be preserved so the same project profile activates
+        let derived = derive_coverage_report_only(
+            Some("mvn test jacoco:report -Pjar -Dtest=!Excluded")
+        ).expect("should derive");
+        assert!(derived.starts_with("mvn jacoco:report"), "got: {}", derived);
+        assert!(derived.contains("-Pjar"), "profile lost: {}", derived);
+    }
+
+    #[test]
+    fn derive_report_only_maven_with_env_prefix() {
+        let derived = derive_coverage_report_only(
+            Some("export JAVA_HOME=$(/usr/libexec/java_home -v 21) && mvn test jacoco:report -Pjar")
+        ).expect("should derive");
+        assert!(derived.contains("export JAVA_HOME"), "env prefix lost: {}", derived);
+        assert!(derived.contains("mvn jacoco:report"), "command wrong: {}", derived);
+        assert!(derived.contains("-Pjar"), "profile lost: {}", derived);
+    }
+
+    #[test]
+    fn derive_report_only_maven_without_jacoco_still_derives() {
+        // We derive optimistically for Maven — if jacoco isn't configured, the
+        // command fails and fix_loop falls back to the full coverage command.
+        assert_eq!(
+            derive_coverage_report_only(Some("mvn verify")).as_deref(),
+            Some("mvn jacoco:report"),
+        );
+    }
+
+    #[test]
+    fn derive_report_only_mvnw() {
+        let derived = derive_coverage_report_only(Some("./mvnw verify -Pcoverage jacoco:report"))
+            .expect("should derive");
+        assert!(derived.starts_with("./mvnw jacoco:report"), "got: {}", derived);
+    }
+
+    #[test]
+    fn derive_report_only_gradle() {
+        let derived = derive_coverage_report_only(Some("./gradlew test jacocoTestReport"))
+            .expect("should derive");
+        assert_eq!(derived, "./gradlew jacocoTestReport");
+    }
+
+    #[test]
+    fn derive_report_only_gradle_without_jacoco_still_derives() {
+        // Same fallback semantics as Maven.
+        assert_eq!(
+            derive_coverage_report_only(Some("./gradlew check")).as_deref(),
+            Some("./gradlew jacocoTestReport"),
+        );
+    }
+
+    #[test]
+    fn derive_report_only_unsupported_ecosystem() {
+        assert_eq!(derive_coverage_report_only(Some("pytest --cov=src")), None);
+        assert_eq!(derive_coverage_report_only(Some("go test -coverprofile=c.out ./...")), None);
+        assert_eq!(derive_coverage_report_only(Some("vitest run --coverage")), None);
+    }
+
+    #[test]
+    fn derive_report_only_no_coverage_command() {
+        assert_eq!(derive_coverage_report_only(None), None);
+    }
+
+    #[test]
+    fn resolve_commands_sets_coverage_report_only_for_maven() {
+        let yaml = YamlConfig {
+            commands: CommandsYaml {
+                coverage: Some("mvn verify -Pcoverage jacoco:report".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = resolve_commands(Some(&yaml), &None, &None);
+        assert_eq!(cmds.coverage_report_only.as_deref(), Some("mvn jacoco:report -Pcoverage"));
+    }
+
+    #[test]
+    fn resolve_commands_respects_explicit_report_only() {
+        let yaml = YamlConfig {
+            commands: CommandsYaml {
+                coverage: Some("mvn verify -Pcoverage".to_string()),
+                coverage_report_only: Some("mvn jacoco:report-aggregate".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds = resolve_commands(Some(&yaml), &None, &None);
+        assert_eq!(cmds.coverage_report_only.as_deref(), Some("mvn jacoco:report-aggregate"));
     }
 }

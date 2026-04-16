@@ -112,6 +112,11 @@ pub struct EngineInvocation {
     pub effort: Option<String>,
     pub prompt_flag: String,
     pub prompt_via_stdin: bool,
+    /// Extra CLI args injected after model/effort but before the prompt flag.
+    /// Used to make per-task invocations leaner (e.g. `--bare --tools Read,Edit,Write`
+    /// for focused single-file fixes, avoiding CLAUDE.md auto-load and
+    /// Grep/Glob/Bash tool calls that inflate input tokens).
+    pub extra_args: Vec<String>,
 }
 
 /// Default engine configurations.
@@ -248,6 +253,7 @@ pub fn resolve_engine_for_tier(
         effort,
         prompt_flag: engine_config.prompt_flag.clone(),
         prompt_via_stdin: engine_config.prompt_via_stdin,
+        extra_args: Vec::new(),
     })
 }
 
@@ -355,6 +361,11 @@ pub fn run_engine_full(
             if skip_permissions {
                 args.push("--dangerously-skip-permissions".to_string());
             }
+            // Disable the user's global MCP servers (e.g. chrome-devtools-mcp).
+            // Without this, Claude auto-loads them and can decide to open a
+            // browser to "test" API code, which has no value for reparo's
+            // automated fix/test-generation flows and slows things down.
+            args.push("--strict-mcp-config".to_string());
             // Add model and effort
             if let Some(ref model) = invocation.model {
                 args.extend(["--model".to_string(), model.clone()]);
@@ -374,6 +385,9 @@ pub fn run_engine_full(
             }
         }
     }
+
+    // Lean / per-task extras (e.g. --bare, --tools Read,Edit,Write).
+    args.extend(invocation.extra_args.iter().cloned());
 
     // Add prompt via flag or prepare for stdin
     if !invocation.prompt_via_stdin {
@@ -408,7 +422,7 @@ pub fn run_engine_full(
 
     // Wait with timeout
     let timeout = Duration::from_secs(timeout_secs);
-    let result = wait_with_timeout(&mut child, timeout);
+    let result = wait_with_timeout(&mut child, timeout, &invocation.engine_kind.to_string());
 
     match result {
         WaitResult::Completed(output) => {
@@ -450,9 +464,17 @@ pub fn run_engine_full(
             let (final_stdout, usage) = match invocation.engine_kind {
                 EngineKind::Claude => {
                     if let Some((result_text, u)) = usage::parse_claude_json(&raw_stdout) {
+                        tracing::debug!(
+                            "claude JSON parse ok: in={} out={} cache_read={} cache_create={}",
+                            u.input, u.output, u.cache_read, u.cache_creation
+                        );
                         (result_text, Some(u))
                     } else {
                         // Non-JSON output (older CLI, `--output-format text`, or test stubs).
+                        tracing::warn!(
+                            "claude stdout did not parse as JSON (first 200 chars): {:?}",
+                            raw_stdout.chars().take(200).collect::<String>()
+                        );
                         (raw_stdout, None)
                     }
                 }
@@ -496,32 +518,80 @@ enum WaitResult {
 }
 
 /// Wait for a child process with a timeout, polling every 500ms.
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> WaitResult {
+///
+/// Drains stdout and stderr concurrently in background threads. This prevents
+/// two deadlock modes:
+///   1. Pipe buffer fills (~64KB on macOS) → child blocks on write → we never
+///      see `try_wait` report exit.
+///   2. Child forks subprocesses (MCP servers, bash tool workers) that inherit
+///      the stdout/stderr fds. When the main child exits, the descendants keep
+///      the pipe's write end open, so a post-exit `read_to_end` blocks forever
+///      waiting for an EOF that won't come.
+///
+/// After the child exits we give drain threads a bounded window to finish;
+/// if they don't, we return whatever they've produced so far and move on.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    label: &str,
+) -> WaitResult {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> Option<mpsc::Receiver<Vec<u8>>> {
+        let mut pipe = pipe?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        Some(rx)
+    }
+
+    let stdout_rx = drain(child.stdout.take());
+    let stderr_rx = drain(child.stderr.take());
+
+    // Bounded wait for drain threads to flush after the child exits. Most runs
+    // finish in milliseconds; the cap only matters when a descendant inherited
+    // the pipe fd and is still running.
+    let post_exit_drain = Duration::from_secs(2);
+
+    let collect = |rx: Option<mpsc::Receiver<Vec<u8>>>| -> Vec<u8> {
+        rx.and_then(|r| r.recv_timeout(post_exit_drain).ok())
+            .unwrap_or_default()
+    };
+
+    // Heartbeat so parallel workers running long AI calls don't look like
+    // silent hangs in the log.
+    const HEARTBEAT_SECS: u64 = 60;
     let start = Instant::now();
+    let mut next_heartbeat = start + Duration::from_secs(HEARTBEAT_SECS);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = err.read_to_end(&mut stderr);
-                }
                 return WaitResult::Completed(std::process::Output {
                     status,
-                    stdout,
-                    stderr,
+                    stdout: collect(stdout_rx),
+                    stderr: collect(stderr_rx),
                 });
             }
             Ok(None) => {
+                let now = Instant::now();
+                if now >= next_heartbeat {
+                    info!(
+                        "{} still running after {}s (timeout {}s)",
+                        label,
+                        start.elapsed().as_secs(),
+                        timeout.as_secs()
+                    );
+                    next_heartbeat = now + Duration::from_secs(HEARTBEAT_SECS);
+                }
                 if start.elapsed() >= timeout {
                     return WaitResult::TimedOut;
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(500));
             }
             Err(_) => {
                 return WaitResult::TimedOut;
@@ -716,6 +786,7 @@ mod tests {
             effort: None,
             prompt_flag: "-p".to_string(),
             prompt_via_stdin: false,
+            extra_args: Vec::new(),
         };
         let result = run_engine(tmp.path(), "hello", 10, false, false, &invocation).unwrap();
         assert!(result.contains("hello"));
@@ -732,6 +803,7 @@ mod tests {
             effort: None,
             prompt_flag: String::new(),
             prompt_via_stdin: true,
+            extra_args: Vec::new(),
         };
         let result = run_engine(tmp.path(), "hello from stdin", 10, false, false, &invocation).unwrap();
         assert!(result.contains("hello from stdin"));
@@ -750,6 +822,7 @@ mod tests {
             effort: None,
             prompt_flag: String::new(),
             prompt_via_stdin: true,
+            extra_args: Vec::new(),
         };
         let result = run_engine(tmp.path(), "test", 1, false, false, &invocation);
         assert!(result.is_err());

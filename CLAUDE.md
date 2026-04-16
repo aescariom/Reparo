@@ -47,6 +47,8 @@ main.rs → Config::validate() → Orchestrator::run()
   Step 2: run_scanner() + wait_for_analysis() [sonar.rs]
   Step 3: fetch_issues() sorted by severity [sonar.rs]
   Step 3b: boost_coverage_to_threshold() — wave-based, N files per wave [engine.rs + runner.rs + git.rs]
+  Step 3c: snapshot_baseline_lcov() — freeze lcov so every per-issue coverage check reads the same immutable file [orchestrator/coverage.rs]
+  Step 3d: run_lint_scan() — run `commands.lint`, parse output, queue findings as synthetic `lint:<format>:<rule>` issues [linter/mod.rs]
   Step 4: for each batch of issues:
     create_branch [git.rs]
     for each issue:
@@ -72,6 +74,8 @@ main.rs → Config::validate() → Orchestrator::run()
 - **Idempotency**: If a branch `fix/sonar-<key>` already exists, the issue is skipped.
 - **Batch mode**: `--batch-size N` groups N fixes into one PR. `--batch-size 0` = all in one PR.
 - **Commands in YAML** (`commands.build`, `commands.test`, etc.) are executed directly via `sh -c`, never through an LLM.
+
+**Linter output format** (`commands.lint_format`): one of `"clippy"`, `"eslint"`, `"ruff"`, or `"auto"` (default). Auto-detection inspects the `commands.lint` string — set the format explicitly for linters Reparo can't infer. Supported parsers live in `src/linter/`.
 
 ## Code Conventions
 
@@ -128,6 +132,7 @@ Every optional step can be enabled or disabled via CLI flags and/or YAML configu
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled | Run full suite after all fixes |
 | Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled | Must enable via YAML |
 | Pre-push rebase | `--skip-rebase` | `execution.auto_rebase: false` | enabled | Rebase onto latest base before push, AI-resolves conflicts |
+| Local linter scan | `--skip-linter-scan` | `execution.linter_scan: false` | enabled when `commands.lint` is set | Runs `commands.lint`, parses output per `commands.lint_format` (clippy / eslint / ruff; `auto` detects from command), and folds findings into the fix queue alongside SonarQube issues. Rules carry a `lint:<format>:<rule>` key. `--linter-autofix` runs the linter's native `--fix` first. `--max-linter-findings N` caps the queue (default 200). |
 | PR creation | `--no-pr` | — | enabled | Create PR via `gh` |
 | WIP working tree | `--allow-wip` (env `REPARO_ALLOW_WIP`) | — | disabled (clean tree required) | Stage pending changes at startup; they are folded into the first commit Reparo creates |
 
@@ -147,10 +152,29 @@ Every optional step can be enabled or disabled via CLI flags and/or YAML configu
 | Commit batch | `--coverage-commit-batch` | `execution.coverage_commit_batch` | 0 (= same as wave size) | Files per git commit. 0 uses `coverage_wave_size`. 1 = one commit per file (original behavior). |
 | Ticket ref | `--commit-issue` | — (CLI only) | — | External issue ref (Jira/Linear) embedded as `{ticket}` in commit messages |
 
+**Per-fix latency knobs** (reduce wall time per issue):
+
+| Parameter | CLI flag | YAML field | Default | Description |
+|-----------|----------|------------|---------|-------------|
+| Report-only coverage | — | `commands.coverage_report_only` | auto-derived for Maven/Gradle | Regenerate coverage report *without* re-running tests after per-fix validation. Saves ~77s/issue on Maven. Falls back to full `coverage` command on failure. |
+| Targeted tests first | `--skip-targeted-tests` | `execution.targeted_tests_first` | true | Run Surefire `-Dtest=<ChangedClass>*Test` before full suite. If targeted passes, full suite still runs for confirmation. Maven-only; no-op for other runners. |
+| Rescan batch size | `--rescan-batch-size N` | `execution.rescan_batch_size` | 1 | Run SonarQube rescan verification only every N fixes (default every fix). N=5 saves ~80s per 5 issues in sequential mode. |
+
+For very large projects, combine with `--parallel 4 --batch-size 1` (per-issue worktree parallelism). The orchestrator prints a hint at startup when running sequentially with > 10 issues.
+
+**Coverage-dependent vs static-analysis rules**: the fix_loop now skips the coverage regeneration step entirely when the rule being fixed isn't coverage-dependent (vulnerabilities, bugs, most code smells, **all `lint:*` findings**). See `orchestrator/helpers.rs::rule_is_coverage_dependent`.
+
+**Baseline coverage snapshot**: per-issue coverage checks (`fix_loop::check_coverage`) read from a frozen lcov copy at `<project>/.reparo/baseline.<ext>`, captured once in Step 3c. The per-worktree lcov is never consulted — this is what "the last complete test run" means in practice. Parallel workers all read the same immutable file.
+
+**Test-repair tier**: the per-fix test-failure repair now uses `haiku:medium` (via `claude::classify_test_repair_tier`) instead of `sonnet:medium`. Shallow failures repair in seconds instead of minutes. Build/lint repair and coverage boost repair still use `sonnet`.
+
 **YAML example** (all steps explicit):
 ```yaml
 execution:
   format_on_start: true
+  linter_scan: true          # run local linter (Step 3d)
+  linter_autofix: false      # run linter's --fix before queuing findings
+  max_linter_findings: 200   # cap queued findings (0 = no cap)
   coverage_boost: true
   coverage_attempts: 3
   coverage_rounds: 3
@@ -162,6 +186,8 @@ execution:
   dedup_on_completion: true
   max_dedup: 10
   auto_rebase: true
+  targeted_tests_first: true
+  rescan_batch_size: 1
 
 pact:
   enabled: false

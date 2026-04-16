@@ -162,16 +162,94 @@ pub struct SonarClient {
     client: reqwest::Client,
     /// Whether the server supports branch analysis (Developer Edition+)
     supports_branches: bool,
+    /// Whether to include test-scope issues when querying. Default (false)
+    /// matches the SonarQube web UI's default view, which hides TEST-scope
+    /// issues and shows only MAIN.
+    include_test_issues: bool,
+    /// Glob patterns matched against each issue's file path (relative to
+    /// project root). Any matching issue is dropped from `fetch_issues`.
+    /// Populated from:
+    ///   1. `sonar-project.properties` (`sonar.exclusions`, `sonar.test.exclusions`)
+    ///   2. reparo's own `--exclude` CLI flag / YAML `sonar.exclusions`
+    exclusion_globs: Vec<String>,
 }
 
 impl SonarClient {
     pub fn new(config: &ValidatedConfig) -> Self {
+        // `reqwest::Client::new()` has NO timeout by default — a stalled TCP
+        // connection or a SonarQube server under load makes any `.await` on a
+        // response block forever, silently, with no heartbeat because we're
+        // not in a subprocess. Parallel wave workers hit this regularly: 4
+        // workers all call `get_line_coverage` at the start of `process_issue`,
+        // and one stuck HTTP call freezes the whole wave.
+        //
+        // Three layered limits:
+        //   - connect_timeout(30s): TCP + TLS handshake must finish.
+        //   - timeout(300s):        whole-request budget (connect + headers +
+        //                           body). Long enough for slow `issues/search`
+        //                           pages on large projects but firm enough to
+        //                           surface a stuck request instead of hanging.
+        //   - tcp_keepalive(30s):   detects dropped connections that would
+        //                           otherwise leave the worker parked on a
+        //                           silently dead socket.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to build reqwest client with timeouts: {} — falling back to default (no timeouts!)",
+                    e
+                );
+                reqwest::Client::new()
+            });
+        // Merge exclusions from (a) reparo's config (CLI/YAML) and (b) the
+        // project's own `sonar-project.properties` so reparo drops the same
+        // issues the user already tells SonarQube to ignore.
+        let mut exclusion_globs: Vec<String> = config.sonar_exclusions.clone();
+        let props_file = config.path.join("sonar-project.properties");
+        if props_file.exists() {
+            match std::fs::read_to_string(&props_file) {
+                Ok(contents) => {
+                    let from_props = parse_properties_exclusions(&contents);
+                    if !from_props.is_empty() {
+                        info!(
+                            "Loaded {} exclusion glob(s) from {}",
+                            from_props.len(),
+                            props_file.display()
+                        );
+                        exclusion_globs.extend(from_props);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not read {}: {} — skipping properties-based exclusions",
+                        props_file.display(),
+                        e
+                    );
+                }
+            }
+        }
+        // De-duplicate while preserving order.
+        let mut seen = std::collections::HashSet::new();
+        exclusion_globs.retain(|g| seen.insert(g.clone()));
+        if !exclusion_globs.is_empty() {
+            info!(
+                "SonarClient will drop issues matching {} exclusion glob(s)",
+                exclusion_globs.len()
+            );
+        }
+
         Self {
             base_url: config.sonar_url.clone(),
             token: config.sonar_token.clone(),
             project_id: config.sonar_project_id.clone(),
-            client: reqwest::Client::new(),
+            client,
             supports_branches: false,
+            include_test_issues: config.include_test_issues,
+            exclusion_globs,
         }
     }
 
@@ -392,12 +470,26 @@ impl SonarClient {
         let mut page = 1u32;
         let page_size = 100u32;
 
+        // SonarQube's `/api/issues/search` returns BOTH MAIN-scope (source) and
+        // TEST-scope (test code) issues when `scopes` is omitted. The SonarQube
+        // web UI defaults to showing only MAIN, which is why reparo's count
+        // (no filter → 1900) was massively larger than the scanner-UI count
+        // (MAIN only → ~600). Match the UI by default; users who want to fix
+        // test-code issues too pass `--include-test-issues`.
+        let scopes = if self.include_test_issues {
+            "MAIN,TEST"
+        } else {
+            "MAIN"
+        };
+        info!("Fetching SonarQube issues with scopes={}", scopes);
+
         loop {
             let resp = self
                 .request("/api/issues/search")
                 .query(&[
                     ("componentKeys", self.project_id.as_str()),
                     ("statuses", "OPEN,REOPENED"),
+                    ("scopes", scopes),
                     ("ps", &page_size.to_string()),
                     ("p", &page.to_string()),
                 ])
@@ -421,6 +513,31 @@ impl SonarClient {
                 break;
             }
             page += 1;
+        }
+
+        // Apply `sonar.exclusions` / reparo `--exclude` filtering client-side.
+        // Sonar is supposed to exclude these at scan time via
+        // `sonar-project.properties`, but in practice older analyses,
+        // forgotten properties files, or excludes added AFTER an analysis
+        // leave excluded issues in the server's DB. Filter them here so
+        // reparo never burns AI budget on files the user marked off-limits.
+        if !self.exclusion_globs.is_empty() {
+            let before = all_issues.len();
+            all_issues.retain(|issue| {
+                let path = component_to_path(&issue.component);
+                let excluded = self
+                    .exclusion_globs
+                    .iter()
+                    .any(|g| matches_exclusion(&path, g));
+                !excluded
+            });
+            let dropped = before - all_issues.len();
+            if dropped > 0 {
+                info!(
+                    "Dropped {} issue(s) matching sonar.exclusions / --exclude globs",
+                    dropped
+                );
+            }
         }
 
         // Sort by: category (Security > Reliability > Maintainability)
@@ -834,6 +951,74 @@ pub fn component_to_path(component: &str) -> String {
     }
 }
 
+/// Parse `sonar.exclusions`, `sonar.test.exclusions`, and `sonar.coverage.exclusions`
+/// entries from the text of a `sonar-project.properties` file.
+///
+/// Each property is a comma-separated list of Ant-style globs (e.g.
+/// `src/generated/**,**/*Generated.java`). Lines starting with `#` or `!` are
+/// comments. Continuation via trailing `\\` is not supported (rare in practice).
+pub(crate) fn parse_properties_exclusions(contents: &str) -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "sonar.exclusions",
+        "sonar.test.exclusions",
+        "sonar.coverage.exclusions",
+        "sonar.cpd.exclusions",
+    ];
+    let mut out = Vec::new();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let eq = match line.find('=') {
+            Some(i) => i,
+            None => continue,
+        };
+        let key = line[..eq].trim();
+        if !KEYS.iter().any(|k| *k == key) {
+            continue;
+        }
+        let value = line[eq + 1..].trim();
+        for pat in value.split(',') {
+            let p = pat.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Match a file path against a sonar-style Ant glob pattern.
+///
+/// Supports the patterns that actually appear in `sonar.exclusions`:
+///   - `**` matches any number of path segments
+///   - `*`  matches any sequence within a single segment
+///   - `?`  matches a single character
+///
+/// Implemented by translating to a Rust `glob::Pattern`; `**` is preserved
+/// because `glob` already understands it.
+pub(crate) fn matches_exclusion(path: &str, pattern: &str) -> bool {
+    // Sonar patterns frequently are expressed relative to src root without a
+    // leading `**/`, e.g. `*Generated.java` is expected to match every file
+    // with that name. Normalize such patterns by also trying a `**/` prefix.
+    let glob_pat = match ::glob::Pattern::new(pattern) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if glob_pat.matches(path) {
+        return true;
+    }
+    if !pattern.starts_with("**/") && !pattern.starts_with('/') {
+        if let Ok(p2) = ::glob::Pattern::new(&format!("**/{}", pattern)) {
+            if p2.matches(path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Build a CoverageResult from file-level coverage when line-level API is not available.
 fn build_coverage_result_from_file_level(
     file_cov: Option<f64>,
@@ -877,6 +1062,10 @@ fn build_coverage_result_from_file_level(
 ///
 /// sonar-scanner writes to `.scannerwork/report-task.txt`.
 /// Maven/Gradle write to `target/sonar/report-task.txt` or `build/sonar/report-task.txt`.
+///
+/// Picks the most recently modified candidate so that a stale file from a
+/// previous scanner (e.g. a leftover `.scannerwork/` from standalone sonar-scanner
+/// in a project now scanned with Maven) cannot shadow the fresh task ID.
 fn read_ce_task_id(project_path: &Path) -> Option<String> {
     let candidates = [
         project_path.join(".scannerwork/report-task.txt"),
@@ -884,15 +1073,23 @@ fn read_ce_task_id(project_path: &Path) -> Option<String> {
         project_path.join("build/sonar/report-task.txt"),
     ];
 
-    for path in &candidates {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                if let Some(id) = line.strip_prefix("ceTaskId=") {
-                    let id = id.trim();
-                    if !id.is_empty() {
-                        return Some(id.to_string());
-                    }
-                }
+    let freshest = candidates
+        .iter()
+        .filter_map(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|mtime| (p, mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(p, _)| p.clone())?;
+
+    let content = std::fs::read_to_string(&freshest).ok()?;
+    for line in content.lines() {
+        if let Some(id) = line.strip_prefix("ceTaskId=") {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
             }
         }
     }
@@ -943,6 +1140,69 @@ fn extract_complexity(message: &str) -> u32 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_parse_properties_exclusions_basic() {
+        let props = r#"
+# comment
+sonar.projectKey=foo
+sonar.exclusions=src/generated/**,**/*Generated.java
+sonar.test.exclusions=src/test/legacy/**
+sonar.coverage.exclusions=**/*Dto.java
+sonar.cpd.exclusions=**/*Builder.java
+other.setting=ignored
+"#;
+        let got = parse_properties_exclusions(props);
+        assert_eq!(
+            got,
+            vec![
+                "src/generated/**".to_string(),
+                "**/*Generated.java".to_string(),
+                "src/test/legacy/**".to_string(),
+                "**/*Dto.java".to_string(),
+                "**/*Builder.java".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_properties_exclusions_empty_and_comments() {
+        let props = "# nothing here\n!also a comment\n\nsonar.exclusions=";
+        assert!(parse_properties_exclusions(props).is_empty());
+    }
+
+    #[test]
+    fn test_matches_exclusion_anchored() {
+        assert!(matches_exclusion(
+            "src/main/java/com/legacy/Foo.java",
+            "src/main/java/com/legacy/**"
+        ));
+        assert!(!matches_exclusion(
+            "src/main/java/com/fresh/Foo.java",
+            "src/main/java/com/legacy/**"
+        ));
+    }
+
+    #[test]
+    fn test_matches_exclusion_auto_anchored_bare_name() {
+        // A pattern without `**/` prefix like `*Generated.java` should match
+        // at any depth — this is how Sonar users typically write it.
+        assert!(matches_exclusion("src/main/java/FooGenerated.java", "*Generated.java"));
+        assert!(matches_exclusion("src/gen/BarGenerated.java", "*Generated.java"));
+        assert!(!matches_exclusion("src/main/java/Foo.java", "*Generated.java"));
+    }
+
+    #[test]
+    fn test_matches_exclusion_double_star() {
+        assert!(matches_exclusion(
+            "src/main/java/com/a/b/c/X.java",
+            "**/X.java"
+        ));
+        assert!(matches_exclusion(
+            "src/main/java/deep/pkg/Y.java",
+            "src/main/java/**/Y.java"
+        ));
+    }
 
     #[test]
     fn test_read_ce_task_id_scannerwork() {

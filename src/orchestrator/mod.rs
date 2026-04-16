@@ -2,15 +2,19 @@ mod coverage;
 mod dedup;
 mod fix_loop;
 pub(crate) mod helpers;
+mod overlap;
 mod parallel;
+pub(crate) mod risk_assessment;
 pub(crate) mod worktree_pool;
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::claude;
 use crate::config::ValidatedConfig;
+use crate::execution_log::{ExecutionLog, ItemStatus};
 use crate::git;
 use crate::report::{self, FixStatus, IssueResult};
 use crate::runner;
@@ -34,12 +38,26 @@ pub struct Orchestrator {
     pub(crate) engine_routing: crate::engine::EngineRoutingConfig,
     /// Cached test examples (computed once, reused across issues)
     pub(crate) cached_test_examples: Option<String>,
-    /// Token usage tracker — records every AI call with its step label for the end-of-run report.
-    pub(crate) usage_tracker: crate::usage::UsageTracker,
+    /// Real-time execution log (SQLite). Shared with the signal handler.
+    /// This is the single source of truth for token usage and phase metrics —
+    /// the end-of-run summary table is computed directly from the database.
+    pub(crate) exec_log: Arc<ExecutionLog>,
+    /// Currently active phase id in the execution log (if any).
+    pub(crate) current_phase_id: std::sync::Mutex<Option<i64>>,
+    /// Currently active step id in the execution log (if any).
+    /// Set by `exec_step_start`, cleared by `exec_step_finish`, used by `run_ai_at`
+    /// to link AI calls to their enclosing step so the steps table shows real token counts.
+    pub(crate) current_step_id: std::sync::Mutex<Option<i64>>,
+    /// US-065: cache of `classify_source_file` results keyed by relative path.
+    /// Avoids re-reading and re-classifying the same file on each phase/pass.
+    pub(crate) file_classifications: std::sync::RwLock<std::collections::HashMap<String, String>>,
+    /// Monotonic counter of fixes processed. Used with `rescan_batch_size` to
+    /// decide when to run the SonarQube verification rescan (every Nth fix).
+    pub(crate) fix_counter: std::sync::atomic::AtomicU32,
 }
 
 impl Orchestrator {
-    pub fn new(config: ValidatedConfig) -> Result<Self> {
+    pub fn new(config: ValidatedConfig, exec_log: Arc<ExecutionLog>) -> Result<Self> {
         let client = SonarClient::new(&config);
 
         // US-019: Load prompt config from YAML
@@ -86,7 +104,11 @@ impl Orchestrator {
             rule_cache: std::collections::HashMap::new(),
             engine_routing,
             cached_test_examples: None,
-            usage_tracker: crate::usage::UsageTracker::new(),
+            exec_log,
+            current_phase_id: std::sync::Mutex::new(None),
+            current_step_id: std::sync::Mutex::new(None),
+            file_classifications: std::sync::RwLock::new(std::collections::HashMap::new()),
+            fix_counter: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -101,7 +123,7 @@ impl Orchestrator {
         engine_routing: crate::engine::EngineRoutingConfig,
         prompt_config: crate::yaml_config::PromptsYaml,
         cached_test_examples: Option<String>,
-        usage_tracker: crate::usage::UsageTracker,
+        exec_log: Arc<ExecutionLog>,
     ) -> Self {
         Self {
             config,
@@ -113,32 +135,44 @@ impl Orchestrator {
             rule_cache,
             engine_routing,
             cached_test_examples,
-            usage_tracker,
+            exec_log,
+            current_phase_id: std::sync::Mutex::new(None),
+            current_step_id: std::sync::Mutex::new(None),
+            file_classifications: std::sync::RwLock::new(std::collections::HashMap::new()),
+            fix_counter: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// US-065: cached wrapper around `runner::classify_source_file`.
+    ///
+    /// The cache is keyed by the file path (relative to the main project); a
+    /// file's classification depends only on its content, which doesn't change
+    /// during a single run.  Used by all main-tree code paths in coverage boost
+    /// and fix loop.  The parallel worktree path classifies from its own
+    /// worktree copy and does not use this cache.
+    pub(crate) fn classify_source_file_cached(&self, file: &str) -> String {
+        if let Ok(cache) = self.file_classifications.read() {
+            if let Some(c) = cache.get(file) {
+                return c.clone();
+            }
+        }
+        let result = crate::runner::classify_source_file(file, &self.config.path);
+        if let Ok(mut cache) = self.file_classifications.write() {
+            cache.insert(file.to_string(), result.clone());
+        }
+        result
     }
 
     /// Generate a partial report from whatever results are available (US-012).
     /// Called when global timeout is reached or execution is interrupted.
     pub fn generate_partial_report(&self) {
         info!("Generating partial report with {} results so far", self.results.len());
-        let usage_entries = self.usage_tracker.snapshot();
-        self.print_usage_table(&usage_entries);
-        report::generate_report_with_usage(
+        report::generate_report(
             &self.config.path,
             &self.results,
             self.total_issues_found,
             0, // elapsed unknown in timeout case
-            &usage_entries,
         );
-    }
-
-    /// Log the token-usage table to the console so the user sees it at the end of the run.
-    fn print_usage_table(&self, entries: &[crate::usage::UsageEntry]) {
-        info!("=== Token usage by step × model ===");
-        let table = crate::usage::render_usage_table(entries);
-        for line in table.lines() {
-            info!("{}", line);
-        }
     }
 
     /// Run an AI engine against the main project directory.
@@ -151,6 +185,44 @@ impl Orchestrator {
         tier: &claude::ClaudeTier,
     ) -> anyhow::Result<String> {
         self.run_ai_at(step, prompt, tier, &self.config.path)
+    }
+
+    /// Lean variant of run_ai for focused single-file fixes.
+    /// Adds `--tools Read,Edit,Write` (no Grep/Glob/Bash) to the Claude
+    /// invocation to restrict the fix to a targeted file edit.
+    /// Falls back to the default invocation when `lean_ai` config is disabled
+    /// or when the resolved engine isn't Claude.
+    ///
+    /// `--bare` was previously added here but was removed because it also
+    /// bypasses auth loading, causing "Not logged in" failures in sessions
+    /// that rely on Claude Code's shared auth.
+    pub(crate) fn run_ai_lean(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+    ) -> anyhow::Result<String> {
+        if !self.config.lean_ai {
+            return self.run_ai(step, prompt, tier);
+        }
+        self.run_ai_lean_at(step, prompt, tier, &self.config.path)
+    }
+
+    pub(crate) fn run_ai_lean_at(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+        project_path: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        let mut invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
+        if matches!(invocation.engine_kind, crate::engine::EngineKind::Claude) {
+            invocation.extra_args.extend([
+                "--tools".to_string(),
+                "Read,Edit,Write".to_string(),
+            ]);
+        }
+        self.run_ai_with_invocation(step, prompt, tier, project_path, invocation)
     }
 
     /// Run an AI engine with an explicit `project_path` (may be a worktree).
@@ -166,6 +238,17 @@ impl Orchestrator {
         project_path: &std::path::Path,
     ) -> anyhow::Result<String> {
         let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
+        self.run_ai_with_invocation(step, prompt, tier, project_path, invocation)
+    }
+
+    pub(crate) fn run_ai_with_invocation(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+        project_path: &std::path::Path,
+        invocation: crate::engine::EngineInvocation,
+    ) -> anyhow::Result<String> {
         let tier_timeout = tier.effective_timeout(self.config.claude_timeout);
 
         // Prompt-aware timeout floor: larger prompts indicate more complex tasks
@@ -184,7 +267,9 @@ impl Orchestrator {
 
         let model_label = invocation.model.clone().unwrap_or_else(|| "default".to_string());
         let engine_kind = invocation.engine_kind.clone();
+        let effort_label = invocation.effort.clone();
 
+        let call_started = std::time::Instant::now();
         let result = crate::engine::run_engine_full(
             project_path,
             prompt,
@@ -193,25 +278,121 @@ impl Orchestrator {
             self.config.show_prompts,
             &invocation,
         );
+        let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
-        // Record usage regardless of success — failed calls still cost tokens if the
-        // engine got far enough to report them. On outright spawn/timeout errors the
-        // output has no usage, so we don't record anything in that case.
+        // Record usage directly in the execution log (SQLite).  Failed calls
+        // still cost tokens if the engine got far enough to report them; on
+        // outright spawn/timeout errors the output has no usage, so we skip.
         if let Ok(ref out) = result {
             let (usage, unknown) = match out.usage {
                 Some(u) => (u, false),
                 None => (crate::usage::TokenUsage::default(), true),
             };
-            self.usage_tracker.record(crate::usage::UsageEntry {
+            let entry = crate::usage::UsageEntry {
                 step: step.to_string(),
                 engine: engine_kind,
                 model: model_label,
                 usage,
                 unknown,
-            });
+            };
+            let current_phase = *self.current_phase_id.lock().unwrap();
+            let current_step = *self.current_step_id.lock().unwrap();
+            if let Err(e) = self.exec_log.log_ai_call(
+                current_phase,
+                current_step,
+                &entry,
+                effort_label.as_deref(),
+                Some(call_duration_ms),
+            ) {
+                tracing::debug!("execution_log: log_ai_call failed: {}", e);
+            }
         }
 
         result.map(|o| o.stdout)
+    }
+
+    // === Execution log helpers ===
+
+    /// Open a new phase in the execution log and remember its id as "current" so
+    /// subsequent `run_ai` calls get associated with it automatically.
+    pub(crate) fn exec_phase_start(
+        &self,
+        name: &str,
+        metric_before: Option<f64>,
+        unit: Option<&str>,
+    ) -> Option<i64> {
+        match self.exec_log.start_phase(name, metric_before, unit) {
+            Ok(id) => {
+                *self.current_phase_id.lock().unwrap() = Some(id);
+                Some(id)
+            }
+            Err(e) => {
+                tracing::debug!("execution_log: start_phase({}) failed: {}", name, e);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn exec_phase_finish(
+        &self,
+        phase_id: Option<i64>,
+        status: ItemStatus,
+        metric_after: Option<f64>,
+        details: Option<&str>,
+    ) {
+        if let Some(id) = phase_id {
+            if let Err(e) = self
+                .exec_log
+                .finish_phase(id, status, metric_after, details)
+            {
+                tracing::debug!("execution_log: finish_phase failed: {}", e);
+            }
+            let mut cur = self.current_phase_id.lock().unwrap();
+            if *cur == Some(id) {
+                *cur = None;
+            }
+        }
+    }
+
+    pub(crate) fn exec_step_start(
+        &self,
+        phase_id: Option<i64>,
+        name: &str,
+        target: Option<&str>,
+        metric_before: Option<f64>,
+    ) -> Option<i64> {
+        let pid = phase_id?;
+        match self.exec_log.start_step(pid, name, target, metric_before) {
+            Ok(id) => {
+                *self.current_step_id.lock().unwrap() = Some(id);
+                Some(id)
+            }
+            Err(e) => {
+                tracing::debug!("execution_log: start_step({}) failed: {}", name, e);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn exec_step_finish(
+        &self,
+        step_id: Option<i64>,
+        status: ItemStatus,
+        metric_after: Option<f64>,
+        details: Option<&str>,
+    ) {
+        if let Some(id) = step_id {
+            if let Err(e) = self
+                .exec_log
+                .finish_step(id, status, metric_after, details)
+            {
+                tracing::debug!("execution_log: finish_step failed: {}", e);
+            }
+            let mut cur = self.current_step_id.lock().unwrap();
+            if *cur == Some(id) {
+                *cur = None;
+            }
+        }
     }
 
     /// Run the full Reparo flow (US-010).
@@ -274,48 +455,114 @@ impl Orchestrator {
 
             info!("=== Step 0b: Preflight build + test validation ===");
 
+            // Preflight is flaky for Maven (~/.m2 lock contention, transient network),
+            // so retry transient failures up to PREFLIGHT_MAX_ATTEMPTS times before
+            // aborting. A real broken build will fail consistently across attempts.
+            const PREFLIGHT_MAX_ATTEMPTS: u32 = 3;
+            const PREFLIGHT_BACKOFF_SECS: u64 = 5;
+
             if let Some(ref build_cmd) = preflight_build_cmd {
                 info!("Preflight: running build...");
-                match runner::run_shell_command(&self.config.path, build_cmd, "preflight build") {
-                    Ok((true, _)) => {
-                        info!("✓ Preflight build passed");
+                let mut last_failure: Option<String> = None;
+                let mut last_error: Option<anyhow::Error> = None;
+                let mut succeeded = false;
+                for attempt in 1..=PREFLIGHT_MAX_ATTEMPTS {
+                    match runner::run_shell_command(&self.config.path, build_cmd, "preflight build") {
+                        Ok((true, _)) => {
+                            if attempt > 1 {
+                                warn!("✓ Preflight build passed on attempt {}/{} — first attempt was flaky", attempt, PREFLIGHT_MAX_ATTEMPTS);
+                            } else {
+                                info!("✓ Preflight build passed");
+                            }
+                            succeeded = true;
+                            break;
+                        }
+                        Ok((false, output)) => {
+                            last_failure = Some(output);
+                            if attempt < PREFLIGHT_MAX_ATTEMPTS {
+                                warn!(
+                                    "Preflight build failed on attempt {}/{} — retrying in {}s (Maven flakes are common)",
+                                    attempt, PREFLIGHT_MAX_ATTEMPTS, PREFLIGHT_BACKOFF_SECS
+                                );
+                                std::thread::sleep(std::time::Duration::from_secs(PREFLIGHT_BACKOFF_SECS));
+                            }
+                        }
+                        Err(e) => {
+                            last_error = Some(anyhow::anyhow!("{}", e));
+                            if attempt < PREFLIGHT_MAX_ATTEMPTS {
+                                warn!(
+                                    "Preflight build error on attempt {}/{}: {} — retrying in {}s",
+                                    attempt, PREFLIGHT_MAX_ATTEMPTS, e, PREFLIGHT_BACKOFF_SECS
+                                );
+                                std::thread::sleep(std::time::Duration::from_secs(PREFLIGHT_BACKOFF_SECS));
+                            }
+                        }
                     }
-                    Ok((false, output)) => {
-                        error!("╔═══════════════════════════════════════════════════════════════╗");
-                        error!("║            ✗  PREFLIGHT BUILD FAILED — ABORTING  ✗           ║");
-                        error!("║  Fix the build before running Reparo. Nothing was modified.  ║");
-                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                }
+                if !succeeded {
+                    error!("╔═══════════════════════════════════════════════════════════════╗");
+                    error!("║            ✗  PREFLIGHT BUILD FAILED — ABORTING  ✗           ║");
+                    error!("║  Fix the build before running Reparo. Nothing was modified.  ║");
+                    error!("║  (failed {} consecutive attempts)                              ║", PREFLIGHT_MAX_ATTEMPTS);
+                    error!("╚═══════════════════════════════════════════════════════════════╝");
+                    if let Some(output) = last_failure {
                         error!("Build output:\n{}", truncate_tail(&output, 3000));
-                        anyhow::bail!("Preflight build failed — project does not compile. Fix the build and retry.");
-                    }
-                    Err(e) => {
-                        error!("╔═══════════════════════════════════════════════════════════════╗");
-                        error!("║          ✗  PREFLIGHT BUILD ERROR — ABORTING  ✗              ║");
-                        error!("╚═══════════════════════════════════════════════════════════════╝");
-                        anyhow::bail!("Preflight build error: {}", e);
+                        anyhow::bail!("Preflight build failed after {} attempts — project does not compile.", PREFLIGHT_MAX_ATTEMPTS);
+                    } else if let Some(e) = last_error {
+                        anyhow::bail!("Preflight build error after {} attempts: {}", PREFLIGHT_MAX_ATTEMPTS, e);
                     }
                 }
             }
 
             if let Some(ref test_cmd) = preflight_test_cmd {
                 info!("Preflight: running test suite...");
-                match runner::run_tests(&self.config.path, test_cmd, self.config.test_timeout) {
-                    Ok((true, _)) => {
-                        info!("✓ Preflight tests passed");
+                let mut last_failure: Option<String> = None;
+                let mut last_error: Option<anyhow::Error> = None;
+                let mut succeeded = false;
+                for attempt in 1..=PREFLIGHT_MAX_ATTEMPTS {
+                    match runner::run_tests(&self.config.path, test_cmd, self.config.test_timeout) {
+                        Ok((true, _)) => {
+                            if attempt > 1 {
+                                warn!("✓ Preflight tests passed on attempt {}/{} — first attempt was flaky", attempt, PREFLIGHT_MAX_ATTEMPTS);
+                            } else {
+                                info!("✓ Preflight tests passed");
+                            }
+                            succeeded = true;
+                            break;
+                        }
+                        Ok((false, output)) => {
+                            last_failure = Some(output);
+                            if attempt < PREFLIGHT_MAX_ATTEMPTS {
+                                warn!(
+                                    "Preflight tests failed on attempt {}/{} — retrying in {}s",
+                                    attempt, PREFLIGHT_MAX_ATTEMPTS, PREFLIGHT_BACKOFF_SECS
+                                );
+                                std::thread::sleep(std::time::Duration::from_secs(PREFLIGHT_BACKOFF_SECS));
+                            }
+                        }
+                        Err(e) => {
+                            last_error = Some(anyhow::anyhow!("{}", e));
+                            if attempt < PREFLIGHT_MAX_ATTEMPTS {
+                                warn!(
+                                    "Preflight tests error on attempt {}/{}: {} — retrying in {}s",
+                                    attempt, PREFLIGHT_MAX_ATTEMPTS, e, PREFLIGHT_BACKOFF_SECS
+                                );
+                                std::thread::sleep(std::time::Duration::from_secs(PREFLIGHT_BACKOFF_SECS));
+                            }
+                        }
                     }
-                    Ok((false, output)) => {
-                        error!("╔═══════════════════════════════════════════════════════════════╗");
-                        error!("║            ✗  PREFLIGHT TESTS FAILED — ABORTING  ✗           ║");
-                        error!("║  Fix failing tests before running Reparo. Nothing modified.  ║");
-                        error!("╚═══════════════════════════════════════════════════════════════╝");
+                }
+                if !succeeded {
+                    error!("╔═══════════════════════════════════════════════════════════════╗");
+                    error!("║            ✗  PREFLIGHT TESTS FAILED — ABORTING  ✗           ║");
+                    error!("║  Fix failing tests before running Reparo. Nothing modified.  ║");
+                    error!("║  (failed {} consecutive attempts)                              ║", PREFLIGHT_MAX_ATTEMPTS);
+                    error!("╚═══════════════════════════════════════════════════════════════╝");
+                    if let Some(output) = last_failure {
                         error!("Test output:\n{}", truncate_tail(&output, 3000));
-                        anyhow::bail!("Preflight tests failed — fix failing tests and retry.");
-                    }
-                    Err(e) => {
-                        error!("╔═══════════════════════════════════════════════════════════════╗");
-                        error!("║          ✗  PREFLIGHT TEST ERROR — ABORTING  ✗               ║");
-                        error!("╚═══════════════════════════════════════════════════════════════╝");
-                        anyhow::bail!("Preflight test error: {}", e);
+                        anyhow::bail!("Preflight tests failed after {} attempts.", PREFLIGHT_MAX_ATTEMPTS);
+                    } else if let Some(e) = last_error {
+                        anyhow::bail!("Preflight test error after {} attempts: {}", PREFLIGHT_MAX_ATTEMPTS, e);
                     }
                 }
             } else {
@@ -477,11 +724,155 @@ impl Orchestrator {
             }
         }
 
+        // Step 3a: Test overlap detection — advisory, read-only, no AI involved.
+        // Runs each test file in isolation through the coverage command, compares the
+        // resulting per-file source-line sets pairwise, and emits warnings for any
+        // pair that covers identical lines (flagging the one with fewer covered lines
+        // as the removal candidate).  The phase is skipped when --skip-overlap is
+        // passed or when no coverage command is resolvable.
+        if self.config.skip_overlap {
+            info!("=== Step 3a: Test overlap detection SKIPPED (--skip-overlap) ===");
+        } else {
+            let cov_cmd = self
+                .config
+                .coverage_command
+                .clone()
+                .or_else(|| self.config.commands.coverage.clone())
+                .or_else(|| runner::detect_coverage_command(&self.config.path));
+
+            if let Some(ref cmd) = cov_cmd {
+                info!("=== Step 3a: Test overlap detection ===");
+                let pid = self.exec_phase_start("test_overlap", None, None);
+                match self.analyze_test_overlap(cmd) {
+                    Ok(_) => self.exec_phase_finish(pid, ItemStatus::Completed, None, None),
+                    Err(e) => {
+                        warn!("Test overlap detection failed (non-critical): {}", e);
+                        self.exec_phase_finish(
+                            pid,
+                            ItemStatus::Failed,
+                            None,
+                            Some(&format!("{}", e)),
+                        );
+                    }
+                }
+            } else {
+                info!("=== Step 3a: Test overlap detection SKIPPED (no coverage command) ===");
+            }
+        }
+
         // Step 3b: Coverage boosting — generate tests until min_coverage is reached
         if self.config.skip_coverage {
             info!("=== Step 3b: Coverage boost SKIPPED (--skip-coverage) ===");
+            let pid = self.exec_phase_start("coverage_boost", None, Some("%"));
+            self.exec_phase_finish(pid, ItemStatus::Skipped, None, Some("--skip-coverage"));
         } else if self.config.min_coverage > 0.0 {
-            self.boost_coverage_to_threshold(&test_command).await?;
+            let pid = self.exec_phase_start("coverage_boost", None, Some("%"));
+            let result = self.boost_coverage_to_threshold(&test_command).await;
+            match &result {
+                Ok(_) => self.exec_phase_finish(pid, ItemStatus::Completed, None, None),
+                Err(e) => self.exec_phase_finish(
+                    pid,
+                    ItemStatus::Failed,
+                    None,
+                    Some(&format!("{}", e)),
+                ),
+            }
+            result?;
+        }
+
+        // Step 3c: Freeze baseline coverage snapshot. Captured before the fix
+        // loop so every per-issue coverage check references the same immutable
+        // lcov — otherwise parallel worktrees contaminate each other's view.
+        {
+            let pid = self.exec_phase_start("baseline_coverage_snapshot", None, None);
+            match coverage::snapshot_baseline_lcov(
+                &self.config.path,
+                self.config.commands.coverage_report.as_deref(),
+            ) {
+                Some(path) => {
+                    self.config.baseline_lcov_path = Some(path);
+                    self.exec_phase_finish(pid, ItemStatus::Completed, None, None);
+                }
+                None => {
+                    info!(
+                        "Baseline coverage snapshot unavailable — per-issue coverage will fall back to SonarQube"
+                    );
+                    self.exec_phase_finish(
+                        pid,
+                        ItemStatus::Skipped,
+                        None,
+                        Some("no lcov report on disk"),
+                    );
+                }
+            }
+        }
+
+        // Step 3d: Local linter scan. Findings are normalized into Issue
+        // records with synthetic `lint:<format>:<rule>` keys and merged into
+        // the fix queue alongside SonarQube issues (Step 4 below).
+        let mut linter_issues: Vec<Issue> = Vec::new();
+        if self.config.skip_linter_scan {
+            info!("=== Step 3d: Linter scan SKIPPED (--skip-linter-scan) ===");
+            let pid = self.exec_phase_start("linter_scan", None, None);
+            self.exec_phase_finish(pid, ItemStatus::Skipped, None, Some("--skip-linter-scan"));
+        } else {
+            info!("=== Step 3d: Local linter scan ===");
+            let pid = self.exec_phase_start("linter_scan", None, Some(" findings"));
+            let lint_cmd = self.config.commands.lint.as_deref();
+            let lint_format = self.config.commands.lint_format.as_deref();
+            match crate::linter::run_lint_scan(
+                &self.config.path,
+                lint_cmd,
+                lint_format,
+                self.config.linter_autofix,
+                self.config.max_linter_findings,
+                &self.config.sonar_project_id,
+            ) {
+                Ok(issues) => {
+                    info!(
+                        "Linter scan produced {} queueable finding(s)",
+                        issues.len()
+                    );
+                    // If autofix made changes, commit them so the fix loop starts
+                    // from a clean tree (WIP commits are absorbed into the branch).
+                    if self.config.linter_autofix {
+                        match git::has_changes(&self.config.path) {
+                            Ok(true) => {
+                                if let Err(e) = git::commit_all(
+                                    &self.config.path,
+                                    &format_commit_message(
+                                        &self.config,
+                                        "style",
+                                        "linter",
+                                        "apply linter autofix before sonar fixes",
+                                        "",
+                                        "",
+                                        "",
+                                    ),
+                                ) {
+                                    warn!("Failed to commit linter autofix changes: {}", e);
+                                } else {
+                                    info!("Linter autofix changes committed");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => warn!("Could not check git status after autofix: {}", e),
+                        }
+                    }
+                    let count = issues.len() as f64;
+                    linter_issues = issues;
+                    self.exec_phase_finish(pid, ItemStatus::Completed, Some(count), None);
+                }
+                Err(e) => {
+                    warn!("Linter scan failed (non-critical): {}", e);
+                    self.exec_phase_finish(
+                        pid,
+                        ItemStatus::Failed,
+                        None,
+                        Some(&format!("{}", e)),
+                    );
+                }
+            }
         }
 
         // Step 4: Initial SonarQube scan
@@ -525,13 +916,33 @@ impl Orchestrator {
         }
 
         // Fetch initial issues to get total count and dry-run info
-        let mut initial_issues = self.client.fetch_issues().await?;
+        let mut sonar_issues = self.client.fetch_issues().await?;
         if self.config.reverse_severity {
-            initial_issues.reverse();
+            sonar_issues.reverse();
             info!("Reversed severity order: processing least severe issues first");
         }
+
+        // Merge linter findings into the sonar queue. Linter issues go through
+        // the same fix loop — they're ordered severity-interleaved so a
+        // BLOCKER lint finding is processed before a MAJOR sonar issue.
+        let linter_count = linter_issues.len();
+        let sonar_count = sonar_issues.len();
+        let mut initial_issues = helpers::merge_lint_and_sonar_issues(
+            linter_issues,
+            sonar_issues,
+            self.config.reverse_severity,
+        );
         self.total_issues_found = initial_issues.len();
-        info!("Found {} issues", self.total_issues_found);
+        if linter_count > 0 {
+            info!(
+                "Found {} issues ({} sonar + {} linter)",
+                self.total_issues_found, sonar_count, linter_count
+            );
+        } else {
+            info!("Found {} issues", self.total_issues_found);
+        }
+        // Keep the binding name `initial_issues` for the rest of the loop.
+        let _ = &mut initial_issues;
 
         if initial_issues.is_empty() {
             info!("No issues to fix. Congratulations!");
@@ -566,10 +977,70 @@ impl Orchestrator {
             ));
         }
 
+        // Pre-fix coverage: if no coverage report exists on disk (e.g. --skip-coverage was
+        // passed and the pre-scan run produced nothing, or the report was cleaned between
+        // steps), run the coverage command once now so that check_coverage() has data
+        // during the fix loop. Always use auto-detection as the final fallback so this
+        // works even when the command is not explicitly configured.
+        if !self.config.skip_fixes {
+            let report_exists = runner::find_lcov_report_with_hint(
+                &self.config.path,
+                self.config.commands.coverage_report.as_deref(),
+            ).is_some();
+
+            if !report_exists {
+                let cov_cmd = self.config.coverage_command.clone()
+                    .or_else(|| self.config.commands.coverage.clone())
+                    .or_else(|| runner::detect_coverage_command(&self.config.path));
+
+                if let Some(ref cmd) = cov_cmd {
+                    info!("=== Pre-fix coverage: no report on disk — generating coverage data ===");
+                    match runner::run_shell_command(&self.config.path, cmd, "pre-fix coverage") {
+                        Ok((true, output)) => {
+                            if output.contains("Skipping JaCoCo execution due to missing execution data") {
+                                warn!(
+                                    "JaCoCo skipped report generation — no execution data (jacoco.exec) found. \
+                                     Ensure jacoco-maven-plugin prepare-agent is configured in the POM."
+                                );
+                            }
+                            if runner::find_lcov_report_with_hint(
+                                &self.config.path,
+                                self.config.commands.coverage_report.as_deref(),
+                            ).is_some() {
+                                info!("Pre-fix coverage report generated");
+                            } else {
+                                warn!("Pre-fix coverage command succeeded but no report file was produced");
+                            }
+                        }
+                        Ok((false, output)) => {
+                            warn!("Pre-fix coverage command failed: {}", truncate(&output, 300));
+                        }
+                        Err(e) => warn!("Pre-fix coverage command error: {}", e),
+                    }
+                } else {
+                    warn!(
+                        "Pre-fix coverage: no coverage report found and no coverage command available — \
+                         check_coverage will run without per-file data"
+                    );
+                }
+            }
+        }
+
         // Step 5: Fix loop — only fix issues from the initial scan
         info!("=== Step 5: Fix loop ===");
+        let fix_loop_phase = self.exec_phase_start(
+            "fix_loop",
+            Some(self.total_issues_found as f64),
+            Some(" issues"),
+        );
         if self.config.skip_fixes {
             info!("Skipping fix loop (--skip-fixes)");
+            self.exec_phase_finish(
+                fix_loop_phase,
+                ItemStatus::Skipped,
+                Some(self.total_issues_found as f64),
+                Some("--skip-fixes"),
+            );
             let _ = git::checkout(&self.config.path, &self.config.branch);
             return Ok(0);
         }
@@ -586,8 +1057,24 @@ impl Orchestrator {
         info!("Tracking {} original issues", original_issue_keys.len());
 
         // US-018: Parallel mode — dispatch to worktrees
-        if self.config.parallel > 1 && self.config.batch_size <= 1 {
-            info!("=== Parallel mode: {} workers ===", self.config.parallel);
+        //
+        // Two sub-modes:
+        //   batch_size == 1  →  per-issue parallel: each issue gets its own branch
+        //                       and PR; processed concurrently.
+        //   batch_size != 1  →  wave-parallel: issues touching different files are
+        //                       processed in parallel within the shared batch branch;
+        //                       a single PR is created at the end (same as sequential).
+        // Hint when running sequentially over many issues: per-issue parallelism
+        // with worktrees can cut wall-clock 3-4× with no code change.
+        if self.config.parallel <= 1 && initial_issues.len() > 10 {
+            info!(
+                "Hint: {} issues queued. For faster runs, try `--parallel 4 --batch-size 1` (per-issue worktree parallelism).",
+                initial_issues.len()
+            );
+        }
+
+        if self.config.parallel > 1 && self.config.batch_size == 1 {
+            info!("=== Parallel mode (per-issue): {} workers ===", self.config.parallel);
             self.run_parallel_fix_loop(
                 &initial_issues,
                 &original_issue_keys,
@@ -606,31 +1093,84 @@ impl Orchestrator {
                 total_fixed, total_failed
             );
 
-            // In parallel mode each issue has its own PR, skip the aggregate PR + dedup + rebase.
+            self.exec_phase_finish(
+                fix_loop_phase,
+                ItemStatus::Completed,
+                Some(total_fixed as f64),
+                Some(&format!("parallel: {} fixed, {} failed", total_fixed, total_failed)),
+            );
+
+            // In per-issue parallel mode each issue has its own PR.
             // Jump to report generation.
+            let report_phase = self.exec_phase_start("report", None, None);
             info!("=== Step 6: Generating report ===");
             let elapsed = start.elapsed().as_secs();
-            let usage_entries = self.usage_tracker.snapshot();
-            self.print_usage_table(&usage_entries);
-            report::generate_report_with_usage(
+            report::generate_report(
                 &self.config.path,
                 &self.results,
                 self.total_issues_found,
                 elapsed,
-                &usage_entries,
             );
 
             let exit_code = self.print_summary(elapsed);
             crate::state::remove_state(&self.config.path);
+            self.exec_phase_finish(report_phase, ItemStatus::Completed, None, None);
 
             return Ok(exit_code);
         }
 
+        let wave_parallel = self.config.parallel > 1;
+        if wave_parallel {
+            info!(
+                "=== Parallel mode (wave-based): {} workers, batch-size={} ===",
+                self.config.parallel, self.config.batch_size
+            );
+            self.run_wave_parallel_fixes(
+                &initial_issues,
+                &original_issue_keys,
+                &already_processed,
+                max_issues,
+                &test_command,
+                &self.config.branch.clone(),
+            )
+            .await?;
+
+            let wp_fixed = self.results.iter().filter(|r| matches!(r.status, FixStatus::Fixed)).count();
+            let wp_failed = self.results.iter().filter(|r| !matches!(r.status, FixStatus::Fixed | FixStatus::Skipped(_) | FixStatus::RiskSkipped(_))).count();
+            info!("Wave-parallel complete: {} fixed, {} failed/review", wp_fixed, wp_failed);
+            self.exec_phase_finish(
+                fix_loop_phase,
+                ItemStatus::Completed,
+                Some(wp_fixed as f64),
+                Some(&format!("wave-parallel: {} fixed, {} failed", wp_fixed, wp_failed)),
+            );
+        }
+
         let mut total_fixed = 0usize;
         let mut total_failed = 0usize;
+
+        if !wave_parallel {
         let mut issue_num = 0usize;
         let mut consecutive_build_failures = 0usize;
         const MAX_CONSECUTIVE_FAILURES: usize = 3;
+
+        // Batch-commit state: accumulate (key, message) of WIP-committed fixes and
+        // squash them once the batch size is reached (or at the end of the loop).
+        // Active only when fix_commit_batch != 1.
+        let fix_batch_size: usize = if self.config.fix_commit_batch == 0 {
+            usize::MAX // 0 = one commit per branch → squash all at the very end
+        } else {
+            self.config.fix_commit_batch as usize
+        };
+        let use_fix_batching = self.config.fix_commit_batch != 1;
+        let mut wip_fix_issues: Vec<(String, String)> = Vec::new();
+
+        // Per-fix validation uses targeted tests only when batch_size != 1.
+        // The full suite runs once every `batch_size` fixes, amortizing the
+        // ~78s cost across the batch. batch_size = 1 preserves the old
+        // per-fix full suite; batch_size = 0 defers to final_validation.
+        let full_suite_batch: usize = self.config.batch_size.max(1);
+        let mut fixes_since_full_suite: usize = 0;
 
         loop {
             if issue_num >= max_issues {
@@ -671,7 +1211,21 @@ impl Orchestrator {
                     if self.config.reverse_severity {
                         issues.reverse();
                     }
-                    issues
+                    // Linter issues never appear in SonarQube. Re-inject any
+                    // still-pending linter issues so the picker below can
+                    // consider them alongside fresh sonar data.
+                    let pending_linter: Vec<Issue> = initial_issues
+                        .iter()
+                        .filter(|i| i.rule.starts_with("lint:"))
+                        .filter(|i| !already_processed.contains(&i.key))
+                        .filter(|i| !self.results.iter().any(|r| r.issue_key == i.key))
+                        .cloned()
+                        .collect();
+                    helpers::merge_lint_and_sonar_issues(
+                        pending_linter,
+                        issues,
+                        self.config.reverse_severity,
+                    )
                 }
                 Err(e) => {
                     error!("Failed to fetch issues: {}", e);
@@ -717,17 +1271,58 @@ impl Orchestrator {
                 }
             }
 
+            // exec log: open a per-issue step
+            let current_phase = *self.current_phase_id.lock().unwrap();
+            let step_target = format!("{} ({})", issue.key, sonar::component_to_path(&issue.component));
+            let issue_step = self.exec_step_start(
+                current_phase,
+                "fix_issue",
+                Some(&step_target),
+                None,
+            );
+
+            self.fix_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let result = self.process_issue(&issue, &test_command).await;
-            match &result.status {
+            let (step_status, step_details) = match &result.status {
                 FixStatus::Fixed => {
                     total_fixed += 1;
                     consecutive_build_failures = 0; // Reset on success
                     info!("Issue {} fixed successfully ({} fixed so far)", issue.key, total_fixed);
+                    if use_fix_batching {
+                        wip_fix_issues.push((issue.key.clone(), issue.message.clone()));
+                        if wip_fix_issues.len() >= fix_batch_size {
+                            let _ = self.squash_fix_commits(wip_fix_issues.len(), &wip_fix_issues);
+                            wip_fix_issues.clear();
+                        }
+                    }
+                    // Batch-boundary full-suite validation: when batch_size > 1,
+                    // the per-fix validation is targeted-only, so we amortize the
+                    // full suite cost by running it once every `batch_size` fixes.
+                    fixes_since_full_suite += 1;
+                    if self.config.batch_size > 1 && fixes_since_full_suite >= full_suite_batch {
+                        if !test_command.is_empty() {
+                            info!(
+                                "Running full test suite after batch of {} fixes (batch_size={})...",
+                                fixes_since_full_suite, self.config.batch_size
+                            );
+                            match runner::run_tests(&self.config.path, &test_command, self.config.test_timeout) {
+                                Ok((true, _)) => info!("Batch full-suite validation PASSED"),
+                                Ok((false, output)) => warn!(
+                                    "Batch full-suite validation FAILED after {} fixes — final_validation will retry at end. Output:\n{}",
+                                    fixes_since_full_suite, truncate(&output, 500)
+                                ),
+                                Err(e) => warn!("Batch full-suite validation error (non-blocking): {}", e),
+                            }
+                        }
+                        fixes_since_full_suite = 0;
+                    }
+                    (ItemStatus::Completed, "fixed".to_string())
                 }
                 FixStatus::NeedsReview(reason) => {
                     total_failed += 1;
                     consecutive_build_failures = 0; // Review != build failure
                     warn!("Issue {} needs manual review: {}", issue.key, reason);
+                    (ItemStatus::Failed, format!("needs review: {}", reason))
                 }
                 FixStatus::Failed(err) => {
                     total_failed += 1;
@@ -737,11 +1332,18 @@ impl Orchestrator {
                         consecutive_build_failures = 0;
                     }
                     error!("Issue {} failed: {}", issue.key, err);
+                    (ItemStatus::Failed, format!("failed: {}", err))
                 }
                 FixStatus::Skipped(reason) => {
                     info!("Issue {} skipped: {}", issue.key, reason);
+                    (ItemStatus::Skipped, format!("skipped: {}", reason))
                 }
-            }
+                FixStatus::RiskSkipped(reason) => {
+                    info!("Issue {} risk-skipped (cross-cutting impact): {}", issue.key, reason);
+                    (ItemStatus::Skipped, format!("risk-skipped: {}", reason))
+                }
+            };
+            self.exec_step_finish(issue_step, step_status, None, Some(&step_details));
 
             // US-013: Document in changelog immediately
             report::append_changelog(&self.config.path, &result);
@@ -753,9 +1355,10 @@ impl Orchestrator {
                     FixStatus::NeedsReview(_) => "needs_review",
                     FixStatus::Failed(_) => "failed",
                     FixStatus::Skipped(_) => "skipped",
+                    FixStatus::RiskSkipped(_) => "risk_skipped",
                 };
                 let reason = match &result.status {
-                    FixStatus::Failed(r) | FixStatus::NeedsReview(r) | FixStatus::Skipped(r) => Some(r.as_str()),
+                    FixStatus::Failed(r) | FixStatus::NeedsReview(r) | FixStatus::Skipped(r) | FixStatus::RiskSkipped(r) => Some(r.as_str()),
                     _ => None,
                 };
                 state.add_processed(&result.issue_key, status_str, result.pr_url.as_deref(), reason);
@@ -763,25 +1366,59 @@ impl Orchestrator {
             }
 
             self.results.push(result);
+        } // end sequential issue loop
+
+        // Final squash: flush any remaining WIP fix commits that didn't fill a full batch.
+        if use_fix_batching && !wip_fix_issues.is_empty() {
+            let _ = self.squash_fix_commits(wip_fix_issues.len(), &wip_fix_issues);
+            wip_fix_issues.clear();
         }
 
         info!(
-            "Processing complete: {} fixed, {} failed/review",
+            "Sequential processing complete: {} fixed, {} failed/review",
             total_fixed, total_failed
         );
 
+        // Close the fix_loop phase with the final fix count as the "after" metric
+        self.exec_phase_finish(
+            fix_loop_phase,
+            ItemStatus::Completed,
+            Some(total_fixed as f64),
+            Some(&format!("{} fixed, {} failed", total_fixed, total_failed)),
+        );
+        } // end if !wave_parallel
+
+        // Compute final counts from self.results for the shared post-processing path
+        let total_fixed = self.results.iter().filter(|r| matches!(r.status, FixStatus::Fixed)).count();
+        let _total_failed = self.results.iter().filter(|r| matches!(r.status, FixStatus::NeedsReview(_) | FixStatus::Failed(_))).count();
+
         // Step 5b: Deduplication — reduce duplicated code after fixes
+        let dedup_phase = self.exec_phase_start("dedup", None, None);
         if self.config.skip_dedup {
             info!("=== Step 5b: Deduplication SKIPPED (--skip-dedup) ===");
+            self.exec_phase_finish(dedup_phase, ItemStatus::Skipped, None, Some("--skip-dedup"));
         } else if let Some(ref scanner) = self.config.scanner {
-            self.reduce_duplications(&test_command, scanner).await?;
+            let dedup_result = self.reduce_duplications(&test_command, scanner).await;
+            match &dedup_result {
+                Ok(_) => self.exec_phase_finish(dedup_phase, ItemStatus::Completed, None, None),
+                Err(e) => self.exec_phase_finish(
+                    dedup_phase,
+                    ItemStatus::Failed,
+                    None,
+                    Some(&format!("{}", e)),
+                ),
+            }
+            dedup_result?;
         } else {
             info!("=== Step 5b: Deduplication SKIPPED (no scanner) ===");
+            self.exec_phase_finish(dedup_phase, ItemStatus::Skipped, None, Some("no scanner"));
         }
 
         // Step 5c: Final validation — run the FULL test suite; iterate with Claude until ALL tests pass
+        let final_phase = self.exec_phase_start("final_validation", None, None);
         if self.config.skip_final_validation {
             info!("=== Step 5c: Final validation SKIPPED (disabled) ===");
+            self.exec_phase_finish(final_phase, ItemStatus::Skipped, None, Some("disabled"));
         } else {
         info!("=== Step 5c: Final validation (all tests must pass) ===");
         }
@@ -888,28 +1525,105 @@ Apply the fix now."#,
                     info!("Committed final validation fixes");
                 }
             }
+            self.exec_phase_finish(
+                final_phase,
+                if final_ok { ItemStatus::Completed } else { ItemStatus::Failed },
+                None,
+                None,
+            );
+        }
+
+        // Step 5d: Traceability matrix (US-068) — runs after final_validation, only when --compliance
+        if self.config.compliance_enabled {
+            let trace_phase = self.exec_phase_start("traceability_report", None, None);
+            info!("=== Step 5d: Generating traceability matrix ===");
+            let report_dir = if self.config.execution_log_report_dir == ".reparo" {
+                self.config.path.join(".reparo")
+            } else {
+                let p = std::path::PathBuf::from(&self.config.execution_log_report_dir);
+                if p.is_absolute() { p } else { self.config.path.join(&self.config.execution_log_report_dir) }
+            };
+            let trace_dir = self.config.compliance.traceability_dir.as_ref()
+                .map(|d| self.config.path.join(d))
+                .unwrap_or_else(|| report_dir.clone());
+            match self.exec_log.generate_traceability_matrix(None, &trace_dir, self.config.health_mode) {
+                Ok(path) => {
+                    info!("Traceability matrix written to {}", path.display());
+                    self.exec_phase_finish(trace_phase, ItemStatus::Completed, None, None);
+                }
+                Err(e) => {
+                    warn!("Failed to generate traceability matrix: {} — continuing", e);
+                    self.exec_phase_finish(trace_phase, ItemStatus::Failed, None, Some(&format!("{}", e)));
+                }
+            }
+        }
+
+        // Step 5e: Compliance report (US-071) — runs after traceability_report, only when --compliance
+        if self.config.compliance_enabled {
+            let comp_phase = self.exec_phase_start("compliance_report", None, None);
+            info!("=== Step 5e: Generating compliance report ===");
+            let report_dir = if self.config.execution_log_report_dir == ".reparo" {
+                self.config.path.join(".reparo")
+            } else {
+                let p = std::path::PathBuf::from(&self.config.execution_log_report_dir);
+                if p.is_absolute() { p } else { self.config.path.join(&self.config.execution_log_report_dir) }
+            };
+            match crate::compliance::report::build_report(
+                &self.exec_log,
+                self.exec_log.run_id(),
+                &self.config.compliance,
+                self.config.health_mode,
+            ) {
+                Ok(report) => {
+                    match crate::compliance::report::write_compliance_file(&report, &report_dir) {
+                        Ok(path) => {
+                            info!("Compliance report written to {}", path.display());
+                            self.exec_phase_finish(comp_phase, ItemStatus::Completed, None, Some(path.display().to_string().as_str()));
+                        }
+                        Err(e) => {
+                            warn!("Failed to write compliance report: {} — continuing", e);
+                            self.exec_phase_finish(comp_phase, ItemStatus::Failed, None, Some(&format!("{}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to build compliance report: {} — continuing", e);
+                    self.exec_phase_finish(comp_phase, ItemStatus::Failed, None, Some(&format!("{}", e)));
+                }
+            }
         }
 
         // Step 5c: Documentation quality — ensure code documentation meets standards
+        let docs_phase = self.exec_phase_start("documentation", None, None);
         if self.config.skip_docs {
             info!("=== Step 5c: Documentation SKIPPED (--skip-docs) ===");
+            self.exec_phase_finish(docs_phase, ItemStatus::Skipped, None, Some("--skip-docs"));
         } else if self.config.documentation.enabled {
-            self.improve_documentation(&test_command).await?;
+            let docs_result = self.improve_documentation(&test_command).await;
+            match &docs_result {
+                Ok(_) => self.exec_phase_finish(docs_phase, ItemStatus::Completed, None, None),
+                Err(e) => self.exec_phase_finish(
+                    docs_phase,
+                    ItemStatus::Failed,
+                    None,
+                    Some(&format!("{}", e)),
+                ),
+            }
+            docs_result?;
         } else {
             info!("=== Step 5c: Documentation SKIPPED (not enabled in YAML) ===");
+            self.exec_phase_finish(docs_phase, ItemStatus::Skipped, None, Some("disabled in YAML"));
         }
 
         // Step 6: Generate report (on the fix branch)
+        let report_phase = self.exec_phase_start("report", None, None);
         info!("=== Step 6: Generating report ===");
         let elapsed = start.elapsed().as_secs();
-        let usage_entries = self.usage_tracker.snapshot();
-        self.print_usage_table(&usage_entries);
-        report::generate_report_with_usage(
+        report::generate_report(
             &self.config.path,
             &self.results,
             self.total_issues_found,
             elapsed,
-            &usage_entries,
         );
 
         // Commit report files to the fix branch
@@ -918,6 +1632,7 @@ Apply the fix now."#,
             let msg = format_commit_message(&self.config, "docs", "sonar", "add REPORT.md and TECHDEBT_CHANGELOG.md", "", "", "");
             let _ = git::commit(&self.config.path, &msg);
         }
+        self.exec_phase_finish(report_phase, ItemStatus::Completed, None, None);
 
         // Step 7: Create PR if enabled and there are fixes
         if self.config.pr && total_fixed > 0 {

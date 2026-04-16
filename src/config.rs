@@ -111,6 +111,46 @@ pub struct Config {
     #[arg(long, env = "REPARO_MIN_FILE_COVERAGE", default_value = "0")]
     pub min_file_coverage: f64,
 
+    /// US-064: Minimum project-wide branch coverage (%) — tests are generated
+    /// until both line AND branch thresholds are reached. 0 = disabled.
+    /// Only active when the coverage report contains branch data (BRDA records).
+    #[arg(long, env = "REPARO_MIN_BRANCH_COVERAGE", default_value = "0")]
+    pub min_branch_coverage: f64,
+
+    /// US-064: Minimum per-file branch coverage (%) — files below this are
+    /// boosted even if line threshold is met. 0 = disabled.
+    #[arg(long, env = "REPARO_MIN_FILE_BRANCH_COVERAGE", default_value = "0")]
+    pub min_file_branch_coverage: f64,
+
+    /// Skip the test overlap detection phase (Step 3a)
+    #[arg(long, default_value = "false")]
+    pub skip_overlap: bool,
+
+    /// Include issues found in test code (`scopes=TEST` in the SonarQube API).
+    ///
+    /// By default reparo only processes `MAIN` scope issues — the same set
+    /// the SonarQube web UI shows by default. SonarQube stores issues from
+    /// test code separately and the web UI hides them unless you explicitly
+    /// switch the scope filter to "All scopes" or "Tests". Running with this
+    /// flag doubles-to-triples the issue count on typical projects.
+    #[arg(long, env = "REPARO_INCLUDE_TEST_ISSUES", default_value = "false")]
+    pub include_test_issues: bool,
+
+    /// Additional file-path glob to exclude from processing. Repeatable.
+    ///
+    /// Applied on top of whatever is declared in the project's
+    /// `sonar-project.properties` (`sonar.exclusions`, `sonar.test.exclusions`,
+    /// `sonar.coverage.exclusions`, `sonar.cpd.exclusions`). Use this to
+    /// exclude entire packages from reparo without touching the properties
+    /// file — e.g. `--exclude 'src/main/java/com/legacy/**'`.
+    ///
+    /// Patterns use Ant-style globs:
+    ///   `**` any number of path segments, `*` anything within a segment,
+    ///   `?` a single character. Patterns without a leading `**/` are
+    ///   auto-anchored to match at any depth.
+    #[arg(long = "exclude", value_name = "GLOB")]
+    pub sonar_exclusions: Vec<String>,
+
     /// Skip the coverage boost step entirely
     #[arg(long, default_value = "false")]
     pub skip_coverage: bool,
@@ -143,6 +183,11 @@ pub struct Config {
     #[arg(long, env = "REPARO_COVERAGE_COMMIT_BATCH", default_value = "0")]
     pub coverage_commit_batch: u32,
 
+    /// Issues per git commit during the fix step (1 = one commit per issue, 0 = one commit per branch).
+    /// Analogous to --coverage-commit-batch but for issue fixes.
+    #[arg(long, env = "REPARO_FIX_COMMIT_BATCH", default_value = "1")]
+    pub fix_commit_batch: u32,
+
     /// Number of files to process in parallel during coverage boost (1 = sequential).
     /// Each parallel file gets its own git worktree for isolation.
     #[arg(long, env = "REPARO_COVERAGE_PARALLEL", default_value = "1")]
@@ -158,6 +203,55 @@ pub struct Config {
     #[arg(long, env = "REPARO_MAX_BOOST_FAILURES", default_value = "5")]
     pub max_boost_failures: usize,
 
+    /// Maximum lines to embed in a method chunk snippet for coverage boost (US-053).
+    /// Methods with more lines use a compact representation (signature + uncovered context + close)
+    /// and let Claude read the full file via tool calls.  0 = always embed full method.
+    #[arg(long, env = "REPARO_CHUNK_SNIPPET_MAX_LINES", default_value = "80")]
+    pub chunk_snippet_max_lines: usize,
+
+    /// Directory (relative to project path) where the execution summary markdown
+    /// is written at the end of each run. Defaults to `.reparo`.
+    #[arg(long, env = "REPARO_EXECUTION_LOG_REPORT_DIR", default_value = ".reparo")]
+    pub execution_log_report_dir: String,
+
+    /// US-066: Enable compliance mode (baseline). When true, generated tests must
+    /// include `@Reparo.*` trace blocks (purpose, requirement, testType, runId),
+    /// Reparo validates their presence, and the execution log + compliance report
+    /// include trazability metadata. Baseline compliance targets ISO 25010 (software
+    /// quality), ISO/IEC 33020 (process assessment) and ENS Alto (Spanish national
+    /// security framework) — industry-agnostic.
+    ///
+    /// Health-specific standards (MDR 2017/745, IEC 62304, IEC 62305, ISO 14971,
+    /// Class A/B/C, MC/DC) require the additional `--health-mode` flag.
+    #[arg(long, env = "REPARO_COMPLIANCE", default_value = "false")]
+    pub compliance_enabled: bool,
+
+    /// Enable medical/health-software compliance extensions on top of `--compliance`.
+    ///
+    /// When true, Reparo activates features specific to **medical device software**
+    /// and safety-critical health systems:
+    /// - **MDR 2017/745** Annex II technical documentation references
+    /// - **IEC 62304** software safety classification (Class A/B/C) and unit
+    ///   testing rigor per class
+    /// - **IEC 62305** / **ISO 14971** risk control traceability
+    /// - **MC/DC** (Modified Condition/Decision Coverage) tracking for Class C code
+    /// - `@Reparo.riskClass` field in test trace blocks
+    /// - Compliance report sections for IEC 62304 §5.5.4 and MDR Annex II §6.1(b)
+    ///
+    /// Implies `--compliance` (baseline). Projects that are NOT medical/health
+    /// should leave this flag off — the industry-agnostic compliance features
+    /// (trace blocks, traceability matrix, audit log, ISO 25010 quality testing)
+    /// remain fully available via `--compliance` alone.
+    #[arg(long, env = "REPARO_HEALTH_MODE", default_value = "false")]
+    pub health_mode: bool,
+
+    /// US-059: Force-skip the separate `test` invocation when the `coverage`
+    /// command already runs tests internally (Maven, Gradle, pytest --cov, etc.).
+    /// When absent, Reparo auto-detects based on the command strings.
+    /// Use `--tests-in-coverage` to force on; `--no-tests-in-coverage` to force off.
+    #[arg(long, env = "REPARO_TESTS_IN_COVERAGE")]
+    pub tests_in_coverage: Option<bool>,
+
     /// Disable retry of failed wave files with error context in per-file fallback
     #[arg(long, default_value = "false")]
     pub skip_retry_failed_wave_files: bool,
@@ -165,6 +259,23 @@ pub struct Config {
     /// Skip the final validation step (run full test suite after all fixes)
     #[arg(long, default_value = "false")]
     pub skip_final_validation: bool,
+
+    /// Disable running targeted tests (Surefire `-Dtest=`) before the full
+    /// suite during per-fix validation. Maven-only; no-op for other runners.
+    #[arg(long, default_value = "false")]
+    pub skip_targeted_tests: bool,
+
+    /// Run SonarQube rescan verification every N fixes instead of after each.
+    /// Saves ~20s × (N-1) per batch in sequential mode. Default 1 (always rescan).
+    #[arg(long, env = "REPARO_RESCAN_BATCH_SIZE", default_value = "1")]
+    pub rescan_batch_size: u32,
+
+    /// Use a lean Claude invocation for per-fix tasks: pass `--bare`
+    /// (skips CLAUDE.md auto-load, auto-memory, hooks, plugins) and
+    /// `--tools Read,Edit,Write` (no Grep/Glob/Bash). Cuts input tokens
+    /// dramatically for focused single-file fixes. Default: true.
+    #[arg(long, default_value = "false")]
+    pub no_lean_ai: bool,
 
     /// Maximum repair attempts during final validation (all tests must pass)
     #[arg(long, env = "REPARO_FINAL_VALIDATION_ATTEMPTS", default_value = "5")]
@@ -193,6 +304,24 @@ pub struct Config {
     /// Skip the pre-push rebase onto the latest base branch
     #[arg(long, default_value = "false")]
     pub skip_rebase: bool,
+
+    /// Skip the local linter discovery phase (Step 3d). When enabled,
+    /// Reparo runs the configured `commands.lint`, parses its output
+    /// according to `commands.lint_format`, and folds the findings into
+    /// the fix queue alongside SonarQube issues.
+    #[arg(long, default_value = "false")]
+    pub skip_linter_scan: bool,
+
+    /// Run the linter's native autofix (e.g. `clippy --fix`, `eslint --fix`)
+    /// before scanning for findings. Reduces the number of issues Reparo has
+    /// to dispatch to an AI engine. Default: false.
+    #[arg(long, env = "REPARO_LINTER_AUTOFIX", default_value = "false")]
+    pub linter_autofix: bool,
+
+    /// Maximum number of linter findings to queue (0 = no cap). Prevents a
+    /// flood of low-severity smells from drowning out SonarQube issues.
+    #[arg(long, env = "REPARO_MAX_LINTER_FINDINGS", default_value = "200")]
+    pub max_linter_findings: u32,
 
     /// Reset personal config (~/.config/reparo/config.yaml) to defaults and exit
     #[arg(long, default_value = "false")]
@@ -230,6 +359,10 @@ pub struct Config {
     /// Test generation configuration (populated from YAML, US-040)
     #[arg(skip)]
     pub test_generation: TestGenerationConfig,
+
+    /// Pre-fix risk assessment configuration (populated from YAML)
+    #[arg(skip)]
+    pub risk_assessment: RiskAssessmentConfig,
 }
 
 /// Validated, ready-to-use configuration.
@@ -274,6 +407,18 @@ pub struct ValidatedConfig {
     pub min_coverage: f64,
     /// Minimum per-file test coverage (%) — files below this are boosted individually (0 = disabled)
     pub min_file_coverage: f64,
+    /// US-064: Minimum project-wide branch coverage (%). 0 = disabled.
+    pub min_branch_coverage: f64,
+    /// US-064: Minimum per-file branch coverage (%). 0 = disabled.
+    pub min_file_branch_coverage: f64,
+    /// Skip the test overlap detection phase
+    pub skip_overlap: bool,
+    /// Also process issues in test code (scopes=TEST in SonarQube). Default
+    /// is MAIN-only, matching the SonarQube web UI's default issue view.
+    pub include_test_issues: bool,
+    /// File-path globs to exclude from processing. Merged at SonarClient
+    /// construction time with patterns parsed from `sonar-project.properties`.
+    pub sonar_exclusions: Vec<String>,
     /// Skip the coverage boost step
     pub skip_coverage: bool,
     /// Skip the initial format-and-commit step
@@ -291,18 +436,42 @@ pub struct ValidatedConfig {
     pub coverage_wave_size: u32,
     /// Files per coverage boost commit (resolved: never 0 at runtime)
     pub coverage_commit_batch: u32,
+    /// Issues per git commit during the fix step (1 = one per issue, 0 = one per branch)
+    pub fix_commit_batch: u32,
     /// Number of files to process in parallel during coverage boost (1 = sequential)
     pub coverage_parallel: u32,
     /// Number of issues to fix in parallel using git worktrees (1 = sequential)
     pub parallel: u32,
     /// Stop coverage boost after N consecutive wave failures (0 = disabled)
     pub max_boost_failures: usize,
+    /// Max lines to embed in a method chunk snippet (0 = always embed full method)
+    pub chunk_snippet_max_lines: usize,
+    /// Directory (relative to project path) where execution summary markdown is written
+    pub execution_log_report_dir: String,
+    /// US-066: compliance mode (baseline — ISO 25010 / ENS Alto / generic traceability)
+    pub compliance_enabled: bool,
+    /// Health/medical mode extension on top of `compliance_enabled`: adds MDR /
+    /// IEC 62304 / IEC 62305 / ISO 14971 features (riskClass, MC/DC, medical
+    /// sections in compliance report). Implies `compliance_enabled`.
+    pub health_mode: bool,
     /// Retry failed wave files with error context in per-file fallback
     pub retry_failed_wave_files: bool,
     /// Skip the final validation step (full test suite after all fixes)
     pub skip_final_validation: bool,
     /// Maximum repair attempts during final validation (all tests must pass)
     pub final_validation_attempts: u32,
+    /// Run targeted tests (Surefire -Dtest=) before the full suite on per-fix
+    /// validation. Full suite still runs for confirmation if targeted passes.
+    /// Maven-only for now. Default: true.
+    pub targeted_tests_first: bool,
+    /// How often to run the SonarQube rescan verification step in fix_loop.
+    /// 1 = rescan after every fix (most thorough). N = rescan only every Nth
+    /// fix (saves ~20s × (N-1) per batch of N issues in sequential mode).
+    /// Parallel mode is unaffected — each worker owns its own branch.
+    pub rescan_batch_size: u32,
+    /// Use a lean Claude invocation for per-fix tasks (--bare + tool whitelist).
+    /// Default: true (opt out via --no-lean-ai).
+    pub lean_ai: bool,
     /// Skip the deduplication step
     pub skip_dedup: bool,
     /// Maximum dedup iterations (0 = unlimited)
@@ -329,10 +498,26 @@ pub struct ValidatedConfig {
     pub pact: PactConfig,
     /// Skip the pre-push rebase onto the latest base branch
     pub skip_rebase: bool,
+    /// Skip the local linter discovery phase (Step 3d).
+    pub skip_linter_scan: bool,
+    /// Run the linter's native autofix before collecting findings.
+    pub linter_autofix: bool,
+    /// Maximum number of linter findings to queue (0 = no cap).
+    pub max_linter_findings: u32,
+    /// Frozen baseline lcov snapshot path. Captured once before the fix loop
+    /// (after preflight + coverage boost). All per-issue coverage checks
+    /// read from this file rather than the per-worktree lcov, so fixes
+    /// happening in parallel cannot contaminate each other's coverage view.
+    /// `None` when no coverage report could be located.
+    pub baseline_lcov_path: Option<PathBuf>,
     /// Resolved engine routing configuration for AI dispatch
     pub engine_routing: crate::engine::EngineRoutingConfig,
     /// Resolved test generation configuration for framework-aware prompts (US-040)
     pub test_generation: TestGenerationConfig,
+    /// US-069/US-073: Resolved compliance configuration (IEC 62304, requirements traceability)
+    pub compliance: crate::compliance::ComplianceConfig,
+    /// Pre-fix risk assessment configuration
+    pub risk_assessment: RiskAssessmentConfig,
 }
 
 /// Resolved documentation configuration for runtime use.
@@ -463,6 +648,18 @@ pub struct TestGenerationConfig {
     pub custom_instructions: Option<String>,
     /// Resolved model/effort for each test-generation complexity band.
     pub tiers: TestGenTiers,
+    /// When set, test files are written into this directory mirroring the source
+    /// tree (e.g. "projects/lib/test/unit").  null = colocated (default).
+    pub test_dir: Option<String>,
+    /// Prefix to strip from source file paths before placing them under
+    /// `test_dir`.  Auto-detected from the common prefix when absent.
+    pub test_source_root: Option<String>,
+    /// When set, consolidate sub-module source files into a single spec file
+    /// by keeping only the first N dot-separated name segments (before the
+    /// extension).  E.g. `test_spec_segments: 2` maps
+    /// `calendar.component.datesRender.ts` → `calendar.component.spec.ts`.
+    /// None = one spec file per source file (default).
+    pub test_spec_segments: Option<usize>,
 }
 
 impl Default for TestGenerationConfig {
@@ -474,6 +671,47 @@ impl Default for TestGenerationConfig {
             avoid_spring_context: false,
             custom_instructions: None,
             tiers: TestGenTiers::default(),
+            test_dir: None,
+            test_source_root: None,
+            test_spec_segments: None,
+        }
+    }
+}
+
+/// Pre-fix risk assessment configuration.
+///
+/// Controls whether Reparo checks if a fix is safe to apply in isolation
+/// before attempting it. Issues assessed as high-risk (cross-cutting impact)
+/// are skipped and logged to REVIEW_NEEDED.md with a clear explanation.
+#[derive(Debug, Clone)]
+pub struct RiskAssessmentConfig {
+    /// Enable risk assessment (default: false).
+    pub enabled: bool,
+    /// Use Claude (haiku, low effort) for AI-based risk assessment when static
+    /// patterns don't match. Default: false (static patterns only).
+    pub ai_assessment: bool,
+    /// Skip the fix if risk >= this level.
+    /// "high" (default): only skip clearly cross-cutting issues.
+    /// "medium": also skip borderline cases.
+    pub skip_threshold: String,
+}
+
+impl RiskAssessmentConfig {
+    /// Returns the `RiskLevel` corresponding to `skip_threshold`.
+    pub fn skip_threshold_level(&self) -> crate::orchestrator::risk_assessment::RiskLevel {
+        match self.skip_threshold.to_lowercase().as_str() {
+            "medium" => crate::orchestrator::risk_assessment::RiskLevel::Medium,
+            _ => crate::orchestrator::risk_assessment::RiskLevel::High,
+        }
+    }
+}
+
+impl Default for RiskAssessmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ai_assessment: false,
+            skip_threshold: "high".to_string(),
         }
     }
 }
@@ -610,12 +848,41 @@ impl Config {
             Some(resolve_scanner(&path, self.scanner_path.as_deref())?)
         };
 
+        // -- resolve compliance config (US-069/US-073) --
+        let compliance = {
+            let yaml_compliance = yaml_config.as_ref()
+                .map(|y| &y.compliance)
+                .cloned()
+                .unwrap_or_default();
+            match crate::yaml_config::resolve_compliance_config(&yaml_compliance, &path) {
+                Ok(mut c) => {
+                    // health_mode enables the risk class column in the matrix
+                    c.include_risk_class_column = self.health_mode;
+                    c
+                }
+                Err(e) => {
+                    tracing::warn!("compliance config error: {} — using defaults", e);
+                    crate::compliance::ComplianceConfig::default()
+                }
+            }
+        };
+
         // -- resolve project commands (US-014) --
-        let commands = crate::yaml_config::resolve_commands(
+        let mut commands = crate::yaml_config::resolve_commands(
             yaml_config.as_ref(),
             &self.test_command,
             &self.coverage_command,
         );
+        // US-059: CLI override takes precedence over YAML and auto-detection.
+        if let Some(v) = self.tests_in_coverage {
+            commands.tests_embedded_in_coverage = v;
+        }
+        if commands.tests_embedded_in_coverage {
+            tracing::info!(
+                "US-059: tests_embedded_in_coverage=true — the `test` command will be skipped \
+                 during coverage boost (coverage command already runs the test suite)"
+            );
+        }
         let cmd_warnings = crate::yaml_config::validate_commands(&commands, &path);
         for w in &cmd_warnings {
             tracing::warn!("{}", w);
@@ -646,6 +913,11 @@ impl Config {
             show_prompts: self.show_prompts,
             min_coverage: if self.skip_coverage { 0.0 } else { self.min_coverage },
             min_file_coverage: if self.skip_coverage { 0.0 } else { self.min_file_coverage },
+            min_branch_coverage: if self.skip_coverage { 0.0 } else { self.min_branch_coverage },
+            min_file_branch_coverage: if self.skip_coverage { 0.0 } else { self.min_file_branch_coverage },
+            skip_overlap: self.skip_overlap,
+            include_test_issues: self.include_test_issues,
+            sonar_exclusions: self.sonar_exclusions.clone(),
             skip_coverage: self.skip_coverage,
             skip_format: self.skip_format,
             allow_wip: self.allow_wip,
@@ -658,20 +930,22 @@ impl Config {
             } else {
                 self.coverage_commit_batch
             },
+            fix_commit_batch: self.fix_commit_batch,
             coverage_parallel: std::cmp::max(1, self.coverage_parallel),
-            parallel: if self.parallel > 1 && self.batch_size > 1 {
-                tracing::warn!(
-                    "--parallel {} ignored: incompatible with --batch-size {} (batch mode is sequential)",
-                    self.parallel, self.batch_size
-                );
-                1
-            } else {
-                std::cmp::max(1, self.parallel)
-            },
+            parallel: std::cmp::max(1, self.parallel),
             max_boost_failures: self.max_boost_failures,
+            chunk_snippet_max_lines: self.chunk_snippet_max_lines,
+            execution_log_report_dir: self.execution_log_report_dir.clone(),
+            // --health-mode implies --compliance (baseline is a prerequisite)
+            compliance_enabled: self.compliance_enabled || self.health_mode,
+            health_mode: self.health_mode,
             retry_failed_wave_files: !self.skip_retry_failed_wave_files,
             skip_final_validation: self.skip_final_validation,
             final_validation_attempts: self.final_validation_attempts,
+            targeted_tests_first: !self.skip_targeted_tests,
+            rescan_batch_size: self.rescan_batch_size.max(1),
+            lean_ai: !self.no_lean_ai,
+
             skip_dedup: self.skip_dedup,
             max_dedup: self.max_dedup,
             skip_fixes: self.skip_fixes,
@@ -683,12 +957,18 @@ impl Config {
             documentation: DocumentationConfig::default(),
             skip_pact: self.skip_pact,
             skip_rebase: self.skip_rebase,
+            skip_linter_scan: self.skip_linter_scan,
+            linter_autofix: self.linter_autofix,
+            max_linter_findings: self.max_linter_findings,
+            baseline_lcov_path: None,
             pact: self.pact,
             engine_routing: crate::engine::EngineRoutingConfig {
                 engines: personal_config.engines.clone(),
                 routing: personal_config.routing.clone(),
             },
             test_generation: self.test_generation,
+            compliance,
+            risk_assessment: self.risk_assessment,
         };
 
         // Validate that all routed engines are available
@@ -954,6 +1234,11 @@ mod tests {
             show_prompts: false,
             min_coverage: 80.0,
             min_file_coverage: 0.0,
+            min_branch_coverage: 0.0,
+            min_file_branch_coverage: 0.0,
+            skip_overlap: false,
+            include_test_issues: false,
+            sonar_exclusions: vec![],
             skip_coverage: false,
             skip_format: false,
             allow_wip: false,
@@ -962,10 +1247,19 @@ mod tests {
             coverage_exclude: vec![],
             coverage_wave_size: 3,
             coverage_commit_batch: 0,
+            fix_commit_batch: 1,
             coverage_parallel: 1,
             max_boost_failures: 5,
+            chunk_snippet_max_lines: 80,
+            execution_log_report_dir: ".reparo".to_string(),
+            tests_in_coverage: None,
+            compliance_enabled: false,
+            health_mode: false,
             skip_retry_failed_wave_files: false,
             skip_final_validation: false,
+            skip_targeted_tests: false,
+            rescan_batch_size: 1,
+            no_lean_ai: false,
             final_validation_attempts: 5,
             skip_dedup: false,
             max_dedup: 10,
@@ -977,10 +1271,14 @@ mod tests {
             documentation: DocumentationConfig::default(),
             skip_pact: false,
             skip_rebase: false,
+            skip_linter_scan: false,
+            linter_autofix: false,
+            max_linter_findings: 200,
             pact: PactConfig::default(),
             restore_personal_yaml: false,
             commit_issue: None,
             test_generation: TestGenerationConfig::default(),
+            risk_assessment: RiskAssessmentConfig::default(),
             parallel: 1,
         }
     }
