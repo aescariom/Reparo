@@ -165,6 +165,20 @@ pub struct ExecutionYaml {
     /// files importing Hibernate/JPA types regardless of this list.
     #[serde(default)]
     pub rule_blocklist: Vec<String>,
+    /// (rule, file-suffix) pairs to skip as NeedsReview without attempting a
+    /// fix. Use for specific files that consistently break tests for a given
+    /// rule. Both fields support suffix matching (e.g. `file: "Foo.java"`).
+    #[serde(default)]
+    pub hard_case_blocklist: Vec<HardCaseEntry>,
+}
+
+/// A (rule, file-suffix) pair used by `execution.hard_case_blocklist`.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct HardCaseEntry {
+    /// SonarQube rule key, e.g. `java:S1874`.
+    pub rule: String,
+    /// File suffix or basename, e.g. `Foo.java` or `src/main/Foo.java`.
+    pub file: String,
 }
 
 /// Project commands that Reparo executes directly (no heuristics, no LLM).
@@ -1003,6 +1017,14 @@ pub fn merge_yaml_into_config(
     }
     if !yaml.execution.rule_blocklist.is_empty() {
         config.rule_blocklist = yaml.execution.rule_blocklist.clone();
+    }
+    if !yaml.execution.hard_case_blocklist.is_empty() {
+        config.hard_case_blocklist = yaml
+            .execution
+            .hard_case_blocklist
+            .iter()
+            .map(|e| (e.rule.clone(), e.file.clone()))
+            .collect();
     }
     // protected_files: always take from YAML (no CLI equivalent)
     if !yaml.protected_files.is_empty() {

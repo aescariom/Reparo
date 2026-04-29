@@ -63,6 +63,7 @@ pub(crate) fn rule_is_blocklisted(
     rule_key: &str,
     file_path: &str,
     user_blocklist: &[String],
+    hard_case_blocklist: &[(String, String)],
 ) -> bool {
     // User-supplied blocklist takes precedence — always skip.
     if user_blocklist.iter().any(|r| r == rule_key) {
@@ -92,12 +93,11 @@ pub(crate) fn rule_is_blocklisted(
     }
 
     // --- Per-file blocklist for known repeat offenders ---
-    // (rule, file-suffix) pairs that have repeatedly failed and should be
-    // skipped. Default is empty; project-specific entries should be supplied
-    // via configuration (see TODO: load from YAML `execution.hard_case_blocklist`).
-    const KNOWN_HARD_CASES: &[(&str, &str)] = &[];
-    for (blocked_rule, blocked_basename) in KNOWN_HARD_CASES {
-        if rule_key == *blocked_rule && file_path.ends_with(blocked_basename) {
+    // (rule, file-suffix) pairs loaded from `execution.hard_case_blocklist`
+    // in reparo.yaml. Default is empty; add entries per-project to skip
+    // specific (rule, file) combinations that consistently fail.
+    for (blocked_rule, blocked_basename) in hard_case_blocklist {
+        if rule_key == blocked_rule && file_path.ends_with(blocked_basename.as_str()) {
             return true;
         }
     }
@@ -140,6 +140,7 @@ pub(crate) fn partition_blocklisted(
     issues: Vec<sonar::Issue>,
     project_path: &Path,
     user_blocklist: &[String],
+    hard_case_blocklist: &[(String, String)],
 ) -> (Vec<sonar::Issue>, Vec<crate::report::IssueResult>) {
     let mut runnable = Vec::with_capacity(issues.len());
     let mut skipped = Vec::new();
@@ -147,7 +148,7 @@ pub(crate) fn partition_blocklisted(
         let file_rel = sonar::component_to_path(&issue.component);
         let full_path = project_path.join(&file_rel);
         let full_str = full_path.to_str().unwrap_or("");
-        if rule_is_blocklisted(&issue.rule, full_str, user_blocklist) {
+        if rule_is_blocklisted(&issue.rule, full_str, user_blocklist, hard_case_blocklist) {
             let reason = format!(
                 "Rule {} blocklisted for {} (previously broke tests without a working fix)",
                 issue.rule, file_rel
@@ -2532,9 +2533,10 @@ FAIL src/components/Button.test.tsx
         assert!(rule_is_blocklisted(
             "java:S9999",
             f.to_str().unwrap(),
-            &["java:S9999".to_string()]
+            &["java:S9999".to_string()],
+            &[],
         ));
-        assert!(!rule_is_blocklisted("java:S1", f.to_str().unwrap(), &[]));
+        assert!(!rule_is_blocklisted("java:S1", f.to_str().unwrap(), &[], &[]));
     }
 
     #[test]
@@ -2546,12 +2548,12 @@ FAIL src/components/Button.test.tsx
             "import org.hibernate.EmptyInterceptor;\nclass X extends EmptyInterceptor {}\n",
         )
         .unwrap();
-        assert!(rule_is_blocklisted("java:S1874", f.to_str().unwrap(), &[]));
+        assert!(rule_is_blocklisted("java:S1874", f.to_str().unwrap(), &[], &[]));
 
         // Non-hibernate file with same rule: not blocked.
         let g = tmp.path().join("Y.java");
         std::fs::write(&g, "class Y {}").unwrap();
-        assert!(!rule_is_blocklisted("java:S1874", g.to_str().unwrap(), &[]));
+        assert!(!rule_is_blocklisted("java:S1874", g.to_str().unwrap(), &[], &[]));
     }
 
     #[test]
@@ -2560,7 +2562,7 @@ FAIL src/components/Button.test.tsx
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("X.java");
         std::fs::write(&f, "class X { /* TODO: something */ }").unwrap();
-        assert!(rule_is_blocklisted("java:S1135", f.to_str().unwrap(), &[]));
+        assert!(rule_is_blocklisted("java:S1135", f.to_str().unwrap(), &[], &[]));
     }
 
     #[test]
@@ -2571,7 +2573,7 @@ FAIL src/components/Button.test.tsx
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("Sample.java");
         std::fs::write(&f, "class Sample {}").unwrap();
-        assert!(!rule_is_blocklisted("java:S112", f.to_str().unwrap(), &[]));
+        assert!(!rule_is_blocklisted("java:S112", f.to_str().unwrap(), &[], &[]));
     }
 
     // -- analyze_test_failure (US-007) --

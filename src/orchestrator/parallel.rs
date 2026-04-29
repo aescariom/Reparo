@@ -62,6 +62,7 @@ impl Orchestrator {
             issues_to_process,
             &self.config.path,
             &self.config.rule_blocklist,
+            &self.config.hard_case_blocklist,
         );
         if !blocklisted.is_empty() {
             info!(
@@ -356,6 +357,7 @@ impl Orchestrator {
             candidates,
             &self.config.path,
             &self.config.rule_blocklist,
+            &self.config.hard_case_blocklist,
         );
         if !blocklisted.is_empty() {
             info!(

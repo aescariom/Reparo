@@ -432,6 +432,9 @@ pub struct Config {
     /// Rules to skip as NeedsReview. Populated from YAML.
     #[arg(skip)]
     pub rule_blocklist: Vec<String>,
+    /// (rule, file-suffix) pairs to skip as NeedsReview. Populated from YAML.
+    #[arg(skip)]
+    pub hard_case_blocklist: Vec<(String, String)>,
 }
 
 /// Validated, ready-to-use configuration.
@@ -610,6 +613,9 @@ pub struct ValidatedConfig {
     pub wave_grouping_depth: usize,
     /// Rule IDs to skip as NeedsReview without attempting a fix.
     pub rule_blocklist: Vec<String>,
+    /// (rule, file-suffix) pairs to skip as NeedsReview without attempting a fix.
+    /// Populated from `execution.hard_case_blocklist` in `reparo.yaml`.
+    pub hard_case_blocklist: Vec<(String, String)>,
     /// Set to `true` by parallel workers that run inside a freshly-acquired
     /// git worktree. Fresh worktrees are guaranteed to be at a clean HEAD (the
     /// pool calls `git clean` + reset on release), so the per-fix `mvn clean`
@@ -1077,6 +1083,7 @@ impl Config {
             skip_clean_when_safe: self.skip_clean_when_safe,
             wave_grouping_depth: self.wave_grouping_depth,
             rule_blocklist: self.rule_blocklist,
+            hard_case_blocklist: self.hard_case_blocklist,
             fresh_worktree: false,
         };
 
@@ -1398,6 +1405,7 @@ mod tests {
             skip_clean_when_safe: true,
             wave_grouping_depth: 1,
             rule_blocklist: Vec::new(),
+            hard_case_blocklist: Vec::new(),
         }
     }
 

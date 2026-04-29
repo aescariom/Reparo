@@ -316,6 +316,7 @@ impl Orchestrator {
             &issue.rule,
             full_path.to_str().unwrap_or(""),
             &self.config.rule_blocklist,
+            &self.config.hard_case_blocklist,
         ) {
             let reason = format!(
                 "Rule {} blocklisted for {} (previously broke tests without a working fix)",
