@@ -22,6 +22,59 @@ pub struct Issue {
     pub status: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Sonar-estimated remediation effort (e.g. "5min", "1h30min", "2h", "1d").
+    /// Present for server-returned issues; `None` for synthetic linter findings.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Parse a SonarQube effort duration string into total minutes.
+///
+/// SonarQube returns effort/debt as compact tokens like `"5min"`, `"1h30min"`,
+/// `"2h"`, or `"1d"` (a workday is 8h by Sonar convention). Returns `None` for
+/// empty input or unrecognized units.
+pub fn parse_effort_minutes(effort: &str) -> Option<u32> {
+    let s = effort.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: u32 = 0;
+    let mut num_buf = String::new();
+    let mut chars = s.chars().peekable();
+    let mut saw_any_unit = false;
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            num_buf.push(c);
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let mut unit = String::from(c);
+            while let Some(&p) = chars.peek() {
+                if p.is_ascii_alphabetic() {
+                    unit.push(p);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let n: u32 = num_buf.parse().ok()?;
+            num_buf.clear();
+            let mult = match unit.as_str() {
+                "min" => 1,
+                "h" => 60,
+                "d" => 8 * 60,
+                _ => return None,
+            };
+            total = total.saturating_add(n.saturating_mul(mult));
+            saw_any_unit = true;
+            continue;
+        }
+        return None;
+    }
+    if !saw_any_unit {
+        return None;
+    }
+    Some(total)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -951,6 +1004,35 @@ pub fn component_to_path(component: &str) -> String {
     }
 }
 
+/// Compute an affinity key for wave-sharding: groups files that are likely to
+/// conflict in cherry-picks together so they get placed in different waves.
+///
+/// `depth = 0` returns the file path itself (previous behavior — only the same
+/// file conflicts with itself).  `depth = 1` returns the file's parent
+/// directory (fixes to any file in `.../security/auth/` serialize).  Higher
+/// depths climb further up the tree.
+///
+/// When the file has fewer components than `depth`, the whole path is returned
+/// (so we never collapse to an empty string).
+pub fn component_to_affinity_key(component: &str, depth: usize) -> String {
+    let path = component_to_path(component);
+    if depth == 0 {
+        return path;
+    }
+    // Split on both native separators; SonarQube emits forward slashes even on
+    // Windows, but be defensive.
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    if parts.len() <= depth + 1 {
+        // File is at the root (or too shallow for the requested depth): fall
+        // back to the file path so every such file gets its own bucket.
+        return path;
+    }
+    // Keep everything except the last `depth` path components (which include
+    // the file name for depth=1, parent+file for depth=2, etc.).
+    let keep = parts.len() - depth;
+    parts[..keep].join("/")
+}
+
 /// Parse `sonar.exclusions`, `sonar.test.exclusions`, and `sonar.coverage.exclusions`
 /// entries from the text of a `sonar-project.properties` file.
 ///
@@ -1300,6 +1382,7 @@ other.setting=ignored
             }),
             status: "OPEN".to_string(),
             tags: vec![],
+            effort: None,
         }
     }
 

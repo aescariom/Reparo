@@ -114,10 +114,30 @@ fn run_with_timeout(
     }
 }
 
+/// Returns the preferred Maven binary for this host.
+/// Prefers `mvnd` (Maven Daemon — 2-3× faster cold builds thanks to a long-
+/// lived daemon JVM) when installed, falling back to `mvn`. A project's own
+/// `./mvnw` wrapper is preferred over this helper's return value — callers
+/// only use this when they need to construct a Maven invocation from scratch.
+pub fn mvn_binary() -> &'static str {
+    // which is already a dependency; cheap PATH lookup.
+    static MVND_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let has_mvnd = *MVND_AVAILABLE.get_or_init(|| {
+        let ok = which::which("mvnd").is_ok();
+        if ok {
+            info!("Maven daemon (mvnd) detected — using it for Maven commands");
+        }
+        ok
+    });
+    if has_mvnd { "mvnd" } else { "mvn" }
+}
+
 /// Detect the test command for a project based on build files present
 pub fn detect_test_command(project_path: &Path) -> Option<String> {
+    let mvn = mvn_binary();
+    let mvn_test = format!("{} test", mvn);
     let checks = [
-        ("pom.xml", "mvn test"),
+        ("pom.xml", mvn_test.as_str()),
         ("build.gradle", "gradle test"),
         ("build.gradle.kts", "gradle test"),
         ("package.json", "npm test"),
@@ -180,13 +200,25 @@ pub fn detect_coverage_command(project_path: &Path) -> Option<String> {
 /// `timeout_secs` hard-kills the process if it hasn't exited within the window.
 /// Pass 0 to disable (tests only).
 pub fn run_tests(project_path: &Path, test_command: &str, timeout_secs: u64) -> Result<(bool, String)> {
-    info!("Running tests: {}", test_command);
-
     if test_command.is_empty() {
         anyhow::bail!("Empty test command");
     }
 
-    run_with_timeout(project_path, test_command, "test", timeout_secs)
+    // Auto-upgrade `mvn test` → `mvnd test` when the daemon is on PATH, matching
+    // `run_targeted_tests_scoped`. A warm daemon cuts cold-JVM startup from
+    // ~5-10 s to near-zero per invocation. Skip the rewrite when the user
+    // explicitly pinned `./mvnw` (specific Maven version).
+    let effective = if !test_command.contains("./mvnw")
+        && test_command.to_lowercase().contains("mvn")
+        && mvn_binary() == "mvnd"
+    {
+        rewrite_mvn_to_mvnd(test_command)
+    } else {
+        test_command.to_string()
+    };
+
+    info!("Running tests: {}", effective);
+    run_with_timeout(project_path, &effective, "test", timeout_secs)
 }
 
 /// Result of running targeted tests (a subset matched by a filter).
@@ -210,13 +242,39 @@ pub fn run_targeted_tests(
     test_command: &str,
     filter: &str,
 ) -> Result<TargetedTestResult> {
+    run_targeted_tests_scoped(project_path, test_command, filter, None)
+}
+
+/// Variant of `run_targeted_tests` that also scopes the Maven reactor to a
+/// specific module via `-pl :<module> -am` when provided. For multi-module
+/// projects this reduces wall-clock by ~50-70% by avoiding full-reactor builds.
+/// Pass `module = None` to preserve the legacy full-reactor behavior.
+pub fn run_targeted_tests_scoped(
+    project_path: &Path,
+    test_command: &str,
+    filter: &str,
+    module: Option<&str>,
+) -> Result<TargetedTestResult> {
     if test_command.is_empty() || filter.is_empty() {
         anyhow::bail!("Empty test command or filter");
     }
 
     let lower = test_command.to_lowercase();
     let targeted_command = if lower.contains("mvn") || lower.contains("./mvnw") {
-        inject_or_merge_surefire_filter(test_command, filter)
+        let base = inject_or_merge_surefire_filter(test_command, filter);
+        // Upgrade `mvn` → `mvnd` when available and the user didn't explicitly
+        // pick `./mvnw` (which pins a specific Maven version intentionally).
+        let base = if !base.contains("./mvnw") && mvn_binary() == "mvnd" {
+            rewrite_mvn_to_mvnd(&base)
+        } else {
+            base
+        };
+        match module {
+            Some(m) if !m.is_empty() && !base.contains("-pl ") => {
+                inject_reactor_scope(&base, m)
+            }
+            _ => base,
+        }
     } else {
         // Unsupported runner — signal fallback
         return Ok(TargetedTestResult {
@@ -268,6 +326,99 @@ fn inject_or_merge_surefire_filter(test_command: &str, new_filter: &str) -> Stri
         return format!("{}-Dtest={}{}", before, merged, tail);
     }
     format!("{} -Dtest={}", test_command, new_filter)
+}
+
+/// Rewrite a `mvn <...>` command to use `mvnd`. Only touches the leading
+/// invocation; any later occurrences of the literal "mvn" (e.g. inside a
+/// property value) are left alone.
+fn rewrite_mvn_to_mvnd(command: &str) -> String {
+    let trimmed_start = command.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+    let prefix = &command[..trimmed_start];
+    let rest = &command[trimmed_start..];
+    if let Some(stripped) = rest.strip_prefix("mvn ") {
+        return format!("{}mvnd {}", prefix, stripped);
+    }
+    // Command may be wrapped in an export/cd; find the first ` mvn ` in the
+    // middle (shell pipelines, env prefixes).
+    if let Some(idx) = command.find(" mvn ") {
+        let (a, b) = command.split_at(idx);
+        return format!("{} mvnd{}", a, &b[4..]);
+    }
+    command.to_string()
+}
+
+/// Inject `-pl :<module> -am` into a Maven command right after the `mvn`/`mvnw`
+/// invocation. Idempotent: if `-pl` is already present the command is returned
+/// unchanged (caller is responsible for checking).
+fn inject_reactor_scope(command: &str, module: &str) -> String {
+    // Find the mvn token; inject the scope flags immediately after it so they
+    // land before any goals/flags.
+    for token in ["./mvnw", "mvnd", "mvn"] {
+        if let Some(idx) = command.find(token) {
+            let after = idx + token.len();
+            return format!(
+                "{}{} -pl :{} -am{}",
+                &command[..idx],
+                token,
+                module,
+                &command[after..]
+            );
+        }
+    }
+    command.to_string()
+}
+
+/// Walk up from `changed_file` (relative to `project_root`) looking for the
+/// closest enclosing `pom.xml` that *isn't* the project root's own pom. Returns
+/// the `<artifactId>` of that module if found. Returns `None` for single-module
+/// projects (the root pom is the only match) or when any parse fails.
+///
+/// Used by fix_loop to scope Maven targeted-tests to only the affected module.
+pub fn derive_maven_module(project_root: &Path, changed_file: &str) -> Option<String> {
+    let full = project_root.join(changed_file);
+    let mut dir = full.parent()?.to_path_buf();
+    let root = project_root.canonicalize().ok()?;
+    loop {
+        let pom = dir.join("pom.xml");
+        if pom.exists() {
+            // Stop if we've reached the root pom — root-module scoping is a no-op.
+            if dir.canonicalize().ok()? == root {
+                return None;
+            }
+            return parse_artifact_id(&pom);
+        }
+        if !dir.pop() {
+            return None;
+        }
+        // Guard: never walk above the project root.
+        if let Ok(canon) = dir.canonicalize() {
+            if !canon.starts_with(&root) {
+                return None;
+            }
+        }
+    }
+}
+
+/// Extract `<artifactId>` from a pom.xml. Prefers the top-level project
+/// artifactId (the first occurrence that isn't inside `<parent>`). Returns
+/// `None` on any parse trouble — callers fall back to full-reactor tests.
+fn parse_artifact_id(pom_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(pom_path).ok()?;
+    // Cheap parser: skip the <parent>...</parent> block, then find the first
+    // <artifactId>...</artifactId>.
+    let without_parent = match (text.find("<parent>"), text.find("</parent>")) {
+        (Some(a), Some(b)) if b > a => {
+            let mut s = String::with_capacity(text.len());
+            s.push_str(&text[..a]);
+            s.push_str(&text[b + "</parent>".len()..]);
+            s
+        }
+        _ => text.clone(),
+    };
+    let start = without_parent.find("<artifactId>")? + "<artifactId>".len();
+    let end = without_parent[start..].find("</artifactId>")?;
+    let id = without_parent[start..start + end].trim();
+    if id.is_empty() { None } else { Some(id.to_string()) }
 }
 
 /// Derive a Surefire `-Dtest=` filter value from a list of changed source files.
@@ -1900,8 +2051,13 @@ mod tests {
     fn test_detect_test_command_maven() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
-        let cmd = detect_test_command(tmp.path());
-        assert_eq!(cmd, Some("mvn test".to_string()));
+        let cmd = detect_test_command(tmp.path()).expect("Maven project should detect a test cmd");
+        // mvnd is picked up automatically when installed on PATH; tolerate both.
+        assert!(
+            cmd == "mvn test" || cmd == "mvnd test",
+            "unexpected detected test command: {:?}",
+            cmd
+        );
     }
 
     #[test]

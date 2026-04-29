@@ -326,6 +326,7 @@ fn run_ai_assessment(
         prompt_flag: "-p".to_string(),
         prompt_via_stdin: false,
         extra_args: Vec::new(),
+        session_id: None,
     };
 
     // Use a short timeout (30% of base) — assessment should be fast.
@@ -364,6 +365,7 @@ mod tests {
             text_range: None,
             status: "OPEN".to_string(),
             tags,
+            effort: None,
         }
     }
 

@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use crate::runner;
 use crate::sonar::{Issue, TextRange};
 
+mod checkstyle;
 mod clippy;
 mod eslint;
 mod ruff;
@@ -29,6 +30,9 @@ pub enum LintFormat {
     Eslint,
     /// `ruff check --output-format json` — array of diagnostics.
     Ruff,
+    /// Checkstyle XML (from `checkstyle -f xml` or
+    /// `mvn checkstyle:checkstyle` → `target/checkstyle-result.xml`).
+    Checkstyle,
 }
 
 impl LintFormat {
@@ -37,6 +41,7 @@ impl LintFormat {
             "clippy" => Some(LintFormat::Clippy),
             "eslint" => Some(LintFormat::Eslint),
             "ruff" => Some(LintFormat::Ruff),
+            "checkstyle" => Some(LintFormat::Checkstyle),
             _ => None,
         }
     }
@@ -46,6 +51,7 @@ impl LintFormat {
             LintFormat::Clippy => "clippy",
             LintFormat::Eslint => "eslint",
             LintFormat::Ruff => "ruff",
+            LintFormat::Checkstyle => "checkstyle",
         }
     }
 }
@@ -60,6 +66,8 @@ pub fn detect_lint_format(command: &str) -> Option<LintFormat> {
         Some(LintFormat::Eslint)
     } else if c.contains("ruff") {
         Some(LintFormat::Ruff)
+    } else if c.contains("checkstyle") {
+        Some(LintFormat::Checkstyle)
     } else {
         None
     }
@@ -115,6 +123,7 @@ impl LintFinding {
             }),
             status: "OPEN".to_string(),
             tags: vec![format.name().to_string(), "linter".to_string()],
+            effort: None,
         }
     }
 }
@@ -215,6 +224,16 @@ pub fn run_lint_scan(
         LintFormat::Clippy => clippy::parse(&output),
         LintFormat::Eslint => eslint::parse(&output),
         LintFormat::Ruff => ruff::parse(&output),
+        LintFormat::Checkstyle => {
+            // The Maven plugin writes findings to target/checkstyle-result.xml
+            // and only prints a summary to stdout. If stdout doesn't contain
+            // the `<checkstyle>` root, fall back to reading the report file(s).
+            if output.contains("<checkstyle") {
+                checkstyle::parse(&output)
+            } else {
+                parse_checkstyle_reports(project_path)
+            }
+        }
     };
 
     let mut findings = match findings {
@@ -255,6 +274,59 @@ pub fn run_lint_scan(
         .collect())
 }
 
+/// Aggregate findings from every `target/checkstyle-result.xml` under the
+/// project — covers multi-module Maven layouts where each module writes its
+/// own report. Paths inside the XML are absolute; we rewrite them to be
+/// project-relative so the downstream fix loop's `component_to_path` works.
+fn parse_checkstyle_reports(project_path: &Path) -> Result<Vec<LintFinding>> {
+    let pattern = format!("{}/**/target/checkstyle-result.xml", project_path.display());
+    let mut all: Vec<LintFinding> = Vec::new();
+    let reports = match glob::glob(&pattern) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Checkstyle glob error ({}): {}", pattern, e);
+            return Ok(Vec::new());
+        }
+    };
+    let mut found_any = false;
+    for entry in reports {
+        let Ok(path) = entry else { continue };
+        found_any = true;
+        info!("Linter phase: reading checkstyle report {}", path.display());
+        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        match checkstyle::parse(&content) {
+            Ok(mut findings) => {
+                for f in &mut findings {
+                    f.file = relativize(&f.file, project_path);
+                }
+                all.extend(findings);
+            }
+            Err(e) => warn!("Could not parse {}: {}", path.display(), e),
+        }
+    }
+    if !found_any {
+        warn!(
+            "Linter phase: no target/checkstyle-result.xml found under {} — \
+             is the checkstyle-maven-plugin configured to run?",
+            project_path.display()
+        );
+    }
+    Ok(all)
+}
+
+/// Make an absolute path project-relative; leave unchanged if already relative
+/// or outside the project root.
+fn relativize(file: &str, project_path: &Path) -> String {
+    let p = Path::new(file);
+    if let Ok(rel) = p.strip_prefix(project_path) {
+        return rel.to_string_lossy().to_string();
+    }
+    // Try parent-walk: in multi-module builds the checkstyle report is written
+    // by the module's target/, but the file path can still be anchored at the
+    // repo root. Strip any leading absolute-path segment.
+    file.to_string()
+}
+
 /// Lower number = more severe. Matches SonarQube ordering.
 fn severity_rank(sev: &str) -> u8 {
     match sev {
@@ -264,6 +336,72 @@ fn severity_rank(sev: &str) -> u8 {
         "MINOR" => 3,
         "INFO" => 4,
         _ => 5,
+    }
+}
+
+/// Run a single-file, single-rule autofix for a `lint:<format>:<rule>` issue.
+///
+/// Returns `Ok(true)` if the linter reports success AND at least one of the
+/// target file's bytes changed. Returns `Ok(false)` when the linter has no
+/// opinion on that rule for that file (or made no change). Returns `Err`
+/// for invocation failures the caller should propagate.
+///
+/// This is the per-issue fast-path that lets us skip the Claude call for
+/// the large class of linter findings the linter itself can fix in ~1s.
+pub fn autofix_single(format: LintFormat, rule: &str, file: &Path, project_path: &Path) -> Result<bool> {
+    // Snapshot file bytes so we can detect whether the linter actually edited it.
+    let before = std::fs::read(file).unwrap_or_default();
+
+    let rel = file
+        .strip_prefix(project_path)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string();
+
+    let cmd = match format {
+        LintFormat::Clippy => {
+            // Clippy can only fix at crate granularity, not per-file. We accept
+            // that: it's still ~2-5s versus a ~30-60s Claude call, and any
+            // collateral fixes for the same rule in the crate are a free win.
+            format!("cargo clippy --fix --allow-dirty --allow-staged -- -W clippy::{}", rule)
+        }
+        LintFormat::Eslint => {
+            format!("eslint --fix --rule '{}: error' {}", rule, shell_escape(&rel))
+        }
+        LintFormat::Ruff => {
+            format!("ruff check --fix --select {} {}", rule, shell_escape(&rel))
+        }
+        LintFormat::Checkstyle => {
+            // Checkstyle is a reporter — it has no autofix mode. Signal
+            // "no opinion" so the caller falls back to the AI engine.
+            return Ok(false);
+        }
+    };
+
+    info!("Linter fast-path ({}): {}", format.name(), cmd);
+    let (ok, output) = runner::run_shell_command(project_path, &cmd, "linter-fastpath")?;
+    if !ok {
+        // Non-zero is NOT fatal — eslint/ruff return non-zero when findings
+        // remain after --fix. Inspect the file mutation as ground truth.
+        let after = std::fs::read(file).unwrap_or_default();
+        if before == after {
+            warn!(
+                "Linter fast-path ({}) exited non-zero and made no change: {}",
+                format.name(),
+                truncate(&output, 200)
+            );
+            return Ok(false);
+        }
+    }
+    let after = std::fs::read(file).unwrap_or_default();
+    Ok(before != after)
+}
+
+fn shell_escape(s: &str) -> String {
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -295,6 +433,7 @@ fn autofix_command_for(format: LintFormat, base: &str) -> Option<String> {
                 None
             }
         }
+        LintFormat::Checkstyle => None,
     }
 }
 

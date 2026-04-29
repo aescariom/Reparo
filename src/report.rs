@@ -698,6 +698,7 @@ mod tests {
             text_range: None,
             status: "OPEN".to_string(),
             tags: vec![],
+            effort: None,
         };
         append_changelog_pr_reference(
             tmp.path(),

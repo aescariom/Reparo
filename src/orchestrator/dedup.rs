@@ -133,6 +133,7 @@ impl Orchestrator {
                     }),
                     status: "OPEN".to_string(),
                     tags: vec![],
+                    effort: None,
                 };
 
                 let gen_result = self
@@ -199,7 +200,9 @@ impl Orchestrator {
 
             let dedup_tier = claude::classify_dedup_tier(dup_file.duplicated_lines, dup_file.duplication_pct);
             info!("Asking AI to refactor {} to reduce duplication... [{}]", dup_file.file_path, dedup_tier);
-            match self.run_ai("dedup", &prompt, &dedup_tier) {
+            // US-087: dedup operates on a single file — key the session by
+            // file_path so previous fix/test/doc context on it is reused.
+            match self.run_ai_keyed("dedup", &prompt, &dedup_tier, Some(dup_file.file_path.as_str())) {
                 Ok(_output) => {
                     info!("Claude completed dedup refactoring for {}", dup_file.file_path);
                 }

@@ -149,6 +149,22 @@ pub struct ExecutionYaml {
     /// Cap the number of linter findings forwarded to the fix loop (0 = no cap).
     /// Default: 200.
     pub max_linter_findings: Option<u32>,
+    /// Skip `mvn clean` (or the configured clean command) between fixes when
+    /// the previous fix succeeded. Clean still runs on cold worktree start and
+    /// after build/test failures. Default: true (skip when safe). Set to false
+    /// to restore the always-clean behavior.
+    pub skip_clean_when_safe: Option<bool>,
+    /// Depth at which wave sharding treats files as conflicting. 0 = same file
+    /// only (previous behavior). 1 = same parent directory (default). 2 =
+    /// grandparent. Larger values reduce cherry-pick conflicts at the cost of
+    /// longer wave queues. Default: 1.
+    pub wave_grouping_depth: Option<usize>,
+    /// Rule IDs (e.g. `java:S1874`) whose issues should be skipped as
+    /// NeedsReview without attempting a fix. Use for rules that consistently
+    /// break tests in this codebase. `java:S1874` is also auto-skipped on
+    /// files importing Hibernate/JPA types regardless of this list.
+    #[serde(default)]
+    pub rule_blocklist: Vec<String>,
 }
 
 /// Project commands that Reparo executes directly (no heuristics, no LLM).
@@ -172,13 +188,22 @@ pub struct CommandsYaml {
     pub coverage_report_only: Option<String>,
     /// Format code after fix
     pub format: Option<String>,
-    /// Lint/static analysis after tests (non-blocking)
+    /// Lint/static analysis after tests (non-blocking). Runs after every fix
+    /// as a quick sanity gate. Keep this fast (`mvn validate`, `tsc --noEmit`,
+    /// etc.) — it isn't the command used to discover new findings; that's
+    /// `lint_scan` below.
     pub lint: Option<String>,
+    /// Command that emits parseable linter findings, used only by the
+    /// startup linter-scan phase. Falls back to `lint` when unset. Set this
+    /// separately when the per-fix `lint` gate is a fast validator that
+    /// doesn't produce findings (e.g. `mvn validate` vs
+    /// `mvn checkstyle:checkstyle -q`).
+    pub lint_scan: Option<String>,
     /// Output format of the configured `lint` command. Controls how Reparo
     /// parses the linter's output into issue records for the fix loop.
     ///
     /// Supported values: "auto" (detect from the command string), "clippy",
-    /// "eslint", "ruff", "golangci-lint", "checkstyle", "sarif". Default: "auto".
+    /// "eslint", "ruff", "checkstyle". Default: "auto".
     pub lint_format: Option<String>,
     /// Path to the coverage report file (bypasses auto-detection)
     pub coverage_report: Option<String>,
@@ -596,6 +621,10 @@ pub struct ProjectCommands {
     pub coverage_report_only: Option<String>,
     pub format: Option<String>,
     pub lint: Option<String>,
+    /// Separate command for the startup linter-scan phase. Falls back to
+    /// `lint` when unset. Lets users keep a fast per-fix `lint` gate while
+    /// using a heavier command to discover findings at startup.
+    pub lint_scan: Option<String>,
     /// Resolved linter output format (one of the values supported by
     /// `CommandsYaml::lint_format`). Defaults to "auto" when not set.
     pub lint_format: Option<String>,
@@ -964,6 +993,17 @@ pub fn merge_yaml_into_config(
             config.max_linter_findings = v;
         }
     }
+    // skip_clean_when_safe / wave_grouping_depth / rule_blocklist:
+    // no CLI flags — YAML-only. Apply if present.
+    if let Some(v) = yaml.execution.skip_clean_when_safe {
+        config.skip_clean_when_safe = v;
+    }
+    if let Some(v) = yaml.execution.wave_grouping_depth {
+        config.wave_grouping_depth = v;
+    }
+    if !yaml.execution.rule_blocklist.is_empty() {
+        config.rule_blocklist = yaml.execution.rule_blocklist.clone();
+    }
     // protected_files: always take from YAML (no CLI equivalent)
     if !yaml.protected_files.is_empty() {
         config.protected_files = yaml.protected_files.clone();
@@ -1111,6 +1151,7 @@ pub fn resolve_commands(
         coverage_report_only,
         format: base.format,
         lint: base.lint,
+        lint_scan: base.lint_scan,
         lint_format: base.lint_format,
         coverage_report: base.coverage_report,
         test_compile: base.test_compile,

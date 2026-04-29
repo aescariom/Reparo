@@ -92,7 +92,10 @@ impl Orchestrator {
                 info!("Documentation prompt:\n{}", prompt);
             }
 
-            match self.run_ai("documentation", &prompt, &tier) {
+            // US-087: reuse the per-file Claude session so docs share context
+            // with the recent fix on this file (which already loaded source +
+            // structural understanding into the conversation).
+            match self.run_ai_keyed("documentation", &prompt, &tier, Some(file_path.as_str())) {
                 Ok(_) => {
                     info!("Claude completed documentation for {}", file_path);
                 }
@@ -194,6 +197,92 @@ impl Orchestrator {
 
     pub(super) async fn process_issue(&self, issue: &Issue, test_command: &str) -> IssueResult {
         let file_path = sonar::component_to_path(&issue.component);
+        let rule_key = issue.rule.clone();
+        let memory_key = (file_path.clone(), rule_key.clone());
+
+        // (file, rule) failure memory short-circuit. After
+        // FAILURE_MEMORY_THRESHOLD prior issues with the same key produced a
+        // non-Fixed outcome, retrying is almost always futile and consumes
+        // significant AI budget. Fail-fast to NeedsReview without any model
+        // call. Reset on Fixed (see post-call branch below).
+        let prior_failures = {
+            let memory = self
+                .fix_failure_memory
+                .lock()
+                .expect("fix_failure_memory mutex poisoned");
+            memory.get(&memory_key).copied().unwrap_or(0)
+        };
+        if prior_failures >= super::FAILURE_MEMORY_THRESHOLD {
+            warn!(
+                "Short-circuiting {} ({}): {} prior failures on ({}, {}) — see FAILURE_MEMORY_THRESHOLD",
+                issue.key, issue.rule, prior_failures, file_path, rule_key
+            );
+            return IssueResult {
+                issue_key: issue.key.clone(),
+                rule: issue.rule.clone(),
+                severity: issue.severity.clone(),
+                issue_type: issue.issue_type.clone(),
+                message: issue.message.clone(),
+                file: file_path.clone(),
+                lines: format_lines(&issue.text_range),
+                status: FixStatus::NeedsReview(format!(
+                    "Skipped: {} prior issue(s) with rule {} on {} have already failed during this run; further attempts are unlikely to succeed without human review",
+                    prior_failures, rule_key, file_path
+                )),
+                change_description: String::new(),
+                tests_added: Vec::new(),
+                pr_url: None,
+                diff_summary: None,
+            };
+        }
+
+        // run 2026-04-28 follow-up: drop any live session for this file at
+        // the issue boundary. Resuming across distinct issues lets Claude
+        // believe the work is already done and return "no changes"
+        // (observed twice on EmailServiceImpl/S6813, ~3 min wasted each).
+        // Repair cycles within process_issue_impl still get session reuse.
+        self.evict_session_for_new_issue(&file_path, &issue.key);
+
+        let result = self.process_issue_impl(issue, test_command).await;
+
+        // Update memory based on outcome. Fixed clears the counter (a new
+        // working approach was found, so prior failures may not predict the
+        // next one). Anything else increments.
+        {
+            let mut memory = self
+                .fix_failure_memory
+                .lock()
+                .expect("fix_failure_memory mutex poisoned");
+            match &result.status {
+                FixStatus::Fixed => {
+                    memory.remove(&memory_key);
+                }
+                FixStatus::NeedsReview(_) | FixStatus::Failed(_) => {
+                    *memory.entry(memory_key).or_insert(0) += 1;
+                }
+                FixStatus::Skipped(_) | FixStatus::RiskSkipped(_) => {
+                    // Skips are not failures of the fix process — leave counter alone.
+                }
+            }
+        }
+
+        // US-081: drop any persistent Claude session for this file when the
+        // issue ends non-Fixed. The conversation captured the failed attempt
+        // (and possibly a revert) and would mislead the next sibling fix.
+        // On Fixed we keep the session alive — successive fixes on the same
+        // file benefit from the model already understanding the structure.
+        match &result.status {
+            FixStatus::NeedsReview(_) | FixStatus::Failed(_) => {
+                self.evict_session(&file_path);
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    async fn process_issue_impl(&self, issue: &Issue, test_command: &str) -> IssueResult {
+        let file_path = sonar::component_to_path(&issue.component);
         let lines = format_lines(&issue.text_range);
         let mut result = IssueResult {
             issue_key: issue.key.clone(),
@@ -218,6 +307,24 @@ impl Orchestrator {
                 return result;
             }
         };
+
+        // Rule blocklist: skip issues that are known to consistently break tests
+        // without producing a usable fix (e.g. java:S1874 on Hibernate/JPA
+        // types). Cheaper than running the full fix/build/test/repair cycle and
+        // then falling back to NeedsReview anyway.
+        if rule_is_blocklisted(
+            &issue.rule,
+            full_path.to_str().unwrap_or(""),
+            &self.config.rule_blocklist,
+        ) {
+            let reason = format!(
+                "Rule {} blocklisted for {} (previously broke tests without a working fix)",
+                issue.rule, file_path
+            );
+            warn!("Blocklisted: {}", reason);
+            result.status = FixStatus::NeedsReview(reason);
+            return result;
+        }
 
         let total_lines = file_content.lines().count() as u32;
         let (start_line, end_line) = match &issue.text_range {
@@ -269,6 +376,16 @@ impl Orchestrator {
             info!("Skipping coverage check for non-coverable file: {}", file_path);
         } else if is_test_file(&file_path) {
             info!("Skipping coverage check for test file: {} (test files aren't coverage-instrumented)", file_path);
+        } else if !rule_is_coverage_dependent(&issue.rule) {
+            // Static-analysis rules (lint:*, most Sonar code smells) don't need
+            // new tests to be verified — SonarQube re-scans the source, not the
+            // coverage report. Skipping the pre-fix coverage gate avoids a 5-12
+            // min detour per such issue. Callers set rule_is_coverage_dependent
+            // narrowly so false negatives self-heal via the post-fix rescan loop.
+            info!(
+                "Skipping pre-fix coverage gate for {} (static-analysis; not coverage-dependent)",
+                issue.rule
+            );
         } else if !test_command.is_empty() {
             let cov_result = self
                 .check_coverage(&issue.component, &file_path, start_line, end_line)
@@ -453,13 +570,47 @@ impl Orchestrator {
             }
         }
 
-        // Step A-2: Clean before fix if command defined (US-014)
-        if let Some(ref clean_cmd) = self.config.commands.clean {
-            match runner::run_shell_command(&self.config.path, clean_cmd, "clean") {
-                Ok((true, _)) => info!("Clean succeeded"),
-                Ok((false, output)) => warn!("Clean failed: {}", truncate(&output, 100)),
-                Err(e) => warn!("Clean command error: {}", e),
+        // Step A-2: Clean before fix if command defined (US-014).
+        // Skip for lint:* fixes — linter changes don't need a clean build lifecycle.
+        // When `skip_clean_when_safe` is enabled (default), also skip between
+        // successful sequential fixes: incremental compile is correct between
+        // green fixes and `mvn clean` alone is ~2-3 s that stacks up across
+        // dozens of issues. The `needs_clean` flag is reset on any failure
+        // (see post-build/test branches) so dirty state still triggers a clean.
+        if !issue.rule.starts_with("lint:") {
+            if let Some(ref clean_cmd) = self.config.commands.clean {
+                // Parallel workers run in pool-managed worktrees that are
+                // reset to a clean state on every acquire (see WorktreePool
+                // release). A stale build directory is impossible here, so
+                // `mvn clean` is pure overhead — ~1.5-2 s per issue × N
+                // issues adds up to tens of minutes on real projects.
+                let skip_for_fresh = self.config.fresh_worktree;
+                let should_clean = !skip_for_fresh
+                    && (!self.config.skip_clean_when_safe
+                        || self.needs_clean.load(std::sync::atomic::Ordering::Relaxed));
+                if should_clean {
+                    match runner::run_shell_command(&self.config.path, clean_cmd, "clean") {
+                        Ok((true, _)) => info!("Clean succeeded"),
+                        Ok((false, output)) => warn!("Clean failed: {}", truncate(&output, 100)),
+                        Err(e) => warn!("Clean command error: {}", e),
+                    }
+                    // Whether clean passed or failed, the state is now "clean-attempted".
+                    self.needs_clean
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                } else if skip_for_fresh {
+                    info!(
+                        "Skipping clean for {} (fresh worktree; build tree is already clean)",
+                        issue.key
+                    );
+                } else {
+                    info!(
+                        "Skipping clean for {} (previous fix succeeded; incremental compile is safe)",
+                        issue.key
+                    );
+                }
             }
+        } else if self.config.commands.clean.is_some() {
+            info!("Skipping clean for lint issue {} (not needed for linter-origin fixes)", issue.key);
         }
 
         // Step B: Fix the issue (US-006)
@@ -504,23 +655,125 @@ impl Orchestrator {
             &rule_desc_with_hint,
         );
 
-        // Classify the issue to pick the right model + effort
+        // Classify the issue to pick the right model + effort. Sonar's
+        // own effort estimate acts as an overlay — large-effort issues
+        // escalate one tier even when the rule looks mechanical.
+        let effort_minutes = issue
+            .effort
+            .as_deref()
+            .and_then(sonar::parse_effort_minutes);
         let tier = claude::classify_issue_tier(
             &issue.rule,
             &issue.severity,
             &issue.message,
             end_line.saturating_sub(start_line) + 1,
+            effort_minutes,
         );
         info!("Issue {} classified as tier {} (rule: {}, severity: {})", issue.key, tier, issue.rule, issue.severity);
 
-        let claude_output = match self.run_ai_lean("fix_issue", &prompt, &tier) {
-            Ok(output) => output,
-            Err(e) => {
-                result.status = FixStatus::Failed(format!("Claude failed: {}", e));
-                let _ = git::revert_changes(&self.config.path);
-                return result;
+        // A1: Linter autofix fast-path. For `lint:<format>:<rule>` findings,
+        // try the linter's own --fix on the affected file first. If it edits
+        // the file, skip the Claude call entirely — a one-second fix beats a
+        // 30-60s roundtrip to a model. If it made no change we fall through.
+        let mut claude_output: String = String::new();
+        let mut used_fastpath = false;
+        if !self.config.skip_linter_fastpath && issue.rule.starts_with("lint:") {
+            if let Some((fmt_name, rule_name)) = issue.rule
+                .strip_prefix("lint:")
+                .and_then(|rest| rest.split_once(':'))
+            {
+                if let Some(fmt) = crate::linter::LintFormat::parse(fmt_name) {
+                    let abs = self.config.path.join(&file_path);
+                    match crate::linter::autofix_single(fmt, rule_name, &abs, &self.config.path) {
+                        Ok(true) => {
+                            info!(
+                                "Linter fast-path resolved {} ({}:{}); skipping AI call",
+                                issue.key, fmt_name, rule_name
+                            );
+                            claude_output = format!(
+                                "[linter-fastpath] {} applied --fix for rule {}",
+                                fmt_name, rule_name
+                            );
+                            used_fastpath = true;
+                        }
+                        Ok(false) => {
+                            info!(
+                                "Linter fast-path made no change for {}; falling back to AI",
+                                issue.key
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Linter fast-path error for {}: {} — falling back to AI",
+                                issue.key, e
+                            );
+                        }
+                    }
+                }
             }
-        };
+        }
+
+        // Deterministic fast-path: some rules have a single well-defined text
+        // transformation (S1118 utility-class constructors, S1124 modifier
+        // order). Running Claude for these wastes ~15-20 s + tokens per issue
+        // — a small parser + edit does the same work in microseconds. If the
+        // deterministic pass produces a change we skip Claude entirely; the
+        // subsequent build/test cycle still verifies the edit, so a wrong
+        // transformation can't silently land.
+        if !used_fastpath {
+            match crate::orchestrator::deterministic::try_apply(
+                &issue.rule,
+                &file_path,
+                &file_content,
+                start_line,
+            ) {
+                Ok(Some(new_content)) => {
+                    if let Err(e) = std::fs::write(&full_path, &new_content) {
+                        warn!(
+                            "Deterministic fix for {} could not write file: {} — falling back to AI",
+                            issue.key, e
+                        );
+                    } else {
+                        info!(
+                            "Deterministic fast-path resolved {} ({}); skipping AI call",
+                            issue.key, issue.rule
+                        );
+                        claude_output = format!(
+                            "[deterministic] Applied template fix for {}",
+                            issue.rule
+                        );
+                        used_fastpath = true;
+                    }
+                }
+                Ok(None) => {
+                    // Rule not implemented or site ambiguous — fall through.
+                }
+                Err(e) => {
+                    warn!(
+                        "Deterministic fast-path errored for {}: {} — falling back to AI",
+                        issue.key, e
+                    );
+                }
+            }
+        }
+
+        if !used_fastpath {
+            // US-081: tie this call to the per-file session map so the next
+            // issue on the same file can resume the conversation.
+            claude_output = match self.run_ai_lean_keyed(
+                "fix_issue",
+                &prompt,
+                &tier,
+                Some(file_path.as_str()),
+            ) {
+                Ok(output) => output,
+                Err(e) => {
+                    result.status = FixStatus::Failed(format!("Claude failed: {}", e));
+                    let _ = git::revert_changes(&self.config.path);
+                    return result;
+                }
+            };
+        }
 
         // Check if anything actually changed (excluding internal files)
         let all_changed = git::changed_files(&self.config.path).unwrap_or_default();
@@ -623,30 +876,76 @@ impl Orchestrator {
         // Step C-1..C-3: Format → Build → Test with retry loop
         // If build or tests fail, ask Claude to fix the error (without modifying tests)
         // and retry up to coverage_attempts times.
-        let max_fix_attempts = self.config.coverage_attempts;
+        //
+        // For trivial rules (lint:* and MINOR/INFO static-analysis smells), cap
+        // the repair loop at 2 attempts (fix + one repair). A 3-attempt ladder
+        // with opus escalation is disproportionate for a one-line style fix,
+        // but capping at 1 was too aggressive: a single transient build-break
+        // (stale import, missed helper change) killed the entire fix. One
+        // repair attempt recovers most of these; if it still fails, THEN route
+        // to manual review.
+        let severity_upper = issue.severity.to_uppercase();
+        let is_trivial_rule = issue.rule.starts_with("lint:")
+            || ((severity_upper == "MINOR" || severity_upper == "INFO")
+                && !rule_is_coverage_dependent(&issue.rule));
+        let max_fix_attempts = if is_trivial_rule {
+            2
+        } else {
+            self.config.coverage_attempts
+        };
         let mut fix_verified = false;
+        // Fast-fail guard: if a repair claude call consumed ≥80% of its tier
+        // timeout, we've almost certainly found a hopeless case (Jackson
+        // migration, deprecated-API removal cascading into callers, etc.).
+        // Spending another 720s on attempt 2 to confirm the same failure
+        // wastes wall-clock and budget. When set, subsequent iterations
+        // short-circuit to NeedsReview instead of re-invoking Claude.
+        let mut repair_budget_exhausted = false;
 
         for fix_attempt in 1..=max_fix_attempts {
             if fix_attempt > 1 {
                 info!("Fix-repair attempt {}/{} for {}", fix_attempt, max_fix_attempts, issue.key);
             }
 
-            // Format code if command defined
+            // Format code if command defined.
+            // Skip for lint:* fixes — the linter autofix / Claude edit already
+            // follows project style conventions and a separate formatter pass
+            // adds only latency without value.
+            if !issue.rule.starts_with("lint:") {
             if let Some(ref fmt_cmd) = self.config.commands.format {
-                match runner::run_shell_command(&self.config.path, fmt_cmd, "format") {
-                    Ok((true, _)) => {
-                        info!("Code formatted successfully");
-                    }
-                    Ok((false, output)) => {
-                        warn!("Formatter failed, continuing: {}", truncate(&output, 100));
-                    }
-                    Err(e) => {
-                        warn!("Formatter error: {}", e);
+                // Common pattern: users set `format: echo "No formatter configured"`
+                // as a no-op placeholder when their stack has no formatter. The
+                // spawned shell still costs ~400-500 ms per call, which adds up
+                // to minutes over a full run. Skip any command that's just a
+                // pass-through `echo` (no side effects on source files).
+                if is_noop_echo_command(fmt_cmd) {
+                    // Silent: printing a line per issue would spam the log with
+                    // "No formatter configured" which is exactly what we're
+                    // trying to elide.
+                } else {
+                    match runner::run_shell_command(&self.config.path, fmt_cmd, "format") {
+                        Ok((true, _)) => {
+                            info!("Code formatted successfully");
+                        }
+                        Ok((false, output)) => {
+                            warn!("Formatter failed, continuing: {}", truncate(&output, 100));
+                        }
+                        Err(e) => {
+                            warn!("Formatter error: {}", e);
+                        }
                     }
                 }
             }
+            } // end if !lint:*
 
-            // Build/compile if command defined
+            // Build/compile if command defined.
+            // Skip for lint:* fixes — the test phase's incremental compile will
+            // catch any real build break; a dedicated `mvn compile` just doubles the work.
+            let skip_build_for_lint = issue.rule.starts_with("lint:");
+            if skip_build_for_lint && self.config.commands.build.is_some() && fix_attempt == 1 {
+                info!("Skipping build for lint issue {} (test phase will verify)", issue.key);
+            }
+            if !skip_build_for_lint {
             if let Some(ref build_cmd) = self.config.commands.build {
                 match runner::run_shell_command(&self.config.path, build_cmd, "build") {
                     Ok((true, _)) => {
@@ -654,7 +953,7 @@ impl Orchestrator {
                     }
                     Ok((false, output)) => {
                         warn!("Build fails after fix for {} (attempt {})", issue.key, fix_attempt);
-                        if fix_attempt < max_fix_attempts {
+                        if fix_attempt < max_fix_attempts && !repair_budget_exhausted {
                             info!("Asking Claude to fix the build error...");
                             let repair_prompt = claude::build_fix_error_prompt(
                                 "build",
@@ -662,18 +961,40 @@ impl Orchestrator {
                                 &file_path,
                                 &issue.message,
                             );
-                            // Progressive escalation — same ladder as test repair.
-                            let repair_tier = match fix_attempt {
-                                1 => claude::classify_repair_tier(),
-                                2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
-                                _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
-                            };
+                            // US-088 + run 2026-04-28 follow-up: build-repair attempt 1
+                            // previously used `classify_repair_tier()` (sonnet:medium 1.0×)
+                            // which with `claude_timeout=600` parked workers at the
+                            // full 600 s wall on stuck loops — 4× observed in a single
+                            // 75-min run = 40 min of pure waste. Successful repairs
+                            // completed in 60–230 s, so 0.4× is well above the
+                            // empirical p95 while the `prompt_floor` (≈400 s for
+                            // 2.8 KB prompts) keeps the effective minimum safe for
+                            // longer reasoning. Subsequent attempts use the same
+                            // 0.4× to keep escalation flat — the 80%-budget fast-
+                            // fail catches stuck loops earlier than re-extending.
+                            let repair_tier =
+                                claude::ClaudeTier::with_timeout("sonnet", "medium", 0.4);
                             info!(
                                 "Build-repair tier for {} (attempt {}/{}): {}:{}",
                                 issue.key, fix_attempt, max_fix_attempts, repair_tier.model, repair_tier.effort
                             );
-                            match self.run_ai_lean("fix_build_error", &repair_prompt, &repair_tier) {
+                            let repair_budget = repair_tier.effective_timeout(self.config.claude_timeout);
+                            let repair_start = std::time::Instant::now();
+                            match self.run_ai_lean_keyed(
+                                "fix_build_error",
+                                &repair_prompt,
+                                &repair_tier,
+                                Some(file_path.as_str()),
+                            ) {
                                 Ok(_) => {
+                                    let elapsed = repair_start.elapsed().as_secs();
+                                    if elapsed * 10 >= repair_budget * 8 {
+                                        warn!(
+                                            "Build-repair consumed {}s of {}s budget (≥80%); will NeedsReview if this retry also fails",
+                                            elapsed, repair_budget
+                                        );
+                                        repair_budget_exhausted = true;
+                                    }
                                     info!("Claude applied build fix — retrying...");
                                     continue;
                                 }
@@ -681,6 +1002,11 @@ impl Orchestrator {
                                     warn!("Claude failed to fix build: {}", e);
                                 }
                             }
+                        } else if repair_budget_exhausted {
+                            warn!(
+                                "Skipping further build-repair attempts for {} — previous repair burned ≥80% of its budget (fast-fail)",
+                                issue.key
+                            );
                         }
                         // Final attempt or Claude failed — revert and give up
                         let _ = git::revert_changes(&self.config.path);
@@ -699,6 +1025,7 @@ impl Orchestrator {
                     }
                 }
             }
+            } // end if !skip_build_for_lint
 
             // Validate tests — tests MUST NOT be modified.
             // Strategy: run a targeted Surefire filter first (5-15s) to catch
@@ -715,8 +1042,15 @@ impl Orchestrator {
                     let mut filter_inputs: Vec<String> = Vec::with_capacity(changed.len() + 1);
                     filter_inputs.push(file_path.clone());
                     filter_inputs.extend(changed.iter().cloned());
+                    // Derive Maven module from the primary file so we can restrict
+                    // the reactor to `-pl :<module> -am`. No-op for single-module
+                    // projects or non-Maven runners.
+                    let maven_module = runner::derive_maven_module(&self.config.path, &file_path);
+                    if let Some(ref m) = maven_module {
+                        info!("Scoping targeted tests to Maven module `{}`", m);
+                    }
                     if let Some(filter) = runner::derive_surefire_filter(&filter_inputs) {
-                        match runner::run_targeted_tests(&self.config.path, test_command, &filter) {
+                        match runner::run_targeted_tests_scoped(&self.config.path, test_command, &filter, maven_module.as_deref()) {
                             Ok(res) if !res.ran_any => {
                                 // Unsupported runner or no tests matched — fall through to full suite
                             }
@@ -727,8 +1061,17 @@ impl Orchestrator {
                                     issue.key, fix_attempt
                                 );
                                 let output = res.output;
+                                // Hoisted parse: if the runner output yields no
+                                // identifiable test names, the repair LLM has no
+                                // signal to act on. Parsing again at the final-
+                                // revert path is cheap (regex over the same buffer).
+                                let parsed_failures = parse_failing_tests(&output);
+                                let unparseable_failures = parsed_failures.is_empty();
                                 let mut repair_applied = false;
-                                if fix_attempt < max_fix_attempts {
+                                if fix_attempt < max_fix_attempts
+                                    && !repair_budget_exhausted
+                                    && !unparseable_failures
+                                {
                                     info!("Asking Claude to fix the test failure (without modifying tests)...");
                                     let repair_prompt = claude::build_fix_error_prompt(
                                         "test",
@@ -736,16 +1079,16 @@ impl Orchestrator {
                                         &file_path,
                                         &issue.message,
                                     );
-                                    // Progressive escalation: haiku for the first repair (most
-                                    // test failures are shallow — wrong signature, missing stub,
-                                    // off-by-one), sonnet:medium for the second, sonnet:high for
-                                    // the last retry before we give up. Only the sonar-rescan
-                                    // retry loop reaches opus, and only after these cheaper
-                                    // attempts have verifiably failed.
+                                    // US-088 + run 2026-04-28 follow-up: attempt-1 stays
+                                    // on `classify_test_repair_tier` (haiku:medium 0.4×).
+                                    // Subsequent attempts dropped from 0.6× to 0.4× —
+                                    // empirically test-repair sonnet calls that succeed
+                                    // finish under 90 s; the 0.6× wall (360 s) just
+                                    // delayed inevitable reverts. `prompt_floor` still
+                                    // guarantees ≥400 s of headroom for large prompts.
                                     let repair_tier = match fix_attempt {
                                         1 => claude::classify_test_repair_tier(),
-                                        2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
-                                        _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
+                                        _ => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.4),
                                     };
                                     info!(
                                         "Test-repair tier for {} (attempt {}/{}): {}:{}",
@@ -755,8 +1098,23 @@ impl Orchestrator {
                                         repair_tier.model,
                                         repair_tier.effort
                                     );
-                                    match self.run_ai_lean("fix_test_error", &repair_prompt, &repair_tier) {
+                                    let repair_budget = repair_tier.effective_timeout(self.config.claude_timeout);
+                                    let repair_start = std::time::Instant::now();
+                                    match self.run_ai_lean_keyed(
+                                        "fix_test_error",
+                                        &repair_prompt,
+                                        &repair_tier,
+                                        Some(file_path.as_str()),
+                                    ) {
                                         Ok(_) => {
+                                            let elapsed = repair_start.elapsed().as_secs();
+                                            if elapsed * 10 >= repair_budget * 8 {
+                                                warn!(
+                                                    "Test-repair consumed {}s of {}s budget (≥80%); will NeedsReview if this retry also fails",
+                                                    elapsed, repair_budget
+                                                );
+                                                repair_budget_exhausted = true;
+                                            }
                                             // Scope guard during repair: if issue is in source file,
                                             // tests are off-limits; if issue is in test file, only the
                                             // issue's own test file may be modified — other tests are off-limits.
@@ -778,6 +1136,16 @@ impl Orchestrator {
                                         }
                                         Err(e) => warn!("Claude failed to fix tests: {}", e),
                                     }
+                                } else if unparseable_failures {
+                                    warn!(
+                                        "Skipping test-repair for {} — failing-test list could not be parsed from runner output (no signal to act on)",
+                                        issue.key
+                                    );
+                                } else if repair_budget_exhausted {
+                                    warn!(
+                                        "Skipping further test-repair attempts for {} — previous repair burned ≥80% of its budget (fast-fail)",
+                                        issue.key
+                                    );
                                 }
                                 if repair_applied {
                                     continue;
@@ -787,7 +1155,7 @@ impl Orchestrator {
                                 // the issue inline (mirror of the full-suite final-failure
                                 // branch below), so the next pre-fix build check finds a
                                 // clean tree.
-                                let failing_tests = parse_failing_tests(&output);
+                                let failing_tests = parsed_failures;
                                 let failure_analysis = analyze_test_failure(
                                     &issue.rule,
                                     &issue.message,
@@ -818,10 +1186,28 @@ impl Orchestrator {
                                 // Targeted tests passed. In batch mode the full suite runs
                                 // once at the batch boundary (see mod.rs squash block), so
                                 // we skip it here — targeted is enough for per-fix verification.
+                                // For TRIVIAL fixes we also defer even with batch_size==1:
+                                // the safety net is the final_validation full-suite run at the
+                                // end of the whole run. A 1-line lint fix doesn't justify ~78s
+                                // of full-suite cost per issue.
+                                let trivial = is_trivial_fix(
+                                    &issue.rule,
+                                    &issue.severity,
+                                    &changed,
+                                    count_changed_lines(&self.config.path),
+                                    5,
+                                );
                                 if self.config.batch_size != 1 {
                                     info!(
                                         "Targeted tests pass — deferring full suite to batch boundary (batch_size={})",
                                         self.config.batch_size
+                                    );
+                                    fix_verified = true;
+                                    break;
+                                } else if trivial {
+                                    info!(
+                                        "Targeted tests pass — trivial fix ({}), deferring full suite to final-validation step",
+                                        issue.rule
                                     );
                                     fix_verified = true;
                                     break;
@@ -860,7 +1246,15 @@ impl Orchestrator {
                     Ok((false, output)) => {
                         warn!("Tests fail after fix for {} (attempt {})", issue.key, fix_attempt);
 
-                        if fix_attempt < max_fix_attempts {
+                        // Same fast-fail as the targeted-test branch: no parseable
+                        // failures → no signal for the LLM to act on.
+                        let parsed_failures = parse_failing_tests(&output);
+                        let unparseable_failures = parsed_failures.is_empty();
+
+                        if fix_attempt < max_fix_attempts
+                            && !repair_budget_exhausted
+                            && !unparseable_failures
+                        {
                             info!("Asking Claude to fix the test failure (without modifying tests)...");
                             let repair_prompt = claude::build_fix_error_prompt(
                                 "test",
@@ -868,18 +1262,37 @@ impl Orchestrator {
                                 &file_path,
                                 &issue.message,
                             );
-                            // Progressive escalation — same ladder as the targeted-test branch.
+                            // Progressive escalation — same ladder as the targeted-test
+                            // branch, multipliers tightened in run 2026-04-28 follow-up
+                            // (0.7×→0.4× for medium, 1.0×→0.6× for high). Stuck repairs
+                            // hit the full wall without progress; successful ones finished
+                            // well under the new caps. `prompt_floor` keeps minima safe.
                             let repair_tier = match fix_attempt {
                                 1 => claude::classify_test_repair_tier(),
-                                2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7),
-                                _ => claude::ClaudeTier::with_timeout("sonnet", "high", 1.0),
+                                2 => claude::ClaudeTier::with_timeout("sonnet", "medium", 0.4),
+                                _ => claude::ClaudeTier::with_timeout("sonnet", "high", 0.6),
                             };
                             info!(
                                 "Test-repair tier for {} (full-suite, attempt {}/{}): {}:{}",
                                 issue.key, fix_attempt, max_fix_attempts, repair_tier.model, repair_tier.effort
                             );
-                            match self.run_ai_lean("fix_test_error", &repair_prompt, &repair_tier) {
+                            let repair_budget = repair_tier.effective_timeout(self.config.claude_timeout);
+                            let repair_start = std::time::Instant::now();
+                            match self.run_ai_lean_keyed(
+                                "fix_test_error",
+                                &repair_prompt,
+                                &repair_tier,
+                                Some(file_path.as_str()),
+                            ) {
                                 Ok(_) => {
+                                    let elapsed = repair_start.elapsed().as_secs();
+                                    if elapsed * 10 >= repair_budget * 8 {
+                                        warn!(
+                                            "Full-suite test-repair consumed {}s of {}s budget (≥80%); fast-fail guard armed",
+                                            elapsed, repair_budget
+                                        );
+                                        repair_budget_exhausted = true;
+                                    }
                                     // Scope guard during repair: see above for semantics.
                                     let repair_changed = git::changed_files(&self.config.path).unwrap_or_default();
                                     let off_limits: Vec<_> = repair_changed.iter().filter(|f| {
@@ -904,7 +1317,13 @@ impl Orchestrator {
                         }
 
                         // Final attempt or Claude failed — revert and give up
-                        let failing_tests = parse_failing_tests(&output);
+                        if unparseable_failures {
+                            warn!(
+                                "Skipping full-suite test-repair for {} — failing-test list could not be parsed (no signal to act on)",
+                                issue.key
+                            );
+                        }
+                        let failing_tests = parsed_failures;
                         let failure_analysis = analyze_test_failure(
                             &issue.rule,
                             &issue.message,
@@ -1037,7 +1456,12 @@ Apply the fixes now."#,
                                 truncate(&output, 3000)
                             );
                             let lint_tier = claude::classify_repair_tier();
-                            match self.run_ai_lean("fix_lint_error", &lint_prompt, &lint_tier) {
+                            match self.run_ai_lean_keyed(
+                                "fix_lint_error",
+                                &lint_prompt,
+                                &lint_tier,
+                                Some(file_path.as_str()),
+                            ) {
                                 Ok(_) => {
                                     // Format after lint fix
                                     if let Some(ref fmt_cmd) = self.config.commands.format {
@@ -1153,13 +1577,35 @@ Apply the fixes now."#,
         // first issue has counter=1. Rescan when counter % N == 0 so we also rescan
         // the Nth, 2Nth, … issues — giving periodic confidence without per-issue cost.
         let fix_counter = self.fix_counter.load(std::sync::atomic::Ordering::Relaxed);
-        let batch_n = self.config.rescan_batch_size.max(1);
-        let should_rescan = batch_n == 1 || (fix_counter > 0 && fix_counter % batch_n == 0);
+        let batch_n = self.config.rescan_batch_size;
+        // Lint findings (synthetic `lint:<format>:<rule>` keys) are produced by the
+        // local linter scan, not SonarQube. A SonarQube rescan will never report
+        // them, so verifying the fix against Sonar is meaningless and just burns
+        // ~30-60s of scanner + CE wait. Short-circuit before the batch check.
+        //
+        // When `batch_n == 0`, ALL per-issue rescans are deferred to a single
+        // end-of-run verification scan (see orchestrator::run post-loop block).
+        let is_lint_issue = issue.rule.starts_with("lint:");
+        let should_rescan = !is_lint_issue
+            && batch_n > 0
+            && (batch_n == 1 || (fix_counter > 0 && fix_counter % batch_n == 0));
         if !should_rescan {
-            info!(
-                "Skipping per-issue SonarQube rescan for {} (batched: fix {}/{}; rescan every {})",
-                issue.key, fix_counter, batch_n, batch_n
-            );
+            if is_lint_issue {
+                info!(
+                    "Skipping SonarQube rescan for {} — linter-origin rule, not tracked by Sonar",
+                    issue.key
+                );
+            } else if batch_n == 0 {
+                info!(
+                    "Deferring SonarQube rescan for {} — end-of-run verification enabled (--rescan-batch-size 0)",
+                    issue.key
+                );
+            } else {
+                info!(
+                    "Skipping per-issue SonarQube rescan for {} (batched: fix {}/{}; rescan every {})",
+                    issue.key, fix_counter, batch_n, batch_n
+                );
+            }
         }
         let max_sonar_retries = self.config.coverage_attempts;
         if should_rescan {
@@ -1254,7 +1700,12 @@ Refine the fix now."#,
                                         retry_tier.model,
                                         retry_tier.effort
                                     );
-                                    match self.run_ai_lean("fix_issue_retry", &retry_prompt, &retry_tier) {
+                                    match self.run_ai_lean_keyed(
+                                        "fix_issue_retry",
+                                        &retry_prompt,
+                                        &retry_tier,
+                                        Some(file_path.as_str()),
+                                    ) {
                                         Ok(_) => {
                                             // Guard against no-op retries: compare the full working-tree
                                             // diff before and after the retry. If unchanged, Claude
@@ -1305,7 +1756,8 @@ Refine the fix now."#,
                                             let mut skipped_full = false;
                                             if self.config.batch_size != 1 && self.config.targeted_tests_first {
                                                 if let Some(filter) = runner::derive_surefire_filter(&filter_inputs) {
-                                                    match runner::run_targeted_tests(&self.config.path, test_command, &filter) {
+                                                    let retry_module = runner::derive_maven_module(&self.config.path, &file_path);
+                                                    match runner::run_targeted_tests_scoped(&self.config.path, test_command, &filter, retry_module.as_deref()) {
                                                         Ok(res) if res.ran_any && res.success => {
                                                             info!(
                                                                 "Retry targeted tests pass — deferring full suite to batch boundary (batch_size={})",
@@ -1369,16 +1821,34 @@ Refine the fix now."#,
         }
 
         // Step D: Commit the fix (US-008)
-        // Only stage the files changed by this fix — exclude changelog/state/report files
-        let files_to_stage: Vec<&str> = changed
-            .iter()
-            .map(|s| s.as_str())
+        //
+        // Re-scan the working tree NOW (not the snapshot taken right after
+        // the initial fix). Build-repair and test-repair iterations can
+        // touch additional files — most commonly the dependent surface
+        // that broke the build (e.g. an interface signature when the impl
+        // changed `Boolean` → `boolean`). Run 2026-04-29 evidence: wave
+        // 110 fix S5411 modified `EmailServiceImpl.java`; the build broke
+        // because the override no longer matched `EmailService.java`;
+        // Claude's repair updated the interface; build went green; but
+        // the commit only staged the snapshot from line 779 (impl alone),
+        // leaving the interface fix as an uncommitted dirty hunk that the
+        // worktree cleanup discarded. Result: batch branch had impl with
+        // `boolean` parameter against an interface with `Boolean` —
+        // doesn't compile, breaks the next preflight.
+        let final_all_changed = git::changed_files(&self.config.path).unwrap_or_default();
+        let final_changed: Vec<String> = final_all_changed
+            .into_iter()
+            .filter(|f| !is_internal_file(f))
             .collect();
+        let files_to_stage: Vec<&str> = final_changed.iter().map(|s| s.as_str()).collect();
         if !files_to_stage.is_empty() {
             let _ = git::add_files(&self.config.path, &files_to_stage);
         }
         if git::has_staged_changes(&self.config.path).unwrap_or(false) {
-            let changed_files_str = changed.join(", ");
+            // Use the full set of touched files (initial fix + repair
+            // iterations) so commit metadata and PR descriptions reflect
+            // every file actually staged into this commit.
+            let changed_files_str = final_changed.join(", ");
             let issue_url = format!(
                 "{}/project/issues?id={}&open={}",
                 self.config.sonar_url, self.config.sonar_project_id, issue.key
@@ -1682,9 +2152,10 @@ Refine the fix now."#,
                 )
             };
 
-            // Run claude to generate tests
+            // Run claude to generate tests. US-087: pin to the source file
+            // session so test gen reuses the conversation opened by the fix.
             let test_tier = claude::classify_test_gen_tier(current_uncovered.len(), file_content.lines().count(), &self.config.test_generation.tiers);
-            match self.run_ai("test_generation", &prompt, &test_tier) {
+            match self.run_ai_keyed("test_generation", &prompt, &test_tier, Some(file_path)) {
                 Ok(_) => {}
                 Err(e) => {
                     if attempt == 1 {
@@ -1715,8 +2186,25 @@ Refine the fix now."#,
                 };
             }
 
-            // Run tests to verify they pass
-            match runner::run_tests(&self.config.path, test_command, self.config.test_timeout) {
+            // Run tests to verify they pass. Scope to just the newly generated
+            // test class(es) — a full-suite run here costs 60-90 s, the targeted
+            // run costs 5-10 s. Fall back to the full suite only when the filter
+            // matches nothing (derive_surefire_filter returned None, or the
+            // runner reported ran_any=false).
+            let targeted_filter = runner::derive_surefire_filter(&all_test_files);
+            let tests_result: Result<(bool, String), _> = match targeted_filter.as_deref() {
+                Some(filter) => match runner::run_targeted_tests(
+                    &self.config.path,
+                    test_command,
+                    filter,
+                ) {
+                    Ok(tr) if tr.ran_any => Ok((tr.success, tr.output)),
+                    _ => runner::run_tests(&self.config.path, test_command, self.config.test_timeout),
+                },
+                None => runner::run_tests(&self.config.path, test_command, self.config.test_timeout),
+            };
+
+            match tests_result {
                 Ok((true, output)) => {
                     info!("Tests pass (attempt {})", attempt);
                     last_test_output = output;
@@ -1877,7 +2365,9 @@ Refine the fix now."#,
             // Use a moderate tier for contract test generation
             let tier = claude::classify_contract_test_tier(5); // default estimate
 
-            let claude_result = self.run_ai("contract_test_generation", &prompt, &tier);
+            // US-087: tie to source file session so contract test gen reuses
+            // the conversation context already established during fix + docs.
+            let claude_result = self.run_ai_keyed("contract_test_generation", &prompt, &tier, Some(file_path));
 
             match claude_result {
                 Ok(_output) => {
@@ -2017,7 +2507,10 @@ Refine the fix now."#,
                 );
 
                 let tier = claude::ClaudeTier::with_timeout("sonnet", "medium", 0.7);
-                match self.run_ai("rebase_conflict", &prompt, &tier) {
+                // US-087: key by the conflicted file path. If the same file
+                // had a recent fix in this run, the conversation already has
+                // the right mental model.
+                match self.run_ai_keyed("rebase_conflict", &prompt, &tier, Some(file.as_str())) {
                     Ok(_) => {
                         // The AI engine edits files in-place, so we just check the file
                         // no longer has conflict markers

@@ -117,6 +117,13 @@ pub struct EngineInvocation {
     /// for focused single-file fixes, avoiding CLAUDE.md auto-load and
     /// Grep/Glob/Bash tool calls that inflate input tokens).
     pub extra_args: Vec<String>,
+    /// US-081: when set on a Claude invocation, append `--resume <id>` so the
+    /// engine continues the existing conversation instead of opening a fresh
+    /// session. Saves the system-prompt + CLAUDE.md + initial file-read cost
+    /// across consecutive issues that target the same file. The orchestrator
+    /// is responsible for managing the lifetime of session ids (see
+    /// `Orchestrator::session_map`).
+    pub session_id: Option<String>,
 }
 
 /// Default engine configurations.
@@ -254,6 +261,7 @@ pub fn resolve_engine_for_tier(
         prompt_flag: engine_config.prompt_flag.clone(),
         prompt_via_stdin: engine_config.prompt_via_stdin,
         extra_args: Vec::new(),
+        session_id: None,
     })
 }
 
@@ -309,6 +317,11 @@ pub struct EngineOutput {
     /// Parsed token usage. `None` when the engine didn't report usage or
     /// parsing failed — callers should record the step as "unknown" in that case.
     pub usage: Option<TokenUsage>,
+    /// US-081: session id reported by Claude in `--output-format json`. The
+    /// orchestrator captures this so the next invocation on the same file can
+    /// pass `--resume <id>` and avoid re-loading system prompt + CLAUDE.md.
+    /// `None` for non-Claude engines or when the JSON didn't include it.
+    pub session_id: Option<String>,
 }
 
 /// Backward-compat wrapper: run an engine and return only the text output.
@@ -372,6 +385,13 @@ pub fn run_engine_full(
             }
             if let Some(ref effort) = invocation.effort {
                 args.extend(["--effort".to_string(), effort.clone()]);
+            }
+            // US-081: resume an existing session if one was provided. Claude
+            // CLI accepts `--resume <session_id>`. The session id is captured
+            // from previous invocations' JSON output (`session_id` field).
+            if let Some(ref sid) = invocation.session_id {
+                args.extend(["--resume".to_string(), sid.clone()]);
+                tracing::info!("Resuming Claude session {}", sid);
             }
         }
         EngineKind::Gemini => {
@@ -461,34 +481,34 @@ pub fn run_engine_full(
             // Engine-specific usage extraction. For Claude JSON mode, also replace
             // the returned stdout with the `result` field so downstream callers
             // see the same text they used to see under `--output-format text`.
-            let (final_stdout, usage) = match invocation.engine_kind {
+            let (final_stdout, usage, session_id) = match invocation.engine_kind {
                 EngineKind::Claude => {
-                    if let Some((result_text, u)) = usage::parse_claude_json(&raw_stdout) {
+                    if let Some((result_text, u, sid)) = usage::parse_claude_json_full(&raw_stdout) {
                         tracing::debug!(
-                            "claude JSON parse ok: in={} out={} cache_read={} cache_create={}",
-                            u.input, u.output, u.cache_read, u.cache_creation
+                            "claude JSON parse ok: in={} out={} cache_read={} cache_create={} session={:?}",
+                            u.input, u.output, u.cache_read, u.cache_creation, sid
                         );
-                        (result_text, Some(u))
+                        (result_text, Some(u), sid)
                     } else {
                         // Non-JSON output (older CLI, `--output-format text`, or test stubs).
                         tracing::warn!(
                             "claude stdout did not parse as JSON (first 200 chars): {:?}",
                             raw_stdout.chars().take(200).collect::<String>()
                         );
-                        (raw_stdout, None)
+                        (raw_stdout, None, None)
                     }
                 }
                 EngineKind::Gemini => {
                     let u = usage::parse_gemini_usage(&raw_stdout);
-                    (raw_stdout, u)
+                    (raw_stdout, u, None)
                 }
                 EngineKind::Aider => {
                     let u = usage::parse_aider_usage(&raw_stdout);
-                    (raw_stdout, u)
+                    (raw_stdout, u, None)
                 }
             };
 
-            Ok(EngineOutput { stdout: final_stdout, usage })
+            Ok(EngineOutput { stdout: final_stdout, usage, session_id })
         }
         WaitResult::TimedOut => {
             let _ = child.kill();
@@ -787,6 +807,7 @@ mod tests {
             prompt_flag: "-p".to_string(),
             prompt_via_stdin: false,
             extra_args: Vec::new(),
+            session_id: None,
         };
         let result = run_engine(tmp.path(), "hello", 10, false, false, &invocation).unwrap();
         assert!(result.contains("hello"));
@@ -804,6 +825,7 @@ mod tests {
             prompt_flag: String::new(),
             prompt_via_stdin: true,
             extra_args: Vec::new(),
+            session_id: None,
         };
         let result = run_engine(tmp.path(), "hello from stdin", 10, false, false, &invocation).unwrap();
         assert!(result.contains("hello from stdin"));
@@ -823,6 +845,7 @@ mod tests {
             prompt_flag: String::new(),
             prompt_via_stdin: true,
             extra_args: Vec::new(),
+            session_id: None,
         };
         let result = run_engine(tmp.path(), "test", 1, false, false, &invocation);
         assert!(result.is_err());

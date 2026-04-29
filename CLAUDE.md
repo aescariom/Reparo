@@ -168,6 +168,8 @@ For very large projects, combine with `--parallel 4 --batch-size 1` (per-issue w
 
 **Test-repair tier**: the per-fix test-failure repair now uses `haiku:medium` (via `claude::classify_test_repair_tier`) instead of `sonnet:medium`. Shallow failures repair in seconds instead of minutes. Build/lint repair and coverage boost repair still use `sonnet`.
 
+**Sonar effort overlay**: `classify_issue_tier` accepts `effort_minutes: Option<u32>` parsed from SonarQube's `effort` field (`"5min"`, `"1h30min"`, `"1d"` → minutes via `sonar::parse_effort_minutes`). When effort ≥ 30min the base tier escalates haiku/sonnet:low → sonnet:medium; ≥ 120min escalates sonnet:medium → sonnet:high. Skipped for `lint:*` rules (no server-side effort) and for S3776 cognitive complexity (already scaled by the parsed number in the message). Never escalates past `sonnet:high`.
+
 **YAML example** (all steps explicit):
 ```yaml
 execution:

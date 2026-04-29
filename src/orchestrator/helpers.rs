@@ -48,6 +48,241 @@ pub(crate) struct BoostFileResult {
     pub measured_overall_pct: Option<f64>,
 }
 
+/// Returns true when a (rule, file) pair has been observed to repeatedly
+/// break tests, so the fix isn't worth attempting.
+///
+/// The primary case: `java:S1874` (deprecated API) on Hibernate/JPA types.
+/// Replacing `EmptyInterceptor` with `Interceptor`, or `JdbcSettings.DATASOURCE`
+/// with `JdbcSettings.JAKARTA_NON_JTA_DATASOURCE`, consistently alters runtime
+/// behavior that tests depend on — three repair attempts is expensive and
+/// rarely succeeds.
+///
+/// Additional rules can be blocklisted unconditionally via
+/// `ValidatedConfig::rule_blocklist`.
+pub(crate) fn rule_is_blocklisted(
+    rule_key: &str,
+    file_path: &str,
+    user_blocklist: &[String],
+) -> bool {
+    // User-supplied blocklist takes precedence — always skip.
+    if user_blocklist.iter().any(|r| r == rule_key) {
+        return true;
+    }
+
+    // --- Built-in rule-wide blocklist ---
+    // S1135: "Complete the task associated to this TODO comment." — not a bug,
+    // removes human context, frequently breaks tests that assert code layout.
+    if rule_key == "java:S1135" {
+        return true;
+    }
+
+    // --- Rule-specific heuristics ---
+    // S1874 deprecated API: only block on Hibernate/JPA files, where replacing
+    // a deprecated type typically changes runtime behavior tests depend on.
+    if rule_key == "java:S1874" {
+        if let Ok(content) = std::fs::read_to_string(file_path) {
+            let hibernate = content.contains("org.hibernate.")
+                || content.contains("import org.hibernate");
+            let jpa = content.contains("jakarta.persistence.")
+                || content.contains("javax.persistence.");
+            if hibernate || jpa {
+                return true;
+            }
+        }
+    }
+
+    // --- Per-file blocklist for known repeat offenders ---
+    // (rule, file-suffix) pairs that have repeatedly failed and should be
+    // skipped. Default is empty; project-specific entries should be supplied
+    // via configuration (see TODO: load from YAML `execution.hard_case_blocklist`).
+    const KNOWN_HARD_CASES: &[(&str, &str)] = &[];
+    for (blocked_rule, blocked_basename) in KNOWN_HARD_CASES {
+        if rule_key == *blocked_rule && file_path.ends_with(blocked_basename) {
+            return true;
+        }
+    }
+
+    // --- Dynamic blocklist: semantic-hard rules on widely-referenced types ---
+    // S5738, S1874, S1133 are all "replace or remove deprecated API" rules.
+    // When the class is used in many places, a single-file fix can't migrate
+    // the call sites — repair loops burn the full 600s budget and still fail.
+    // Threshold: if the class is referenced in >=20 other Java files, skip
+    // instead of running Claude against a predictable timeout.
+    if is_semantic_hard_rule(rule_key) {
+        const REFERENCE_THRESHOLD: usize = 20;
+        if let Some(count) = count_class_references(file_path) {
+            if count >= REFERENCE_THRESHOLD {
+                tracing::info!(
+                    "Auto-blocklisting {} on {} — class has {} inbound refs (>= {})",
+                    rule_key,
+                    file_path,
+                    count,
+                    REFERENCE_THRESHOLD
+                );
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Split a list of candidate issues into (runnable, pre-skipped).
+///
+/// Any issue whose (rule, file) pair is blocklisted is dropped from the
+/// runnable set and returned as a ready-to-report `IssueResult` with status
+/// `NeedsReview`. Doing this before we dispatch workers avoids allocating a
+/// git worktree and branch for issues that we know will be blocklisted the
+/// instant the worker enters `process_issue` — in practice that's ~20-30%
+/// of wave slots on the largest projects (S1135 TODOs, hard-case S5738,
+/// etc.).
+pub(crate) fn partition_blocklisted(
+    issues: Vec<sonar::Issue>,
+    project_path: &Path,
+    user_blocklist: &[String],
+) -> (Vec<sonar::Issue>, Vec<crate::report::IssueResult>) {
+    let mut runnable = Vec::with_capacity(issues.len());
+    let mut skipped = Vec::new();
+    for issue in issues {
+        let file_rel = sonar::component_to_path(&issue.component);
+        let full_path = project_path.join(&file_rel);
+        let full_str = full_path.to_str().unwrap_or("");
+        if rule_is_blocklisted(&issue.rule, full_str, user_blocklist) {
+            let reason = format!(
+                "Rule {} blocklisted for {} (previously broke tests without a working fix)",
+                issue.rule, file_rel
+            );
+            tracing::info!("Pre-filter: {} ({})", issue.key, reason);
+            skipped.push(crate::report::IssueResult {
+                issue_key: issue.key.clone(),
+                rule: issue.rule.clone(),
+                severity: issue.severity.clone(),
+                issue_type: issue.issue_type.clone(),
+                message: issue.message.clone(),
+                file: file_rel,
+                lines: format_lines(&issue.text_range),
+                status: crate::report::FixStatus::NeedsReview(reason),
+                change_description: String::new(),
+                tests_added: Vec::new(),
+                pr_url: None,
+                diff_summary: None,
+            });
+        } else {
+            runnable.push(issue);
+        }
+    }
+    (runnable, skipped)
+}
+
+/// Returns true when a shell command is a no-op `echo` placeholder that users
+/// set when they have no formatter/linter/etc. configured (e.g.
+/// `echo "No formatter configured"`). Every such call costs ~400-500 ms of
+/// shell startup per fix; skipping them saves minutes over a large queue.
+///
+/// The check is deliberately conservative: only single-statement `echo`
+/// commands match. Anything chained with `&&`, `;`, `|` or followed by real
+/// work is treated as a legitimate command and executed normally.
+pub(crate) fn is_noop_echo_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if !trimmed.starts_with("echo ") && trimmed != "echo" {
+        return false;
+    }
+    // Reject anything that chains into another command.
+    !trimmed.contains("&&")
+        && !trimmed.contains("||")
+        && !trimmed.contains(';')
+        && !trimmed.contains('|')
+        && !trimmed.contains('`')
+        && !trimmed.contains("$(")
+        && !trimmed.contains('>')
+}
+
+/// Rules where the "fix" is a semantic API migration that typically cascades
+/// across call sites. Per-file repair is futile when the class has many refs.
+fn is_semantic_hard_rule(rule_key: &str) -> bool {
+    matches!(
+        rule_key,
+        "java:S5738" | "java:S1874" | "java:S1133"
+    )
+}
+
+/// Count Java files (other than `file_path` itself) that reference the class
+/// defined by `file_path`'s basename. Returns `None` when the check can't run
+/// (no `src/main/java` ancestor, grep/ripgrep unavailable, etc.) so callers
+/// can treat it as "unknown" rather than "zero refs".
+///
+/// Cached per class name in a process-wide map so 500 issues don't re-scan
+/// the same class 500 times.
+fn count_class_references(file_path: &str) -> Option<usize> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<usize>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    let path = std::path::Path::new(file_path);
+    let class_name = path.file_stem()?.to_str()?.to_string();
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(v) = guard.get(&class_name) {
+            return *v;
+        }
+    }
+
+    // Find the nearest `src/main/java` ancestor to scope the search. If the
+    // file isn't under a Maven layout, skip the check.
+    let mut search_root: Option<std::path::PathBuf> = None;
+    for ancestor in path.ancestors() {
+        if ancestor.ends_with("src/main/java") {
+            search_root = Some(ancestor.to_path_buf());
+            break;
+        }
+    }
+    let Some(root) = search_root else {
+        if let Ok(mut g) = cache.lock() { g.insert(class_name, None); }
+        return None;
+    };
+
+    // Word-boundary match on the class name (bare identifier, not prefix of a
+    // longer name). Restrict to *.java so we don't also pick up resource files.
+    let pattern = format!(r"\b{}\b", regex_escape(&class_name));
+    let out = std::process::Command::new("grep")
+        .args(["-l", "-r", "-E", "--include=*.java", &pattern])
+        .arg(&root)
+        .output();
+    let result = match out {
+        Ok(o) if o.status.success() || o.stdout.len() > 0 => {
+            let canonical_self = std::fs::canonicalize(path).ok();
+            let count = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|line| {
+                    // Exclude the file that defines the class itself.
+                    match &canonical_self {
+                        Some(s) => std::fs::canonicalize(line).ok().as_deref() != Some(s),
+                        None => !line.ends_with(&format!("{}.java", class_name)),
+                    }
+                })
+                .count();
+            Some(count)
+        }
+        _ => None,
+    };
+    if let Ok(mut g) = cache.lock() { g.insert(class_name, result); }
+    result
+}
+
+/// Minimal regex-metacharacter escaper — class names are `[A-Za-z0-9_$]`
+/// so in practice this is a no-op, but defensive in case Sonar ever ships
+/// a rule targeting a file with unusual characters.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.+*?()[]{}|^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Returns true when the SonarQube rule's verdict depends on code coverage
 /// metrics (e.g. `common-java:InsufficientLineCoverage`). For these rules
 /// we must regenerate the coverage report before the rescan, otherwise
@@ -67,6 +302,60 @@ pub(crate) fn rule_is_coverage_dependent(rule_key: &str) -> bool {
     // a false negative (skipping regen when we shouldn't) triggers a rescan
     // retry in fix_loop, so the loop is self-healing.
     k.contains("coverage") || k.contains("uncovered") || k.contains("linecoverage") || k.contains("branchcoverage")
+}
+
+/// Returns true when a fix is "trivial" — cheap enough that a full test-suite
+/// run would cost more than it's worth. Trivial fixes are verified by targeted
+/// tests only; the full suite still runs once at the end of the whole run via
+/// the final-validation step.
+///
+/// A fix is trivial when ALL of the following hold:
+/// - Rule is a linter finding (`lint:*`) OR severity is MINOR/INFO, AND
+/// - At most one non-test source file was modified, AND
+/// - Total modified lines (across all files) is below `max_lines` (typically 5).
+pub(crate) fn is_trivial_fix(
+    rule_key: &str,
+    severity: &str,
+    changed_files: &[String],
+    total_changed_lines: usize,
+    max_lines: usize,
+) -> bool {
+    let is_lint = rule_key.starts_with("lint:");
+    let sev = severity.to_uppercase();
+    let low_severity = matches!(sev.as_str(), "MINOR" | "INFO");
+    if !is_lint && !low_severity {
+        return false;
+    }
+    let non_test_sources: Vec<&String> = changed_files
+        .iter()
+        .filter(|f| !is_test_file(f))
+        .collect();
+    if non_test_sources.len() > 1 {
+        return false;
+    }
+    total_changed_lines <= max_lines
+}
+
+/// Count added + removed lines across all changed files via `git diff --numstat HEAD`.
+/// Used by `is_trivial_fix` to gate full-suite skipping.
+pub(crate) fn count_changed_lines(repo_path: &Path) -> usize {
+    let output = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["diff", "--numstat", "HEAD"])
+        .output();
+    let Ok(out) = output else { return usize::MAX };
+    if !out.status.success() {
+        return usize::MAX;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total: usize = 0;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let added = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let removed = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        total = total.saturating_add(added).saturating_add(removed);
+    }
+    total
 }
 
 /// Merge linter-derived and SonarQube-derived issues into a single severity-
@@ -124,15 +413,57 @@ pub(crate) fn merge_lint_and_sonar_issues(
 ///
 /// Handles common test runner output formats:
 /// - pytest: `FAILED tests/test_foo.py::test_bar`
-/// - JUnit/Maven: `Tests run: X, Failures: Y` + `testMethodName(ClassName)`
+/// - Maven Surefire: `[ERROR]   ClassName.methodName:line » ExceptionType` under
+///   `[ERROR] Failures:` / `[ERROR] Errors:` headers
 /// - Jest: `FAIL src/foo.test.js` + `✕ test name`
 /// - Go: `--- FAIL: TestFoo`
 /// - Rust: `test module::test_name ... FAILED`
 pub(crate) fn parse_failing_tests(output: &str) -> Vec<String> {
     let mut failures = Vec::new();
+    // Maven Surefire emits blocks of test failures under:
+    //   [ERROR] Failures:
+    //   [ERROR]   ClassName.method:line ...
+    //   [ERROR]
+    //   [ERROR] Errors:
+    //   [ERROR]   ClassName.method:line » ExceptionType
+    // We toggle a flag when we see one of those headers and parse the
+    // "ClassName.method" from subsequent "[ERROR]  " lines until an [INFO]
+    // line resets the context.
+    let mut in_maven_block = false;
 
     for line in output.lines() {
         let trimmed = line.trim();
+
+        // Maven block-start/reset markers.
+        if trimmed == "[ERROR] Failures:" || trimmed == "[ERROR] Errors:" {
+            in_maven_block = true;
+            continue;
+        }
+        if trimmed.starts_with("[INFO]") {
+            in_maven_block = false;
+            // continue; don't try other patterns on [INFO] lines
+            continue;
+        }
+        if in_maven_block {
+            if let Some(rest) = trimmed.strip_prefix("[ERROR]") {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    // blank [ERROR] line — keep the block open; other tools
+                    // sometimes emit these between sections
+                    continue;
+                }
+                // Expected: ClassName.methodName:line <tail>
+                // Extract up to first whitespace or colon after the method.
+                let head = rest.split(&[' ', ':'][..]).next().unwrap_or("").trim();
+                // Sanity: must look like a Java identifier path with a dot.
+                if head.contains('.')
+                    && head.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+                {
+                    failures.push(head.to_string());
+                    continue;
+                }
+            }
+        }
 
         // pytest: FAILED tests/test_foo.py::test_bar - ...
         if trimmed.starts_with("FAILED ") {
@@ -1503,7 +1834,7 @@ pub(crate) fn resolve_source_file(project_path: &Path, relative_file: &str) -> P
     }
 
     // Try searching in subdirectories (multi-module Maven projects)
-    // e.g., example-app/src/main/java/com/... when --path points to parent
+    // e.g., <module>/src/main/java/com/... when --path points to parent
     if let Ok(entries) = std::fs::read_dir(project_path) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1712,6 +2043,50 @@ public class Foo {
         assert!(!rule_is_coverage_dependent("lint:ruff:F401"));
     }
 
+    // -- is_trivial_fix --
+
+    #[test]
+    fn trivial_fix_lint_small_diff() {
+        let changed = vec!["src/main.rs".to_string()];
+        assert!(is_trivial_fix("lint:clippy:unused_imports", "MINOR", &changed, 2, 5));
+    }
+
+    #[test]
+    fn trivial_fix_minor_severity_small_diff() {
+        let changed = vec!["src/foo.rs".to_string()];
+        assert!(is_trivial_fix("java:S1481", "MINOR", &changed, 3, 5));
+        assert!(is_trivial_fix("java:S1481", "INFO", &changed, 1, 5));
+    }
+
+    #[test]
+    fn not_trivial_when_diff_too_large() {
+        let changed = vec!["src/foo.rs".to_string()];
+        assert!(!is_trivial_fix("lint:clippy:x", "MINOR", &changed, 20, 5));
+    }
+
+    #[test]
+    fn not_trivial_when_high_severity_non_lint() {
+        let changed = vec!["src/foo.rs".to_string()];
+        assert!(!is_trivial_fix("java:S1234", "CRITICAL", &changed, 1, 5));
+        assert!(!is_trivial_fix("java:S1234", "MAJOR", &changed, 1, 5));
+    }
+
+    #[test]
+    fn not_trivial_when_multiple_source_files() {
+        let changed = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        assert!(!is_trivial_fix("lint:clippy:x", "MINOR", &changed, 2, 5));
+    }
+
+    #[test]
+    fn trivial_ignores_test_files_in_count() {
+        // Test files don't count toward the single-source-file cap.
+        let changed = vec![
+            "src/a.rs".to_string(),
+            "src/a_test.rs".to_string(),
+        ];
+        assert!(is_trivial_fix("lint:clippy:x", "MINOR", &changed, 3, 5));
+    }
+
     // -- merge_lint_and_sonar_issues --
 
     fn fake_issue(key: &str, rule: &str, severity: &str) -> sonar::Issue {
@@ -1725,6 +2100,7 @@ public class Foo {
             text_range: None,
             status: "OPEN".to_string(),
             tags: vec![],
+            effort: None,
         }
     }
 
@@ -2117,6 +2493,87 @@ FAIL src/components/Button.test.tsx
         assert_eq!(failures.len(), 1);
     }
 
+    #[test]
+    fn test_parse_failing_tests_maven_surefire() {
+        let output = "\
+[INFO] Running com.example.FooTest
+[INFO] Tests run: 5, Failures: 1, Errors: 1
+[INFO]
+[INFO] Results:
+[INFO]
+[ERROR] Failures:
+[ERROR]   ReflectionUtilsTest.compareAndImportAttribute_nonExistentNestedProperty_throws:1089 Expected java.lang.Throwable to be thrown, but nothing was thrown.
+[ERROR]   ReflectionUtilsTest.setAttribute_nonExistentProperty_throws:612 Expected
+[ERROR] Errors:
+[ERROR]   EntityServiceImplAdditionalCoverageTest.processCollectionAttribute_nullDesc_logsAndContinues:685 » NoClassDefFound org/apache/commons/collections/FastHashMap
+[INFO]
+[INFO] BUILD FAILURE
+";
+        let failures = parse_failing_tests(output);
+        assert!(
+            failures.contains(&"ReflectionUtilsTest.compareAndImportAttribute_nonExistentNestedProperty_throws".to_string()),
+            "got: {:?}", failures
+        );
+        assert!(
+            failures.contains(&"ReflectionUtilsTest.setAttribute_nonExistentProperty_throws".to_string()),
+            "got: {:?}", failures
+        );
+        assert!(
+            failures.contains(&"EntityServiceImplAdditionalCoverageTest.processCollectionAttribute_nullDesc_logsAndContinues".to_string()),
+            "got: {:?}", failures
+        );
+    }
+
+    #[test]
+    fn test_rule_is_blocklisted_user_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("X.java");
+        std::fs::write(&f, "class X {}").unwrap();
+        assert!(rule_is_blocklisted(
+            "java:S9999",
+            f.to_str().unwrap(),
+            &["java:S9999".to_string()]
+        ));
+        assert!(!rule_is_blocklisted("java:S1", f.to_str().unwrap(), &[]));
+    }
+
+    #[test]
+    fn test_rule_is_blocklisted_s1874_hibernate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("X.java");
+        std::fs::write(
+            &f,
+            "import org.hibernate.EmptyInterceptor;\nclass X extends EmptyInterceptor {}\n",
+        )
+        .unwrap();
+        assert!(rule_is_blocklisted("java:S1874", f.to_str().unwrap(), &[]));
+
+        // Non-hibernate file with same rule: not blocked.
+        let g = tmp.path().join("Y.java");
+        std::fs::write(&g, "class Y {}").unwrap();
+        assert!(!rule_is_blocklisted("java:S1874", g.to_str().unwrap(), &[]));
+    }
+
+    #[test]
+    fn test_rule_is_blocklisted_s1135_always() {
+        // S1135 (TODO) is blocked globally — file contents irrelevant.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("X.java");
+        std::fs::write(&f, "class X { /* TODO: something */ }").unwrap();
+        assert!(rule_is_blocklisted("java:S1135", f.to_str().unwrap(), &[]));
+    }
+
+    #[test]
+    fn test_rule_is_blocklisted_known_hard_cases_empty_by_default() {
+        // The hardcoded blocklist is intentionally empty — project-specific
+        // entries should come from configuration. An arbitrary (rule, file)
+        // pair must therefore not be blocked here.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("Sample.java");
+        std::fs::write(&f, "class Sample {}").unwrap();
+        assert!(!rule_is_blocklisted("java:S112", f.to_str().unwrap(), &[]));
+    }
+
     // -- analyze_test_failure (US-007) --
 
     #[test]
@@ -2286,6 +2743,7 @@ FAIL src/components/Button.test.tsx
             text_range: None,
             status: "OPEN".to_string(),
             tags: vec![],
+            effort: None,
         }
     }
 

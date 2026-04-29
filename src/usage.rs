@@ -70,6 +70,11 @@ struct ClaudeResultJson {
     result: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<ClaudeUsageJson>,
+    /// US-081: session id present on `type: "result"` lines emitted by `claude
+    /// --output-format json`. Captured so the orchestrator can pass it back
+    /// via `--resume <id>` on the next invocation for the same file.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -84,17 +89,15 @@ struct ClaudeUsageJson {
     cache_creation_input_tokens: u64,
 }
 
-/// Parse the JSON emitted by `claude --output-format json`.
-///
-/// Returns `(result_text, usage)` when successful. `result_text` is the final
-/// assistant message — what previous callers received as raw stdout under
-/// `--output-format text`. Returns `None` when stdout is not JSON or doesn't
-/// match the expected schema (in which case callers should fall back to raw stdout).
-pub fn parse_claude_json(stdout: &str) -> Option<(String, TokenUsage)> {
-    // `claude --output-format json` emits streaming NDJSON: one JSON object per line.
-    // The line with `"type":"result"` contains both the assistant text and usage.
-    // We filter on `usage.is_some()` rather than `result.is_some()` so that lines where
-    // `result` is an array (content blocks) instead of a plain string are still accepted.
+/// Parse the JSON emitted by `claude --output-format json`. Returns
+/// `(result_text, usage, session_id)` (US-081 — the orchestrator chains
+/// successive invocations on the same file via `--resume <session_id>`).
+/// `result_text` is the final assistant message — what previous callers
+/// received as raw stdout under `--output-format text`. The session id is
+/// itself optional — older Claude CLI versions may not emit it. Returns
+/// `None` when stdout is not JSON or doesn't match the expected schema
+/// (callers fall back to raw stdout).
+pub fn parse_claude_json_full(stdout: &str) -> Option<(String, TokenUsage, Option<String>)> {
     let result_line = stdout
         .lines()
         .filter(|l| l.trim_start().starts_with('{'))
@@ -102,7 +105,6 @@ pub fn parse_claude_json(stdout: &str) -> Option<(String, TokenUsage)> {
         .filter(|p| p.usage.is_some())
         .last()?;
 
-    // Coerce result value to a string regardless of its JSON type.
     let result = match result_line.result {
         Some(serde_json::Value::String(s)) => s,
         Some(other) => other.to_string(),
@@ -114,7 +116,7 @@ pub fn parse_claude_json(stdout: &str) -> Option<(String, TokenUsage)> {
         cache_read: u.cache_read_input_tokens,
         cache_creation: u.cache_creation_input_tokens,
     }).unwrap_or_default();
-    Some((result, usage))
+    Some((result, usage, result_line.session_id))
 }
 
 /// Best-effort parser for Aider's end-of-run summary.
@@ -160,7 +162,7 @@ mod tests {
     #[test]
     fn parse_claude_json_extracts_result_and_usage() {
         let stdout = r#"{"type":"result","subtype":"success","result":"All fixed.","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":10}}"#;
-        let (text, usage) = parse_claude_json(stdout).unwrap();
+        let (text, usage) = parse_claude_json_full(stdout).map(|(t, u, _)| (t, u)).unwrap();
         assert_eq!(text, "All fixed.");
         assert_eq!(usage.input, 100);
         assert_eq!(usage.output, 50);
@@ -170,15 +172,31 @@ mod tests {
 
     #[test]
     fn parse_claude_json_returns_none_for_non_json() {
-        assert!(parse_claude_json("hello world").is_none());
-        assert!(parse_claude_json("").is_none());
+        assert!(parse_claude_json_full("hello world").is_none());
+        assert!(parse_claude_json_full("").is_none());
     }
 
     #[test]
     fn parse_claude_json_missing_usage_returns_none() {
         // No `usage` field → filtered out; function returns None (caller falls back to raw stdout).
         let stdout = r#"{"result":"done"}"#;
-        assert!(parse_claude_json(stdout).is_none());
+        assert!(parse_claude_json_full(stdout).is_none());
+    }
+
+    #[test]
+    fn parse_claude_json_full_extracts_session_id() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"ok","session_id":"abc-123","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        let (_text, _usage, sid) = parse_claude_json_full(stdout).unwrap();
+        assert_eq!(sid.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn parse_claude_json_full_session_id_absent_yields_none() {
+        // Older Claude CLI versions don't emit session_id; the parser must
+        // still succeed and return None for that field.
+        let stdout = r#"{"type":"result","subtype":"success","result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        let (_text, _usage, sid) = parse_claude_json_full(stdout).unwrap();
+        assert!(sid.is_none());
     }
 
     #[test]
@@ -186,7 +204,7 @@ mod tests {
         // Newer Claude CLI versions may emit result as an array of content blocks.
         // The function must still return usage even when result is not a plain string.
         let stdout = r#"{"type":"result","subtype":"success","result":[{"type":"text","text":"Fixed."}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
-        let (_text, usage) = parse_claude_json(stdout).unwrap();
+        let (_text, usage) = parse_claude_json_full(stdout).map(|(t, u, _)| (t, u)).unwrap();
         assert_eq!(usage.input, 10);
         assert_eq!(usage.output, 5);
     }
@@ -202,7 +220,7 @@ mod tests {
             "\"usage\":{\"input_tokens\":500,\"output_tokens\":120,",
             "\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":0}}\n",
         );
-        let (text, usage) = parse_claude_json(stdout).unwrap();
+        let (text, usage) = parse_claude_json_full(stdout).map(|(t, u, _)| (t, u)).unwrap();
         assert_eq!(text, "Fixed.");
         assert_eq!(usage.input, 500);
         assert_eq!(usage.output, 120);
@@ -243,7 +261,9 @@ mod tests {
             r#""cache_creation":{"ephemeral_1h_input_tokens":8743,"ephemeral_5m_input_tokens":0},"inference_geo":"","#,
             r#""iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":12030,"cache_creation_input_tokens":8743}],"speed":"standard"}}"#,
         );
-        let (text, usage) = parse_claude_json(stdout).expect("must parse real CLI output");
+        let (text, usage) = parse_claude_json_full(stdout)
+            .map(|(t, u, _)| (t, u))
+            .expect("must parse real CLI output");
         assert_eq!(text, "ok");
         assert_eq!(usage.input, 2);
         assert_eq!(usage.output, 4);

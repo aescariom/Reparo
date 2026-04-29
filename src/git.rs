@@ -42,6 +42,23 @@ pub fn current_branch(project_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Resolve a ref (branch, tag, sha) to its full commit SHA.
+pub fn resolve_sha(project_path: &Path, reference: &str) -> Result<String> {
+    let out = Command::new("git")
+        .current_dir(project_path)
+        .args(["rev-parse", "--verify", reference])
+        .output()
+        .context("Failed to run git rev-parse")?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse {} failed: {}",
+            reference,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Create and checkout a new branch from the base branch
 pub fn create_branch(project_path: &Path, branch_name: &str, base_branch: &str) -> Result<()> {
     // First ensure we're on the base branch
@@ -120,6 +137,12 @@ pub fn create_branch_in_worktree(
 /// Clean a worktree back to detached HEAD for reuse.
 ///
 /// Reverts all changes, removes untracked files, and detaches HEAD.
+///
+/// Uses `git clean -fd` (NOT `-fdx`) on purpose: we want to preserve
+/// gitignored build artifacts like `target/`, `node_modules/`, `.gradle/`,
+/// `build/`, and `.venv/` across worktree reuses. On a Maven project this
+/// alone saves ~30–60s of cold-compile per issue handled by the pool.
+/// If you ever switch to `-fdx` here, benchmark the impact first.
 pub fn clean_worktree(worktree_path: &Path) -> Result<()> {
     // Use `.output()` (drains pipes) rather than `.status()` with `Stdio::piped()`
     // (creates pipes but never drains). Any of these commands can emit enough
@@ -888,19 +911,38 @@ pub fn cherry_pick(path: &Path, sha: &str) -> Result<()> {
         .args(["cherry-pick", "--allow-empty", sha])
         .output()
         .context("git cherry-pick failed to spawn")?;
-    if !out.status.success() {
-        // Abort so the tree is clean
-        let _ = Command::new("git")
-            .current_dir(path)
-            .args(["cherry-pick", "--abort"])
-            .output();
-        bail!(
-            "cherry-pick {} failed: {}",
-            sha,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    if out.status.success() {
+        return Ok(());
     }
-    Ok(())
+    // Abort the failed attempt so the tree is clean before retrying.
+    let _ = Command::new("git")
+        .current_dir(path)
+        .args(["cherry-pick", "--abort"])
+        .output();
+
+    // Retry with `-X theirs` so overlapping hunks prefer the incoming fix.
+    // This covers the wave-parallel case where two workers independently
+    // touched a shared file (e.g. added an import) — textually different
+    // edits to the same region but semantically idempotent. Cherry-pick
+    // order is deterministic so "theirs" means the later fix wins, which is
+    // the same precedence the sequential path would produce.
+    let retry = Command::new("git")
+        .current_dir(path)
+        .args(["cherry-pick", "--allow-empty", "-X", "theirs", sha])
+        .output()
+        .context("git cherry-pick (theirs retry) failed to spawn")?;
+    if retry.status.success() {
+        return Ok(());
+    }
+    let _ = Command::new("git")
+        .current_dir(path)
+        .args(["cherry-pick", "--abort"])
+        .output();
+    bail!(
+        "cherry-pick {} failed (both default and -X theirs): {}",
+        sha,
+        String::from_utf8_lossy(&retry.stderr).trim()
+    );
 }
 
 pub fn worktree_prune(project_path: &Path) -> Result<()> {
@@ -938,6 +980,45 @@ mod tests {
         let branch = current_branch(tmp.path()).unwrap();
         // Default branch is usually "main" or "master"
         assert!(!branch.is_empty());
+    }
+
+    #[test]
+    fn test_clean_worktree_preserves_gitignored_build_dirs() {
+        // Regression guard for B2: worktree reuse must preserve `target/`
+        // and other build caches so the next issue on this worktree doesn't
+        // pay a full cold-compile.
+        let tmp = git_repo();
+        fs::write(tmp.path().join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["add", ".gitignore"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .current_dir(tmp.path())
+            .args(["commit", "-m", "add gitignore"])
+            .output()
+            .unwrap();
+
+        // Simulate an in-progress build:
+        fs::create_dir_all(tmp.path().join("target/classes")).unwrap();
+        fs::write(tmp.path().join("target/classes/Foo.class"), b"fake").unwrap();
+        fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+        fs::write(tmp.path().join("node_modules/pkg/index.js"), b"fake").unwrap();
+        // And a leftover untracked scratch file (should be removed):
+        fs::write(tmp.path().join("scratch.txt"), b"scratch").unwrap();
+
+        clean_worktree(tmp.path()).unwrap();
+
+        assert!(
+            tmp.path().join("target/classes/Foo.class").exists(),
+            "clean_worktree must NOT delete gitignored build artifacts"
+        );
+        assert!(tmp.path().join("node_modules/pkg/index.js").exists());
+        assert!(
+            !tmp.path().join("scratch.txt").exists(),
+            "clean_worktree must remove untracked non-ignored files"
+        );
     }
 
     #[test]

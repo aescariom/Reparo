@@ -1,3 +1,4 @@
+mod autofix_sonar;
 #[allow(dead_code)]
 mod claude;
 mod compliance;

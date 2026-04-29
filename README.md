@@ -17,6 +17,12 @@ Reparo scans your SonarQube project, prioritizes issues by severity, ensures tes
 - **Custom commit formats** — Templated commit messages with placeholders
 - **Resume support** — Pick up where you left off after interruptions
 - **Personal config** — User-level defaults in `~/.config/reparo/config.yaml`
+- **Sonar autofix fast-path** — OpenRewrite runs before the AI loop to resolve mechanical Sonar rules (S1128, S1481, S1068, S1118, S1161, S1124, S2293, …) with zero AI calls
+- **Local linter autofix fast-path** — Per-issue `--fix` dispatch to clippy / eslint / ruff; AI is called only when the linter can't resolve it
+- **Lint issue grouping** — Same-file / same-rule lint findings are batched into a single AI call
+- **Maven speedups** — `mvnd` auto-detection, module-scoped targeted tests (`-pl :<module> -am`), `target/` preserved across worktree reuse
+- **Smart rescan batching** — `--rescan-batch-size 0` defers all per-issue rescans to a single end-of-run verification
+- **Adaptive parallelism** — `--parallel N` with auto-bump to 2 workers when queue > 20 issues
 
 ## Quick Start
 
@@ -239,6 +245,21 @@ STEP FLAGS (each step can be enabled/disabled independently):
   --skip-dedup                     Skip the deduplication step after fixes
   --skip-final-validation          Skip the final full test suite validation
   --skip-docs                      Skip the documentation quality step
+  --skip-linter-scan               Skip the local linter discovery phase (Step 3d)
+  --skip-linter-fastpath           Skip the per-issue linter autofix fast-path (A1)
+  --skip-issue-grouping            Skip same-file/same-rule lint issue grouping (A3)
+  --skip-autofix-sonar             Skip the Sonar autofix fast-path (OpenRewrite)
+
+LATENCY OPTIMIZATION FLAGS:
+  --parallel <N>                   Per-issue parallelism via git worktrees [default: 1; auto-2 when queue > 20]
+  --coverage-parallel <N>          Files processed in parallel during coverage boost [default: 1]
+  --coverage-wave-size <N>         Files per coverage-boost wave [default: 3]
+  --coverage-commit-batch <N>      Files per coverage-boost commit (0 = wave size)
+  --rescan-batch-size <N>          Sonar rescan every N fixes; 0 = single end-of-run scan [default: 1]
+  --fix-commit-batch <N>           WIP fix commits to squash before pushing [default: 1]
+  --max-group-size <N>             Max lint findings per batched AI call [default: 20]
+  --targeted-tests-first / --skip-targeted-tests
+                                   Run Surefire-filtered tests before the full suite (Maven only)
 ```
 
 ### Environment Variables
@@ -268,6 +289,16 @@ All parameters can be set via environment variables:
 | `REPARO_COVERAGE_ROUNDS` | `--coverage-rounds` |
 | `REPARO_FINAL_VALIDATION_ATTEMPTS` | `--final-validation-attempts` |
 | `REPARO_MAX_DEDUP` | `--max-dedup` |
+| `REPARO_PARALLEL` | `--parallel` |
+| `REPARO_COVERAGE_PARALLEL` | `--coverage-parallel` |
+| `REPARO_RESCAN_BATCH_SIZE` | `--rescan-batch-size` |
+| `REPARO_SKIP_LINTER_FASTPATH` | `--skip-linter-fastpath` |
+| `REPARO_SKIP_ISSUE_GROUPING` | `--skip-issue-grouping` |
+| `REPARO_MAX_GROUP_SIZE` | `--max-group-size` |
+| `REPARO_SKIP_AUTOFIX_SONAR` | `--skip-autofix-sonar` |
+| `REPARO_LINTER_AUTOFIX` | `--linter-autofix` |
+| `REPARO_MAX_LINTER_FINDINGS` | `--max-linter-findings` |
+| `REPARO_ALLOW_WIP` | `--allow-wip` |
 
 ### YAML Configuration (`reparo.yaml`)
 
@@ -387,6 +418,10 @@ Every optional step can be controlled via CLI flags and/or YAML. CLI flags alway
 | Coverage boost | `--skip-coverage` | `execution.coverage_boost: false` | enabled |
 | Fix loop | `--skip-fixes` | — | enabled |
 | Contract/pact testing | `--skip-pact` | `pact:` section present | enabled when section present (hard error if missing) |
+| Local linter scan | `--skip-linter-scan` | `execution.linter_scan: false` | enabled when `commands.lint` set |
+| Per-issue linter autofix (A1) | `--skip-linter-fastpath` | — | enabled for `lint:*` findings |
+| Lint issue grouping (A3) | `--skip-issue-grouping` | — | enabled |
+| Sonar autofix (OpenRewrite) | `--skip-autofix-sonar` | — | enabled for Maven projects |
 | Deduplication | `--skip-dedup` | `execution.dedup_on_completion: false` | enabled |
 | Final validation (tests) | `--skip-final-validation` | `execution.final_validation: false` | enabled |
 | Documentation quality | `--skip-docs` | `documentation.enabled: true` | disabled |
@@ -394,11 +429,64 @@ Every optional step can be controlled via CLI flags and/or YAML. CLI flags alway
 
 **Command execution order** after each fix:
 
-1. `clean` (if defined) — clean artifacts before each fix
-2. `format` (if defined) — format code, changes included in commit
-3. `build` (if defined) — compile, **retries with AI on failure** (up to `coverage_attempts` times)
+1. `clean` (if defined) — clean artifacts before each fix *(skipped for `lint:*` findings)*
+2. `format` (if defined) — format code, changes included in commit *(skipped for `lint:*` findings)*
+3. `build` (if defined) — compile, **retries with AI on failure** (up to `coverage_attempts` times) *(skipped for `lint:*` findings; incremental compile in the test phase catches regressions)*
 4. `test` (required) — run tests, **retries with AI on failure** (up to `coverage_attempts` times)
 5. `lint` (if defined) — static analysis, **auto-fixed by AI** (up to `coverage_attempts` times)
+
+## Latency Optimizations
+
+Reparo stacks several AI-free or AI-light fast-paths to keep wall-clock down on large queues. Each runs automatically unless its skip flag is set.
+
+### Sonar autofix via OpenRewrite (Maven only)
+
+Before the AI fix loop, Reparo scans the queue for Sonar rule keys mapped to OpenRewrite recipes (16 mapped today: `S1128` unused imports, `S1481`/`S1068` unused local/field, `S1118` utility-class constructor, `S1161` missing `@Override`, `S1124` modifier order, `S2293` diamond operator, `S1155` isEmpty, `S1488` inline return, `S1066`/`S1125`/`S1126` boolean simplification, `S1905` unnecessary cast, `S6201` instanceof pattern, `S1165` final field, `S2864` entrySet, …). A single `mvn rewrite:run` with the union of matching recipes resolves dozens to hundreds of findings in ~60-120s. Files that OpenRewrite touches are accepted as mechanically fixed and skip the AI path. The full GAV is invoked — no pom.xml edits required. Disable with `--skip-autofix-sonar`.
+
+### Per-issue linter autofix fast-path (clippy / eslint / ruff)
+
+For `lint:<format>:<rule>` findings produced by the local linter scan, Reparo first runs the linter's own `--fix` scoped to the rule + file. If the file changes, the AI call is skipped. Typical savings: ~30-60s per auto-fixable finding → ~1-5s. Disable with `--skip-linter-fastpath`.
+
+### Lint issue grouping
+
+When the same `lint:<format>:<rule>` fires N times in one file, Reparo batches them into a single AI call (representative issue with all line ranges enumerated in the prompt). Caps at `--max-group-size` (default 20). Restricted to lint findings today so the Sonar re-fetch path stays simple. Disable with `--skip-issue-grouping`.
+
+### Maven-specific speedups
+
+- **`mvnd` auto-detection**: if `mvnd` is on `PATH`, Reparo rewrites `mvn …` test commands to `mvnd …` (2-3× faster cold builds). `./mvnw` invocations are preserved — if the project pinned a wrapper, Reparo respects it.
+- **Module-scoped targeted tests**: Reparo derives the enclosing Maven module of the changed file and injects `-pl :<module> -am` alongside the Surefire `-Dtest=` filter. Skipped for single-module projects.
+- **Clean/build/format skip for `lint:*` findings**: these linter-origin edits don't need a clean lifecycle; the test phase's incremental compile catches any regression.
+
+### Rescan batching
+
+`--rescan-batch-size N` controls how often the SonarQube rescan runs:
+- `N = 1` (default): rescan after every fix — strict verification, slowest.
+- `N > 1`: rescan every N fixes — amortizes ~30-60s per batch.
+- `N = 0`: defer all per-issue rescans; one rescan at the very end of the run diffs against the original queue and downgrades any still-open issue to `NeedsReview`. Largest single saving on long queues.
+
+`lint:*` findings never trigger a Sonar rescan (they're synthetic and Sonar doesn't track them).
+
+### Parallelism
+
+`--parallel N` runs issues concurrently in git worktrees. Reparo auto-bumps `N` to 2 when the queue > 20 issues unless `REPARO_PARALLEL` is explicitly set. For Maven projects the worktree pool preserves `target/`, `node_modules/`, `.gradle/`, `.venv/` across reuses — every issue on a reused worktree gets incremental compile instead of cold start.
+
+### Trivial-fix heuristics
+
+- **Trivial full-suite skip**: when targeted tests pass on a `lint:*` finding or a MINOR/INFO single-file change ≤ 5 lines, Reparo defers the full suite to the final-validation step even with `batch-size=1`.
+- **Repair-loop cap**: 1 repair attempt instead of `coverage_attempts` for `lint:*` and MINOR/INFO non-coverage-dependent rules.
+- **Haiku routing**: `lint:*` at MINOR severity routes to `haiku:low` (guarded by regression test).
+
+### Pre-queue dedup
+
+Overlapping findings in the same `(file, rule)` are collapsed before the queue is built. A finding whose `text_range` is fully contained in another of the same rule is dropped (the outer finding carries the fix).
+
+### End-of-run Sonar verification (`--rescan-batch-size 0` only)
+
+After the fix loop completes, a single scan + `wait_for_analysis` + `fetch_issues` compares remaining open issues against what we marked Fixed. Any still-open issue gets retroactively marked `NeedsReview` with a note that manual verification is required.
+
+### Pending work
+
+See [`US/US-080-pending-latency-improvements.md`](US/US-080-pending-latency-improvements.md) for the list of deferred items (B3 sequential pipelining, ESLint v9 flat-config fallback, batched native prompt for groups, Sonar-rule grouping, Checkstyle/SpotBugs/PMD parsers, OpenRewrite recipe map validation, Gradle autofix-sonar, preflight-tolerate flag).
 
 ## Coverage Boost
 

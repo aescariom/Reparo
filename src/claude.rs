@@ -67,7 +67,59 @@ impl std::fmt::Display for ClaudeTier {
 /// - Severity (CRITICAL/BLOCKER = higher tier)
 /// - Cognitive complexity delta (how much refactoring is needed)
 /// - Number of affected lines
+/// - SonarQube-estimated effort in minutes (overlay; escalates one tier when
+///   Sonar itself rates the fix as large). Pass `None` for linter findings
+///   or anywhere effort is unknown.
 pub fn classify_issue_tier(
+    rule: &str,
+    severity: &str,
+    message: &str,
+    affected_lines: u32,
+    effort_minutes: Option<u32>,
+) -> ClaudeTier {
+    let base = classify_issue_tier_base(rule, severity, message, affected_lines);
+    apply_effort_overlay(base, rule, effort_minutes)
+}
+
+/// Escalate a base tier when SonarQube's own estimate says the fix is large.
+///
+/// Skipped for `lint:*` rules (effort is never populated for synthetic linter
+/// findings) and for `S3776` (cognitive complexity already scales via the
+/// parsed number in the message — applying effort on top would double-count).
+///
+/// The overlay never escalates past `sonnet:high` — single-file reasoning
+/// doesn't benefit from opus, and opus routing stays reserved for dedup /
+/// extreme cognitive complexity.
+fn apply_effort_overlay(
+    base: ClaudeTier,
+    rule: &str,
+    effort_minutes: Option<u32>,
+) -> ClaudeTier {
+    if rule.starts_with("lint:") {
+        return base;
+    }
+    let rule_suffix = rule.split(':').last().unwrap_or(rule);
+    if rule_suffix == "S3776" {
+        return base;
+    }
+    let Some(minutes) = effort_minutes else {
+        return base;
+    };
+
+    // Thresholds picked from Sonar's own rule metadata: most trivial rules
+    // cost 1–10 min, moderate 15–30 min, complex 60+ min. A 30-min floor
+    // reliably separates "rote edit" from "real refactor", and a 2h ceiling
+    // flags the genuinely deep single-file work that benefits from high
+    // effort tokens.
+    match (base.model, base.effort) {
+        ("haiku", _) if minutes >= 30 => ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+        ("sonnet", "low") if minutes >= 30 => ClaudeTier::with_timeout("sonnet", "medium", 0.7),
+        ("sonnet", "medium") if minutes >= 120 => ClaudeTier::with_timeout("sonnet", "high", 1.0),
+        _ => base,
+    }
+}
+
+fn classify_issue_tier_base(
     rule: &str,
     severity: &str,
     message: &str,
@@ -97,7 +149,14 @@ pub fn classify_issue_tier(
     }
 
     // --- Tier 1: Haiku + low effort — trivial mechanical fixes ---
+    //
+    // Anything here should be a near-textual transformation: a one-line
+    // replacement, an import move, a keyword toggle, a rename, a constructor
+    // stub. Rules that require reading semantics of surrounding code (e.g.
+    // "is this deprecation a safe no-op swap?") belong in mechanical_rules
+    // or higher.
     let trivial_rules = [
+        // --- JS/TS lint-style Sonar rules ---
         "S1128",  // unused import
         "S1481",  // unused variable
         "S7772",  // prefer node: prefix
@@ -117,6 +176,23 @@ pub fn classify_issue_tier(
         "S2933",  // mark as readonly
         "S7756",  // prefer Blob#arrayBuffer
         "S1788",  // default parameters should be last
+        // --- Java: mechanical one-line fixes (observed in real runs) ---
+        "S106",   // replace System.out with a logger
+        "S117",   // rename to match naming convention
+        "S00117", // rename to match naming convention (legacy key)
+        "S1118",  // utility class: add a private constructor
+        "S1123",  // add the missing @deprecated Javadoc tag
+        "S1124",  // reorder the modifiers
+        "S1130",  // remove unused `throws` declaration
+        "S1133",  // remove use of deprecated API (simple call-site swap)
+        "S1135",  // remove/resolve TODO comment
+        "S1170",  // add `static` to a final field
+        "S1172",  // remove unused method parameter
+        "S1450",  // convert field to local variable
+        "S1659",  // declare on a separate line
+        "S4488",  // @RequestMapping → @GetMapping/@PostMapping
+        "S6201",  // replace instanceof-cast with pattern matching
+        "S6548",  // Singleton flag — add `// NOSONAR` or document
     ];
 
     let rule_suffix = rule.split(':').last().unwrap_or(rule);
@@ -153,21 +229,23 @@ pub fn classify_issue_tier(
         "S2187",  // test class has no tests
         "S2259",  // null pointer dereference
         "S2095",  // resource not closed
-        "S1135",  // TODO comment
-        "S1172",  // unused method parameter
         "S1186",  // empty method
         "S1192",  // duplicated string literal
-        "S1118",  // utility class instantiable
         "S1068",  // unused private field
         "S3457",  // printf format string
         "S112",   // generic exception
         "S1161",  // missing @Override
-        "S00117", // variable name convention
         "S00100", // method name convention
         "S00101", // class name convention
         "S1125",  // boolean literal in expression
         "S1126",  // if-return boolean
         "S3008",  // static field name convention
+        // Moderate semantic work — understanding the surrounding change vs.
+        // a pure text transform:
+        "S1874",  // deprecated API replacement (non-Hibernate; Hibernate auto-skipped)
+        "S3740",  // provide parametrized type for generic (infer from usage)
+        "S2629",  // guard logger calls (rewrite log site)
+        "S6813",  // field injection → constructor injection (real refactor)
     ];
     if mechanical_rules.iter().any(|r| rule_suffix == *r) {
         return ClaudeTier::with_timeout("sonnet", "medium", 0.7);
@@ -208,6 +286,11 @@ pub fn classify_issue_tier(
     // classifier only sees a single-file issue, the ceiling is sonnet:high.
     // Opus is reachable only via `classify_dedup_tier` (cross-class work
     // by definition) and the extreme-cognitive-complexity branch above.
+    //
+    // MINOR/INFO unknown rules: default to haiku. If the fix turns out to be
+    // beyond haiku's reach, the build/test-repair ladder escalates on the
+    // second attempt — we'd rather try cheap first and pay for an occasional
+    // redo than route ~60% of a run's issues to sonnet by default.
     match severity {
         "BLOCKER" => {
             if affected_lines > 80 {
@@ -218,7 +301,7 @@ pub fn classify_issue_tier(
         }
         "CRITICAL" => ClaudeTier::with_timeout("sonnet", "medium", 0.7),
         "MAJOR" => ClaudeTier::with_timeout("sonnet", "medium", 0.5),
-        _ => ClaudeTier::with_timeout("sonnet", "low", 0.3),
+        _ => ClaudeTier::with_timeout("haiku", "low", 0.3),
     }
 }
 
@@ -290,14 +373,23 @@ pub fn classify_test_gen_tier(
     _total_file_lines: usize,
     tiers: &crate::config::TestGenTiers,
 ) -> ClaudeTier {
-    if uncovered_lines > 60 {
+    // Thresholds tuned for Java/Maven projects: a typical JUnit test covers
+    // ~5-10 source lines, so:
+    //   ≤10 uncovered → one tiny test, easy win for haiku
+    //   ≤25 uncovered → a small test class — sonnet:low
+    //   ≤50 uncovered → a real test suite — sonnet:medium
+    //   ≤100         → deep coverage — sonnet:high
+    //   >100          → genuinely complex, reach for opus
+    if uncovered_lines > 100 {
         tier_from_spec(&tiers.complex)
-    } else if uncovered_lines > 30 {
+    } else if uncovered_lines > 50 {
         tier_from_spec(&tiers.high)
-    } else if uncovered_lines > 20 {
+    } else if uncovered_lines > 25 {
         tier_from_spec(&tiers.medium)
-    } else {
+    } else if uncovered_lines > 10 {
         tier_from_spec(&tiers.low)
+    } else {
+        tier_from_spec(&tiers.trivial)
     }
 }
 
@@ -328,9 +420,18 @@ pub fn classify_chunk_test_gen_tier(
     }
 }
 
-/// Classify build/test/lint repair — always fast, targeted fixes.
+/// Classify build/test/lint repair — targeted fix of a failing output.
+///
+/// Repair prompts bundle the failing command's stderr with the offending
+/// source file (typically 2.5–3 KB). The effective tier timeout must beat
+/// the `prompt_floor` in `Orchestrator::run_ai_with_invocation_keyed`
+/// (~400 s for a 2.8 KB prompt — but skipped on `fix_*_error` repair steps,
+/// see that function) with headroom — the P99 repair run needs ~400–500 s.
+///
+/// `1.0×` at the default `claude_timeout=600` gives 600 s, which cleanly
+/// clears the floor and leaves margin for model slowness.
 pub fn classify_repair_tier() -> ClaudeTier {
-    ClaudeTier::with_timeout("sonnet", "medium", 0.5)
+    ClaudeTier::with_timeout("sonnet", "medium", 1.0)
 }
 
 /// Tier for repairing test failures after a fix. Most test failures are
@@ -383,6 +484,7 @@ pub fn run_claude_with_tier(project_path: &Path, prompt: &str, timeout_secs: u64
         prompt_flag: "-p".to_string(),
         prompt_via_stdin: false,
         extra_args: Vec::new(),
+        session_id: None,
     };
     crate::engine::run_engine(project_path, prompt, timeout_secs, skip_permissions, show_prompt, &invocation)
 }
@@ -1150,10 +1252,38 @@ mod tests {
     // --- Tier classification ---
 
     #[test]
+    fn test_classify_lint_minor_stays_haiku_low() {
+        // Regression guard: linter-origin rules at MINOR severity must route to
+        // haiku:low. Changing this silently would blow up latency for every
+        // lint-heavy run, since ~40-60% of queues are lint:* findings.
+        let tier = classify_issue_tier(
+            "lint:clippy:unused_imports",
+            "MINOR",
+            "unused import",
+            1,
+            None,
+        );
+        assert_eq!(tier.model, "haiku", "lint:* MINOR must use haiku");
+        assert_eq!(tier.effort, "low", "lint:* MINOR must use effort=low");
+
+        // Effort overlay must NOT escalate lint:* (synthetic findings never
+        // have server-side effort anyway, but defense in depth).
+        let tier_with_effort = classify_issue_tier(
+            "lint:eslint:no-unused-vars",
+            "MINOR",
+            "unused",
+            1,
+            Some(120),
+        );
+        assert_eq!(tier_with_effort.model, "haiku");
+        assert_eq!(tier_with_effort.effort, "low");
+    }
+
+    #[test]
     fn test_classify_blocker_missing_assertion_stays_sonnet_not_opus() {
         // java:S2699 = missing test assertion. Sonar flags it as BLOCKER but
         // the fix is literally one line. Should NOT route to opus.
-        let tier = classify_issue_tier("java:S2699", "BLOCKER", "Add at least one assertion to this test case.", 1);
+        let tier = classify_issue_tier("java:S2699", "BLOCKER", "Add at least one assertion to this test case.", 1, None);
         assert_eq!(tier.model, "sonnet", "S2699 should not use opus");
         assert_eq!(tier.effort, "medium");
     }
@@ -1161,7 +1291,7 @@ mod tests {
     #[test]
     fn test_classify_blocker_empty_test_class_stays_sonnet_not_opus() {
         // java:S2187 = test class has no tests. Mechanical.
-        let tier = classify_issue_tier("java:S2187", "BLOCKER", "Add some tests to this class or remove it.", 1);
+        let tier = classify_issue_tier("java:S2187", "BLOCKER", "Add some tests to this class or remove it.", 1, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "medium");
     }
@@ -1170,7 +1300,7 @@ mod tests {
     fn test_classify_blocker_unknown_small_range_uses_sonnet_medium() {
         // An unknown BLOCKER rule with a small range is almost always
         // mechanical. Should stay on sonnet:medium, not opus:high.
-        let tier = classify_issue_tier("java:S9999", "BLOCKER", "hypothetical", 5);
+        let tier = classify_issue_tier("java:S9999", "BLOCKER", "hypothetical", 5, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "medium");
     }
@@ -1180,7 +1310,7 @@ mod tests {
         // A >80-line BLOCKER is still single-file. Opus's advantage is
         // cross-file reasoning, which this classifier can't detect. Cap at
         // sonnet:high.
-        let tier = classify_issue_tier("java:S9999", "BLOCKER", "big refactor", 120);
+        let tier = classify_issue_tier("java:S9999", "BLOCKER", "big refactor", 120, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "high");
     }
@@ -1188,21 +1318,21 @@ mod tests {
     #[test]
     fn test_classify_cognitive_complexity_scales_effort_not_model() {
         // ≤40: sonnet:medium — single-method logic, model doesn't matter much
-        let tier = classify_issue_tier("java:S3776", "MAJOR", "from 18 to the 15 allowed.", 30);
+        let tier = classify_issue_tier("java:S3776", "MAJOR", "from 18 to the 15 allowed.", 30, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "medium");
 
-        let tier = classify_issue_tier("java:S3776", "MAJOR", "from 35 to the 15 allowed", 50);
+        let tier = classify_issue_tier("java:S3776", "MAJOR", "from 35 to the 15 allowed", 50, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "medium");
 
         // 41-70: sonnet:high — deep single-method refactor, more thinking tokens
-        let tier = classify_issue_tier("java:S3776", "CRITICAL", "from 65 to the 15 allowed", 100);
+        let tier = classify_issue_tier("java:S3776", "CRITICAL", "from 65 to the 15 allowed", 100, None);
         assert_eq!(tier.model, "sonnet");
         assert_eq!(tier.effort, "high");
 
         // >70 extreme: opus:high (NOT max). Max reserved for multi-class dedup.
-        let tier = classify_issue_tier("java:S3776", "CRITICAL", "from 108 to the 15 allowed", 200);
+        let tier = classify_issue_tier("java:S3776", "CRITICAL", "from 108 to the 15 allowed", 200, None);
         assert_eq!(tier.model, "opus");
         assert_eq!(tier.effort, "high");
     }
@@ -1218,7 +1348,7 @@ mod tests {
             ("java:S9999", "BLOCKER", "whatever", 500),
         ];
         for (rule, sev, msg, lines) in cases {
-            let tier = classify_issue_tier(rule, sev, msg, lines);
+            let tier = classify_issue_tier(rule, sev, msg, lines, None);
             assert_ne!(
                 tier.effort, "max",
                 "classify_issue_tier returned opus:max for ({rule}, {sev}, {lines}) — that tier is multi-class only"
@@ -1228,8 +1358,77 @@ mod tests {
 
     #[test]
     fn test_classify_trivial_rule_uses_haiku() {
-        let tier = classify_issue_tier("java:S1128", "MINOR", "unused import", 1);
+        let tier = classify_issue_tier("java:S1128", "MINOR", "unused import", 1, None);
         assert_eq!(tier.model, "haiku");
+    }
+
+    // --- Effort overlay ---
+
+    #[test]
+    fn test_effort_overlay_escalates_haiku_trivial_with_large_effort() {
+        // S1128 (unused import) is normally haiku:low. A 30-min Sonar effort
+        // estimate means the trivial classification is wrong for this
+        // instance — escalate to sonnet:medium.
+        let tier = classify_issue_tier("java:S1128", "MINOR", "unused import", 1, Some(45));
+        assert_eq!(tier.model, "sonnet");
+        assert_eq!(tier.effort, "medium");
+    }
+
+    #[test]
+    fn test_effort_overlay_leaves_small_effort_on_haiku() {
+        let tier = classify_issue_tier("java:S1128", "MINOR", "unused import", 1, Some(5));
+        assert_eq!(tier.model, "haiku");
+    }
+
+    #[test]
+    fn test_effort_overlay_escalates_sonnet_medium_to_high_for_long_refactors() {
+        // Mechanical rule defaults to sonnet:medium. A 2h+ Sonar effort
+        // signals a real refactor — bump to sonnet:high.
+        let tier = classify_issue_tier("java:S2095", "BLOCKER", "resource not closed", 10, Some(150));
+        assert_eq!(tier.model, "sonnet");
+        assert_eq!(tier.effort, "high");
+    }
+
+    #[test]
+    fn test_effort_overlay_skipped_for_cognitive_complexity() {
+        // S3776 has its own effort scaling from the parsed message. The
+        // overlay must NOT stack on top — a 60-min effort should not change
+        // the classification for a complexity-18 issue.
+        let tier = classify_issue_tier("java:S3776", "MAJOR", "from 18 to the 15 allowed.", 30, Some(60));
+        assert_eq!(tier.model, "sonnet");
+        assert_eq!(tier.effort, "medium");
+    }
+
+    #[test]
+    fn test_effort_overlay_skipped_for_lint_rules() {
+        // Synthetic lint findings never carry a Sonar effort, but defensively
+        // the overlay should be a no-op even if one sneaks in.
+        let tier = classify_issue_tier("lint:clippy:needless_return", "MINOR", "return", 1, Some(90));
+        assert_eq!(tier.model, "haiku");
+    }
+
+    #[test]
+    fn test_effort_overlay_never_escalates_past_sonnet_high() {
+        let tier = classify_issue_tier("java:S9999", "BLOCKER", "big refactor", 200, Some(480));
+        assert_ne!(tier.model, "opus");
+        assert_ne!(tier.effort, "max");
+    }
+
+    // --- Effort parser ---
+
+    #[test]
+    fn test_parse_effort_minutes_formats() {
+        use crate::sonar::parse_effort_minutes;
+        assert_eq!(parse_effort_minutes("5min"), Some(5));
+        assert_eq!(parse_effort_minutes("1h"), Some(60));
+        assert_eq!(parse_effort_minutes("1h30min"), Some(90));
+        assert_eq!(parse_effort_minutes("2h"), Some(120));
+        assert_eq!(parse_effort_minutes("1d"), Some(480));
+        assert_eq!(parse_effort_minutes("1d2h"), Some(480 + 120));
+        assert_eq!(parse_effort_minutes(""), None);
+        assert_eq!(parse_effort_minutes("12"), None);       // no unit
+        assert_eq!(parse_effort_minutes("abc"), None);
+        assert_eq!(parse_effort_minutes("1week"), None);    // unknown unit
     }
 
     // --- Existing prompt tests ---
@@ -1508,16 +1707,24 @@ mod tests {
     fn test_classify_test_gen_tier_by_uncovered_lines() {
         let tiers = crate::config::TestGenTiers::default();
 
-        // Few uncovered lines → low effort regardless of file size
-        let small = classify_test_gen_tier(5, 1000, &tiers);
+        // ≤10 uncovered → trivial tier (haiku in defaults)
+        let tiny = classify_test_gen_tier(5, 1000, &tiers);
+        assert_eq!(tiny.model, "haiku");
+
+        // 11-25 uncovered → low (sonnet:low in defaults)
+        let small = classify_test_gen_tier(20, 1000, &tiers);
         assert_eq!(small.model, "sonnet");
         assert_eq!(small.effort, "low");
 
-        // Medium uncovered count
-        let med = classify_test_gen_tier(30, 50, &tiers);
+        // 26-50 uncovered → medium
+        let med = classify_test_gen_tier(40, 50, &tiers);
         assert_eq!(med.effort, "medium");
 
-        // Many uncovered lines → opus
+        // 51-100 uncovered → high
+        let hi = classify_test_gen_tier(80, 200, &tiers);
+        assert_eq!(hi.effort, "high");
+
+        // >100 uncovered → opus (complex)
         let large = classify_test_gen_tier(120, 200, &tiers);
         assert_eq!(large.model, "opus");
     }

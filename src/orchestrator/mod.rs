@@ -1,6 +1,8 @@
 mod coverage;
 mod dedup;
+mod deterministic;
 mod fix_loop;
+pub(crate) mod grouping;
 pub(crate) mod helpers;
 mod overlap;
 mod parallel;
@@ -54,7 +56,60 @@ pub struct Orchestrator {
     /// Monotonic counter of fixes processed. Used with `rescan_batch_size` to
     /// decide when to run the SonarQube verification rescan (every Nth fix).
     pub(crate) fix_counter: std::sync::atomic::AtomicU32,
+    /// Whether the next fix must run the `clean` command before fixing.
+    /// Set to true on startup and after any build/test failure; set to false
+    /// after a successful fix so subsequent fixes skip the ~2-3 s clean step
+    /// (see `config.skip_clean_when_safe`).
+    pub(crate) needs_clean: std::sync::atomic::AtomicBool,
+    /// (file, rule) → consecutive non-Fixed outcomes seen during this run.
+    /// Once a (file, rule) pair fails ≥ FAILURE_MEMORY_THRESHOLD times, further
+    /// issues with the same key short-circuit straight to NeedsReview without
+    /// spending an AI call. Reason: when one issue on a file/rule fails the
+    /// targeted tests, the next sibling issue almost always fails the same way
+    /// (e.g. `EntityServiceImpl + java:S3740` repeatedly broke
+    /// `EntityServiceImplAdditionalCoverageTest` across 6 issues = ~50 min wasted).
+    /// Shared `Arc` so every parallel worker sees the same counter.
+    pub(crate) fix_failure_memory:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
+    /// US-081: file_path → live Claude session that can be resumed.
+    /// First AI call on a file opens a fresh session and captures the session
+    /// id from the JSON response; subsequent calls on the same file pass that
+    /// id via `--resume <id>` so Claude continues the conversation instead of
+    /// re-loading system prompt + CLAUDE.md. Sessions are evicted when the
+    /// turn count or wall age caps are exceeded, when a fix is reverted (the
+    /// conversation contains code that was rolled back and would mislead the
+    /// next turn), or when the worker moves to a different file.
+    /// Shared `Arc` across parallel workers so two issues on the same file
+    /// dispatched to different worktrees can still share the session — the
+    /// content of the file is replicated across worktrees so the model's
+    /// understanding remains valid.
+    pub(crate) session_map:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, SessionEntry>>>,
 }
+
+/// Live Claude session associated with a single source file.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionEntry {
+    pub id: String,
+    pub turns: u32,
+    pub opened_at: std::time::Instant,
+}
+
+/// Hard caps on session reuse. Sessions get evicted when EITHER cap is hit.
+/// `MAX_TURNS` keeps the conversation under ~50–100 K context tokens; the
+/// time cap stays comfortably under the 5-min Anthropic prompt-cache TTL so
+/// a fresh session's first call still hits warm cache.
+pub(crate) const SESSION_MAX_TURNS: u32 = 10;
+pub(crate) const SESSION_MAX_AGE_SECS: u64 = 240; // 4 minutes (cache TTL is 5)
+
+/// Threshold of (file, rule) failures after which subsequent siblings are
+/// short-circuited to NeedsReview. Empirically (run 2026-04-28) the first
+/// failure on a (file, rule) pair already predicts subsequent ones reliably:
+/// `S3740` on `EntityServiceImpl` failed 6 in a row, `S6813` on
+/// `EmailServiceImpl` consumed ~5 min twice returning "no changes". Cutting
+/// after the first failure trades ~one wasted issue-attempt per pair for the
+/// guarantee that no run wastes ≥ 30 min on a single rule/file combination.
+pub(crate) const FAILURE_MEMORY_THRESHOLD: u32 = 1;
 
 impl Orchestrator {
     pub fn new(config: ValidatedConfig, exec_log: Arc<ExecutionLog>) -> Result<Self> {
@@ -109,6 +164,9 @@ impl Orchestrator {
             current_step_id: std::sync::Mutex::new(None),
             file_classifications: std::sync::RwLock::new(std::collections::HashMap::new()),
             fix_counter: std::sync::atomic::AtomicU32::new(0),
+            needs_clean: std::sync::atomic::AtomicBool::new(true),
+            fix_failure_memory: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_map: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -116,6 +174,8 @@ impl Orchestrator {
     ///
     /// Shares SonarQube client, rule cache, engine routing, and prompt config with the parent.
     /// The worker uses a different project path (a git worktree) and a shared usage tracker.
+    /// `fix_failure_memory` is cloned from the parent `Arc` so all workers in a run
+    /// see the same (file, rule) failure counters.
     pub(crate) fn new_worker(
         config: ValidatedConfig,
         client: SonarClient,
@@ -124,6 +184,12 @@ impl Orchestrator {
         prompt_config: crate::yaml_config::PromptsYaml,
         cached_test_examples: Option<String>,
         exec_log: Arc<ExecutionLog>,
+        fix_failure_memory: Arc<
+            std::sync::Mutex<std::collections::HashMap<(String, String), u32>>,
+        >,
+        session_map: Arc<
+            std::sync::Mutex<std::collections::HashMap<String, SessionEntry>>,
+        >,
     ) -> Self {
         Self {
             config,
@@ -140,6 +206,9 @@ impl Orchestrator {
             current_step_id: std::sync::Mutex::new(None),
             file_classifications: std::sync::RwLock::new(std::collections::HashMap::new()),
             fix_counter: std::sync::atomic::AtomicU32::new(0),
+            needs_clean: std::sync::atomic::AtomicBool::new(true),
+            fix_failure_memory,
+            session_map,
         }
     }
 
@@ -187,6 +256,21 @@ impl Orchestrator {
         self.run_ai_at(step, prompt, tier, &self.config.path)
     }
 
+    /// US-086/087: variant of `run_ai` that pins session reuse to a file path
+    /// (typically the test file or source file under edit). Used by
+    /// coverage_boost, documentation, test_generation, contract_test_generation
+    /// and rebase_conflict so consecutive AI calls on the same file amortise
+    /// the system-prompt + CLAUDE.md + initial file-read cost.
+    pub(crate) fn run_ai_keyed(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.run_ai_at_keyed(step, prompt, tier, &self.config.path, session_key)
+    }
+
     /// Lean variant of run_ai for focused single-file fixes.
     /// Adds `--tools Read,Edit,Write` (no Grep/Glob/Bash) to the Claude
     /// invocation to restrict the fix to a targeted file edit.
@@ -196,24 +280,33 @@ impl Orchestrator {
     /// `--bare` was previously added here but was removed because it also
     /// bypasses auth loading, causing "Not logged in" failures in sessions
     /// that rely on Claude Code's shared auth.
-    pub(crate) fn run_ai_lean(
+    /// Lean variant of `run_ai` for focused single-file fixes; pins session
+    /// reuse to `session_key` so successive fixes on it amortise the system
+    /// prompt + initial file-read cost.
+    pub(crate) fn run_ai_lean_keyed(
         &self,
         step: &str,
         prompt: &str,
         tier: &claude::ClaudeTier,
+        session_key: Option<&str>,
     ) -> anyhow::Result<String> {
         if !self.config.lean_ai {
             return self.run_ai(step, prompt, tier);
         }
-        self.run_ai_lean_at(step, prompt, tier, &self.config.path)
+        self.run_ai_lean_at_keyed(step, prompt, tier, &self.config.path, session_key)
     }
 
-    pub(crate) fn run_ai_lean_at(
+    /// Lean run with explicit `project_path` (may be a worktree); participates
+    /// in the per-file Claude session reuse map (US-081). `session_key` is
+    /// the file path of the issue being fixed; `None` opts out (use for
+    /// non-fix calls like risk assessment or coverage boost).
+    pub(crate) fn run_ai_lean_at_keyed(
         &self,
         step: &str,
         prompt: &str,
         tier: &claude::ClaudeTier,
         project_path: &std::path::Path,
+        session_key: Option<&str>,
     ) -> anyhow::Result<String> {
         let mut invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
         if matches!(invocation.engine_kind, crate::engine::EngineKind::Claude) {
@@ -222,7 +315,39 @@ impl Orchestrator {
                 "Read,Edit,Write".to_string(),
             ]);
         }
-        self.run_ai_with_invocation(step, prompt, tier, project_path, invocation)
+        self.run_ai_with_invocation_keyed(step, prompt, tier, project_path, invocation, session_key)
+    }
+
+    /// US-081: drop any live session associated with this file. Called by
+    /// fix_loop after a revert (the conversation contains rolled-back code
+    /// and would mislead the next turn) and at the end of a successful but
+    /// turn-limit-reaching fix.
+    pub(crate) fn evict_session(&self, file: &str) {
+        let mut map = self.session_map.lock().expect("session_map poisoned");
+        if let Some(e) = map.remove(file) {
+            tracing::info!(
+                "Evicted Claude session {} for {} (turns={})",
+                e.id, file, e.turns
+            );
+        }
+    }
+
+    /// Drop any live session for `file` at issue-boundary. Each call to
+    /// `process_issue` is for a distinct SonarQube issue, and resuming a
+    /// session that was opened for a previous issue lets Claude believe the
+    /// work is already done — observed in run 2026-04-28 waves 17 & 18,
+    /// where two consecutive issues on `EmailServiceImpl` returned "Claude
+    /// made no changes" after wasting ~3 min each. Repair cycles within
+    /// the same `process_issue_impl` still benefit from session reuse
+    /// because they happen between this evict and the next.
+    pub(crate) fn evict_session_for_new_issue(&self, file: &str, incoming_issue_key: &str) {
+        let mut map = self.session_map.lock().expect("session_map poisoned");
+        if let Some(e) = map.remove(file) {
+            tracing::info!(
+                "Evicting Claude session {} for {} at issue boundary (new_issue={}, turns={})",
+                e.id, file, incoming_issue_key, e.turns
+            );
+        }
     }
 
     /// Run an AI engine with an explicit `project_path` (may be a worktree).
@@ -237,25 +362,99 @@ impl Orchestrator {
         tier: &claude::ClaudeTier,
         project_path: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
-        self.run_ai_with_invocation(step, prompt, tier, project_path, invocation)
+        self.run_ai_at_keyed(step, prompt, tier, project_path, None)
     }
 
-    pub(crate) fn run_ai_with_invocation(
+    pub(crate) fn run_ai_at_keyed(
         &self,
         step: &str,
         prompt: &str,
         tier: &claude::ClaudeTier,
         project_path: &std::path::Path,
-        invocation: crate::engine::EngineInvocation,
+        session_key: Option<&str>,
     ) -> anyhow::Result<String> {
+        let invocation = crate::engine::resolve_engine_for_tier(tier, &self.engine_routing)?;
+        self.run_ai_with_invocation_keyed(
+            step,
+            prompt,
+            tier,
+            project_path,
+            invocation,
+            session_key,
+        )
+    }
+
+    /// Run an AI engine with an explicit invocation, participating in the
+    /// per-file Claude session reuse map (US-081). When `session_key` is
+    /// `Some(file)`, the orchestrator looks up a live session for that file,
+    /// applies `--resume <id>` to the invocation, captures the new session id
+    /// from the response, and updates the bookkeeping (turns + age). On any
+    /// error or non-Claude engine, falls back to the legacy fresh-session
+    /// behaviour transparently — failures here must NEVER abort the issue.
+    pub(crate) fn run_ai_with_invocation_keyed(
+        &self,
+        step: &str,
+        prompt: &str,
+        tier: &claude::ClaudeTier,
+        project_path: &std::path::Path,
+        mut invocation: crate::engine::EngineInvocation,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<String> {
+        // Resolve session reuse before computing timeout — whether we resume
+        // or open fresh doesn't change the timeout policy.
+        let session_active = matches!(
+            invocation.engine_kind,
+            crate::engine::EngineKind::Claude
+        ) && session_key.is_some();
+        if session_active {
+            if let Some(file) = session_key {
+                let entry = {
+                    let map = self.session_map.lock().expect("session_map poisoned");
+                    map.get(file).cloned()
+                };
+                if let Some(e) = entry {
+                    let age = e.opened_at.elapsed().as_secs();
+                    if e.turns < SESSION_MAX_TURNS && age < SESSION_MAX_AGE_SECS {
+                        invocation.session_id = Some(e.id.clone());
+                        tracing::info!(
+                            "Reusing Claude session {} for {} (turn {}/{}, age {}s)",
+                            e.id, file, e.turns + 1, SESSION_MAX_TURNS, age
+                        );
+                    } else {
+                        // Aged out / over turn cap → drop and let a fresh
+                        // session open below.
+                        let mut map = self.session_map.lock().expect("session_map poisoned");
+                        map.remove(file);
+                        tracing::info!(
+                            "Evicting Claude session {} for {} (turns={} age={}s)",
+                            e.id, file, e.turns, age
+                        );
+                    }
+                }
+            }
+        }
+
         let tier_timeout = tier.effective_timeout(self.config.claude_timeout);
 
         // Prompt-aware timeout floor: larger prompts indicate more complex tasks
         // requiring more reasoning and output generation time.  Use 120s base +
         // ~100ms per prompt character, capped at 3× the configured base timeout.
-        let prompt_floor = ((prompt.len() as u64) / 10 + 120)
-            .min(self.config.claude_timeout.saturating_mul(3));
+        //
+        // Skip the floor on `fix_*_error` repair steps. Empirically (run
+        // 2026-04-28) successful repairs complete in 17–58 s; the floor was
+        // boosting tier_timeout from 240 s up to 400 s for typical 2.8 KB
+        // repair prompts and that extra 160 s was burnt almost exclusively
+        // by stuck loops that the 80%-budget fast-fail couldn't catch in time.
+        // Repair tiers already encode their reasoning needs via the
+        // multiplier; the floor is appropriate for first-shot fix prompts
+        // where the model loads more file context.
+        let is_repair_step = step.starts_with("fix_") && step.ends_with("_error");
+        let prompt_floor = if is_repair_step {
+            0
+        } else {
+            ((prompt.len() as u64) / 10 + 120)
+                .min(self.config.claude_timeout.saturating_mul(3))
+        };
         let timeout = tier_timeout.max(prompt_floor);
 
         if timeout > tier_timeout {
@@ -279,6 +478,31 @@ impl Orchestrator {
             &invocation,
         );
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
+
+        // US-081: persist the session id reported by Claude for follow-up
+        // calls on the same file. We only update the map on success — a
+        // failed call may have died before fully establishing context.
+        if session_active {
+            if let (Some(file), Ok(ref out)) = (session_key, &result) {
+                if let Some(ref new_sid) = out.session_id {
+                    let mut map = self.session_map.lock().expect("session_map poisoned");
+                    let entry = map.entry(file.to_string())
+                        .or_insert_with(|| SessionEntry {
+                            id: new_sid.clone(),
+                            turns: 0,
+                            opened_at: std::time::Instant::now(),
+                        });
+                    // Claude returns a stable session id across turns of the
+                    // same conversation, but cope defensively if it changes.
+                    if entry.id != *new_sid {
+                        entry.id = new_sid.clone();
+                        entry.opened_at = std::time::Instant::now();
+                        entry.turns = 0;
+                    }
+                    entry.turns = entry.turns.saturating_add(1);
+                }
+            }
+        }
 
         // Record usage directly in the execution log (SQLite).  Failed calls
         // still cost tokens if the engine got far enough to report them; on
@@ -818,7 +1042,16 @@ impl Orchestrator {
         } else {
             info!("=== Step 3d: Local linter scan ===");
             let pid = self.exec_phase_start("linter_scan", None, Some(" findings"));
-            let lint_cmd = self.config.commands.lint.as_deref();
+            // Prefer the dedicated scan command; fall back to the per-fix
+            // `lint` gate when no scan-specific command is configured. This
+            // lets users keep a fast per-fix gate (mvn validate) alongside a
+            // heavier scan (mvn checkstyle:checkstyle).
+            let lint_cmd = self
+                .config
+                .commands
+                .lint_scan
+                .as_deref()
+                .or(self.config.commands.lint.as_deref());
             let lint_format = self.config.commands.lint_format.as_deref();
             match crate::linter::run_lint_scan(
                 &self.config.path,
@@ -932,6 +1165,138 @@ impl Orchestrator {
             sonar_issues,
             self.config.reverse_severity,
         );
+        // C2: drop overlapping issues of the same (file, rule) so we don't
+        // pay an AI call per containment-nested finding. One fix usually
+        // resolves the whole stack.
+        let pre_dedup_len = initial_issues.len();
+        initial_issues = grouping::dedup_overlapping(initial_issues);
+        let dropped = pre_dedup_len.saturating_sub(initial_issues.len());
+        if dropped > 0 {
+            info!(
+                "Pre-queue dedup: dropped {} overlapping issues ({} → {})",
+                dropped, pre_dedup_len, initial_issues.len()
+            );
+        }
+
+        // A3: bucket LINT findings by (file, rule) and collapse each bucket
+        // into one synthetic issue whose message enumerates every occurrence.
+        // One AI call then resolves N findings. We deliberately restrict to
+        // `lint:*` rules because Sonar issues are re-fetched mid-loop for
+        // freshness, and re-fetching would resurrect individual Sonar findings
+        // outside their batch. Lint findings are synthetic and never come
+        // back from the Sonar re-fetch, so grouping them is safe.
+        if !self.config.skip_issue_grouping {
+            let (lint_part, sonar_part): (Vec<_>, Vec<_>) = initial_issues
+                .into_iter()
+                .partition(|i| i.rule.starts_with("lint:"));
+            let pre_group_len = lint_part.len();
+            let groups = grouping::group_issues(lint_part, self.config.max_group_size);
+            let batched: usize = groups.iter().filter(|g| g.is_batched()).count();
+            let mut grouped: Vec<Issue> = groups.into_iter().map(|g| g.into_representative()).collect();
+            if batched > 0 {
+                info!(
+                    "Lint grouping: collapsed {} lint findings into {} groups ({} batched)",
+                    pre_group_len,
+                    grouped.len(),
+                    batched
+                );
+            }
+            // Re-merge sonar + grouped-lint, preserving severity ordering.
+            initial_issues = helpers::merge_lint_and_sonar_issues(
+                grouped.split_off(0),
+                sonar_part,
+                self.config.reverse_severity,
+            );
+        }
+
+        // === Sonar autofix fast-path (OpenRewrite) ===
+        //
+        // Before the AI fix loop, run one `mvn rewrite:run` that activates
+        // every recipe in our static rule map for which the queue contains
+        // a matching issue. Files OpenRewrite touches are accepted as
+        // mechanically-fixed: the corresponding issues get FixStatus::Fixed
+        // and are dropped from the queue. The remaining queue flows through
+        // the AI path unchanged.
+        //
+        // This is Maven-specific today (OpenRewrite has Gradle support; can
+        // be added later behind a scanner-kind branch).
+        if !self.config.skip_autofix_sonar {
+            let eligible: bool = initial_issues
+                .iter()
+                .any(|i| crate::autofix_sonar::RULE_TO_RECIPES.iter().any(|(k, _)| *k == i.rule));
+            let pom_exists = self.config.path.join("pom.xml").exists();
+            if !pom_exists {
+                info!("autofix-sonar: skipping (no pom.xml — Maven-only for now)");
+            } else if !eligible {
+                info!("autofix-sonar: skipping (no queued rule matches the recipe map)");
+            } else {
+                info!("=== Step 4b: Sonar autofix fast-path (OpenRewrite) ===");
+                match crate::autofix_sonar::run(&self.config.path, &initial_issues) {
+                    Ok(outcome) if !outcome.resolved_keys.is_empty() => {
+                        // Commit the autofix changes as a single, labeled commit.
+                        let _ = git::add_all(&self.config.path);
+                        if git::has_staged_changes(&self.config.path).unwrap_or(false) {
+                            let recipe_summary = outcome
+                                .activated_recipes
+                                .iter()
+                                .take(5)
+                                .map(|s| s.rsplit('.').next().unwrap_or(s))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let msg = format_commit_message(
+                                &self.config,
+                                "refactor",
+                                "sonar",
+                                &format!(
+                                    "autofix {} issue(s) via OpenRewrite ({}{})",
+                                    outcome.resolved_keys.len(),
+                                    recipe_summary,
+                                    if outcome.activated_recipes.len() > 5 { ", …" } else { "" },
+                                ),
+                                "",
+                                "",
+                                "",
+                            );
+                            let _ = git::commit(&self.config.path, &msg);
+                        }
+                        // Materialize Fixed results for each resolved key and
+                        // filter them out of the AI queue.
+                        let resolved_set: std::collections::HashSet<String> =
+                            outcome.resolved_keys.iter().cloned().collect();
+                        let before_len = initial_issues.len();
+                        let (resolved, remaining): (Vec<Issue>, Vec<Issue>) = initial_issues
+                            .into_iter()
+                            .partition(|i| resolved_set.contains(&i.key));
+                        for issue in resolved {
+                            self.results.push(IssueResult {
+                                issue_key: issue.key.clone(),
+                                rule: issue.rule.clone(),
+                                severity: issue.severity.clone(),
+                                issue_type: issue.issue_type.clone(),
+                                message: issue.message.clone(),
+                                file: sonar::component_to_path(&issue.component),
+                                lines: format_lines(&issue.text_range),
+                                status: FixStatus::Fixed,
+                                change_description: "OpenRewrite autofix (no AI)".to_string(),
+                                tests_added: Vec::new(),
+                                pr_url: None,
+                                diff_summary: None,
+                            });
+                        }
+                        initial_issues = remaining;
+                        info!(
+                            "autofix-sonar: queue shrank from {} → {} (saved ~{} AI calls)",
+                            before_len,
+                            initial_issues.len(),
+                            before_len.saturating_sub(initial_issues.len())
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("autofix-sonar: run failed (continuing with AI path): {}", e),
+                }
+            }
+        }
+
         self.total_issues_found = initial_issues.len();
         if linter_count > 0 {
             info!(
@@ -1064,13 +1429,31 @@ impl Orchestrator {
         //   batch_size != 1  →  wave-parallel: issues touching different files are
         //                       processed in parallel within the shared batch branch;
         //                       a single PR is created at the end (same as sequential).
-        // Hint when running sequentially over many issues: per-issue parallelism
-        // with worktrees can cut wall-clock 3-4× with no code change.
+        // Hint / auto-opt-in when running sequentially over many issues:
+        // per-issue parallelism with worktrees can cut wall-clock 3-4×.
+        //
+        // - >10 issues : emit the hint (same as before).
+        // - >20 issues AND batch_size==1 AND user did not pass --parallel
+        //   explicitly: auto-bump to 2 workers. Two is conservative (minimal
+        //   disk + memory pressure from extra worktrees) but still halves
+        //   wall-clock for the common case. Users can always set
+        //   --parallel 1 explicitly to opt out, or --parallel 4 for more.
         if self.config.parallel <= 1 && initial_issues.len() > 10 {
             info!(
                 "Hint: {} issues queued. For faster runs, try `--parallel 4 --batch-size 1` (per-issue worktree parallelism).",
                 initial_issues.len()
             );
+        }
+        if self.config.parallel <= 1
+            && self.config.batch_size == 1
+            && initial_issues.len() > 20
+            && std::env::var("REPARO_PARALLEL").is_err()
+        {
+            info!(
+                "Auto-enabling --parallel 2 for {} issues (set REPARO_PARALLEL=1 or pass --parallel 1 to opt out)",
+                initial_issues.len()
+            );
+            self.config.parallel = 2;
         }
 
         if self.config.parallel > 1 && self.config.batch_size == 1 {
@@ -1283,6 +1666,14 @@ impl Orchestrator {
 
             self.fix_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let result = self.process_issue(&issue, &test_command).await;
+            // Update needs_clean based on outcome: clean stays skipped after a
+            // successful fix, but must run again after any kind of failure
+            // (build/test/repair) since the tree may be dirty or in a weird
+            // state that only a clean build can recover from.
+            if !matches!(result.status, FixStatus::Fixed) {
+                self.needs_clean
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let (step_status, step_details) = match &result.status {
                 FixStatus::Fixed => {
                     total_fixed += 1;
@@ -1613,6 +2004,51 @@ Apply the fix now."#,
         } else {
             info!("=== Step 5c: Documentation SKIPPED (not enabled in YAML) ===");
             self.exec_phase_finish(docs_phase, ItemStatus::Skipped, None, Some("disabled in YAML"));
+        }
+
+        // Step 5f: End-of-run SonarQube verification (B4).
+        // When `--rescan-batch-size 0` is set we skipped all per-issue rescans
+        // during the fix loop. Run a single scan now, diff against the
+        // originally queued issue keys, and retroactively flag any fixes whose
+        // issue Sonar still reports as OPEN — those go to manual review.
+        if self.config.rescan_batch_size == 0 {
+            if let Some(ref scanner) = self.config.scanner {
+                info!("=== Step 5f: End-of-run SonarQube verification ===");
+                match self.client.run_scanner(&self.config.path, scanner, &self.config.branch) {
+                    Ok(ce_task_id) => {
+                        if let Err(e) = self.client.wait_for_analysis(ce_task_id.as_deref()).await {
+                            warn!("End-of-run Sonar analysis wait failed: {} — skipping verification", e);
+                        } else {
+                            match self.client.fetch_issues().await {
+                                Ok(remaining) => {
+                                    let remaining_keys: std::collections::HashSet<String> =
+                                        remaining.iter().map(|i| i.key.clone()).collect();
+                                    let mut still_open = 0usize;
+                                    for r in self.results.iter_mut() {
+                                        if matches!(r.status, FixStatus::Fixed)
+                                            && remaining_keys.contains(&r.issue_key)
+                                        {
+                                            r.status = FixStatus::NeedsReview(
+                                                "End-of-run SonarQube scan still reports this issue — manual review required".to_string()
+                                            );
+                                            still_open += 1;
+                                        }
+                                    }
+                                    info!(
+                                        "End-of-run verification: {} fixes downgraded to NeedsReview ({} still-open issues)",
+                                        still_open,
+                                        remaining_keys.len()
+                                    );
+                                }
+                                Err(e) => warn!("End-of-run fetch_issues failed: {}", e),
+                            }
+                        }
+                    }
+                    Err(e) => warn!("End-of-run run_scanner failed: {}", e),
+                }
+            } else {
+                info!("=== Step 5f: End-of-run verification SKIPPED (no scanner configured) ===");
+            }
         }
 
         // Step 6: Generate report (on the fix branch)

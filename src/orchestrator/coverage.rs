@@ -934,7 +934,7 @@ impl Orchestrator {
                     "Generating tests for {} [general whole-file] [{}] ({})...",
                     fc.file, test_tier, round_label
                 );
-                match self.run_ai("coverage_boost", &prompt, &test_tier) {
+                match self.run_ai_keyed("coverage_boost", &prompt, &test_tier, Some(fc.file.as_str())) {
                     Ok(_) => {
                         info!("AI completed general whole-file generation for {} ({})", fc.file, round_label);
                     }
@@ -1016,7 +1016,7 @@ impl Orchestrator {
                         "  Batch {}/{}: {} — {} uncovered lines [{}]",
                         batch_idx, total_batches, batch_label, batch_uncovered, batch_tier
                     );
-                    match self.run_ai("coverage_boost_chunk", &prompt, &batch_tier) {
+                    match self.run_ai_keyed("coverage_boost_chunk", &prompt, &batch_tier, Some(fc.file.as_str())) {
                         Ok(_) => {
                             info!("  Batch {}/{} completed", batch_idx, total_batches);
                             // Validate: no source files modified by this batch
@@ -1157,7 +1157,7 @@ impl Orchestrator {
                 let uncovered = current_uncovered_count as usize;
                 let test_tier = claude::classify_test_gen_tier(uncovered, fc.total_lines as usize, &self.config.test_generation.tiers);
                 info!("Generating tests for {} [{}] ({})...", fc.file, test_tier, round_label);
-                match self.run_ai("coverage_boost", &prompt, &test_tier) {
+                match self.run_ai_keyed("coverage_boost", &prompt, &test_tier, Some(fc.file.as_str())) {
                     Ok(_) => {
                         info!("AI completed test generation for {} ({})", fc.file, round_label);
                     }
@@ -1777,8 +1777,9 @@ impl Orchestrator {
         );
         let tier = claude::classify_repair_tier();
 
-        if let Err(e) = self.run_ai("coverage_boost_repair", &prompt, &tier) {
+        if let Err(e) = self.run_ai_keyed("coverage_boost_repair", &prompt, &tier, Some(result.file.as_str())) {
             warn!("AI retry failed for {}: {} — discarding definitively", result.file, e);
+            self.evict_session(result.file.as_str());
             let _ = git::revert_changes(&self.config.path);
             return false;
         }
@@ -2179,6 +2180,7 @@ impl Orchestrator {
             test_dir: self.config.test_generation.test_dir.clone(),
             test_source_root: self.config.test_generation.test_source_root.clone(),
             test_spec_segments: self.config.test_generation.test_spec_segments,
+            session_map: Arc::clone(&self.session_map),
         });
 
         let start_pct = initial_pct;
@@ -2401,8 +2403,9 @@ impl Orchestrator {
                                         &per_file_ctx,
                                     );
                                     let tier = claude::classify_repair_tier();
-                                    if let Err(e) = self.run_ai("coverage_boost_repair", &prompt, &tier) {
+                                    if let Err(e) = self.run_ai_keyed("coverage_boost_repair", &prompt, &tier, Some(result.file.as_str())) {
                                         warn!("AI retry failed for {}: {} — giving up", result.file, e);
+                                        self.evict_session(result.file.as_str());
                                         let _ = git::revert_changes(&self.config.path);
                                         break;
                                     }
@@ -2552,6 +2555,14 @@ pub(crate) struct ParallelGenContext {
     /// When set, truncate the filename stem to this many dot-segments when
     /// deriving the spec file name (consolidates sub-module files).
     pub test_spec_segments: Option<usize>,
+    /// US-086: shared Claude session map (file_path → live session). Cloned
+    /// from `Orchestrator::session_map` at dispatch time so worker-mode test
+    /// generation can resume conversations across the chunked-batch loop.
+    pub session_map: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, super::SessionEntry>,
+        >,
+    >,
 }
 
 /// Result of parallel test generation for a single file.
@@ -2725,9 +2736,40 @@ pub(crate) fn generate_tests_in_worktree(
         .unwrap_or_default();
     let per_file_ctx = build_per_file_context(&ctx.framework_context, &file_class, &pkg_hint);
 
-    // Helper closure: run AI via engine, record usage directly in the execution log
+    // Helper closure: run AI via engine, record usage directly in the execution log.
+    // US-086: this closure participates in the shared per-file Claude session
+    // map. Each call passes the source `fc.file` as session_key; consecutive
+    // calls within the same boost (chunks + repair) resume the conversation
+    // and avoid re-loading the source + framework context for every batch.
     let run_ai = |step: &str, prompt: &str, tier: &claude::ClaudeTier| -> Result<String> {
-        let invocation = crate::engine::resolve_engine_for_tier(tier, &ctx.engine_routing)?;
+        let mut invocation = crate::engine::resolve_engine_for_tier(tier, &ctx.engine_routing)?;
+
+        // Look up live session for this source file.
+        let session_key = fc.file.as_str();
+        if matches!(invocation.engine_kind, crate::engine::EngineKind::Claude) {
+            let entry = {
+                let map = ctx.session_map.lock().expect("session_map poisoned");
+                map.get(session_key).cloned()
+            };
+            if let Some(e) = entry {
+                let age = e.opened_at.elapsed().as_secs();
+                if e.turns < super::SESSION_MAX_TURNS && age < super::SESSION_MAX_AGE_SECS {
+                    invocation.session_id = Some(e.id.clone());
+                    tracing::info!(
+                        "[wt] Reusing Claude session {} for {} (turn {}/{}, age {}s)",
+                        e.id, session_key, e.turns + 1, super::SESSION_MAX_TURNS, age
+                    );
+                } else {
+                    let mut map = ctx.session_map.lock().expect("session_map poisoned");
+                    map.remove(session_key);
+                    tracing::info!(
+                        "[wt] Evicting Claude session {} for {} (turns={} age={}s)",
+                        e.id, session_key, e.turns, age
+                    );
+                }
+            }
+        }
+
         let tier_timeout = tier.effective_timeout(ctx.claude_timeout);
         let prompt_floor = ((prompt.len() as u64) / 10 + 120)
             .min(ctx.claude_timeout.saturating_mul(3));
@@ -2749,6 +2791,23 @@ pub(crate) fn generate_tests_in_worktree(
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         if let Ok(ref out) = result {
+            // Persist returned session id for the next turn.
+            if let Some(ref new_sid) = out.session_id {
+                let mut map = ctx.session_map.lock().expect("session_map poisoned");
+                let entry = map.entry(session_key.to_string())
+                    .or_insert_with(|| super::SessionEntry {
+                        id: new_sid.clone(),
+                        turns: 0,
+                        opened_at: std::time::Instant::now(),
+                    });
+                if entry.id != *new_sid {
+                    entry.id = new_sid.clone();
+                    entry.opened_at = std::time::Instant::now();
+                    entry.turns = 0;
+                }
+                entry.turns = entry.turns.saturating_add(1);
+            }
+
             let (usage, unknown) = match out.usage {
                 Some(u) => (u, false),
                 None => (crate::usage::TokenUsage::default(), true),

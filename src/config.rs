@@ -267,8 +267,24 @@ pub struct Config {
 
     /// Run SonarQube rescan verification every N fixes instead of after each.
     /// Saves ~20s × (N-1) per batch in sequential mode. Default 1 (always rescan).
+    ///
+    /// Set to `0` to defer ALL per-issue rescans and run a single verification
+    /// scan at the very end of the whole run (saves ~N rescans × ~30-60s each —
+    /// the biggest single cut available for huge queues). The trade-off is
+    /// that per-issue "still-open" AI retries won't fire during the run; issues
+    /// Sonar still reports at the end are flagged for manual review.
     #[arg(long, env = "REPARO_RESCAN_BATCH_SIZE", default_value = "1")]
     pub rescan_batch_size: u32,
+
+    /// Run the post-wave SonarQube verification scan every N waves instead of
+    /// after every wave. Each scan costs ~20-30 s of scanner time + CE wait,
+    /// so for a run with 88 waves the per-wave policy alone burns ~30-45 min
+    /// just in rescans. Batching lets several waves accumulate before we pay
+    /// that cost — the trade-off is that "still reported by Sonar" issues
+    /// from wave K are only requeued for sequential retry when wave K+N runs
+    /// its scan. Default 1 (every wave). Set to 3-5 for large projects.
+    #[arg(long, env = "REPARO_WAVE_SCAN_BATCH", default_value = "1")]
+    pub wave_scan_batch: u32,
 
     /// Use a lean Claude invocation for per-fix tasks: pass `--bare`
     /// (skips CLAUDE.md auto-load, auto-memory, hooks, plugins) and
@@ -323,6 +339,45 @@ pub struct Config {
     #[arg(long, env = "REPARO_MAX_LINTER_FINDINGS", default_value = "200")]
     pub max_linter_findings: u32,
 
+    /// Disable the per-issue linter autofix fast-path. When enabled (default),
+    /// `lint:*` findings first try the linter's own `--fix` on the affected
+    /// file for the specific rule; only if that doesn't resolve the finding
+    /// does Reparo invoke the AI engine. Saves ~30-60s per auto-fixable
+    /// finding. Set this flag to opt out.
+    #[arg(long, env = "REPARO_SKIP_LINTER_FASTPATH", default_value = "false")]
+    pub skip_linter_fastpath: bool,
+
+    /// Disable same-file / same-rule issue grouping. When enabled (default),
+    /// Reparo buckets findings by `(file, rule)` and issues one AI call per
+    /// bucket instead of one per finding. For queues with many repeated
+    /// findings (e.g. 40 unused-import warnings in one file), this is a
+    /// near-linear speedup.
+    #[arg(long, env = "REPARO_SKIP_ISSUE_GROUPING", default_value = "false")]
+    pub skip_issue_grouping: bool,
+
+    /// Disable the Sonar autofix fast-path (OpenRewrite). When enabled
+    /// (default), Reparo runs a single `mvn rewrite:run` before the AI
+    /// fix loop with recipes mapped to common Sonar rules (S1128, S1481,
+    /// S1068, S1118, S1161, S1124, S2293, …). Findings resolved this way
+    /// skip the AI path entirely. Saves ~3 min per resolvable finding.
+    #[arg(long, env = "REPARO_SKIP_AUTOFIX_SONAR", default_value = "false")]
+    pub skip_autofix_sonar: bool,
+
+    /// Maximum number of findings to bundle into a single AI call during
+    /// issue grouping. Larger values = fewer AI calls but crowded prompts;
+    /// 20 is a good default for one-line style fixes.
+    #[arg(long, env = "REPARO_MAX_GROUP_SIZE", default_value = "20")]
+    pub max_group_size: usize,
+
+    /// Apply same-file/same-rule grouping to Sonar findings within a single
+    /// wave (US-082). Hoy `skip_issue_grouping` solo afecta a `lint:*`
+    /// findings porque la rescan mid-loop podría resucitar findings Sonar
+    /// agrupados a nivel global. Dentro de un wave no hay rescan, así que
+    /// es seguro. Default true; ponerlo a false para reproducir el
+    /// comportamiento previo.
+    #[arg(long, env = "REPARO_DISABLE_WAVE_BATCHING", default_value = "false")]
+    pub disable_wave_batching: bool,
+
     /// Reset personal config (~/.config/reparo/config.yaml) to defaults and exit
     #[arg(long, default_value = "false")]
     pub restore_personal_yaml: bool,
@@ -363,6 +418,20 @@ pub struct Config {
     /// Pre-fix risk assessment configuration (populated from YAML)
     #[arg(skip)]
     pub risk_assessment: RiskAssessmentConfig,
+
+    /// Skip `mvn clean` between successful sequential fixes. Default: true.
+    /// Populated from YAML (no CLI flag).
+    #[arg(skip = true)]
+    pub skip_clean_when_safe: bool,
+
+    /// Wave-sharding conflict depth: 0 = same file, 1 = same parent dir.
+    /// Populated from YAML.
+    #[arg(skip = 1usize)]
+    pub wave_grouping_depth: usize,
+
+    /// Rules to skip as NeedsReview. Populated from YAML.
+    #[arg(skip)]
+    pub rule_blocklist: Vec<String>,
 }
 
 /// Validated, ready-to-use configuration.
@@ -469,6 +538,11 @@ pub struct ValidatedConfig {
     /// fix (saves ~20s × (N-1) per batch of N issues in sequential mode).
     /// Parallel mode is unaffected — each worker owns its own branch.
     pub rescan_batch_size: u32,
+    /// How often to run the post-wave SonarQube verification scan. 1 = after
+    /// every wave (original behavior). N = after every Nth wave or the final
+    /// wave — whichever comes first. Saves ~20-30 s × (N-1) per batch of N
+    /// waves when the scanner + CE wait dominates wave wall-clock.
+    pub wave_scan_batch: u32,
     /// Use a lean Claude invocation for per-fix tasks (--bare + tool whitelist).
     /// Default: true (opt out via --no-lean-ai).
     pub lean_ai: bool,
@@ -504,6 +578,17 @@ pub struct ValidatedConfig {
     pub linter_autofix: bool,
     /// Maximum number of linter findings to queue (0 = no cap).
     pub max_linter_findings: u32,
+    /// Disable the per-issue linter autofix fast-path (A1).
+    pub skip_linter_fastpath: bool,
+    /// Disable same-file/same-rule issue grouping (A3).
+    pub skip_issue_grouping: bool,
+    /// Maximum findings per batched AI call (A3).
+    pub max_group_size: usize,
+    /// Disable wave-level batching for Sonar findings (US-082).
+    /// Default false ⇒ wave batching active.
+    pub disable_wave_batching: bool,
+    /// Disable Sonar autofix fast-path (OpenRewrite).
+    pub skip_autofix_sonar: bool,
     /// Frozen baseline lcov snapshot path. Captured once before the fix loop
     /// (after preflight + coverage boost). All per-issue coverage checks
     /// read from this file rather than the per-worktree lcov, so fixes
@@ -518,6 +603,19 @@ pub struct ValidatedConfig {
     pub compliance: crate::compliance::ComplianceConfig,
     /// Pre-fix risk assessment configuration
     pub risk_assessment: RiskAssessmentConfig,
+    /// Skip `clean` between fixes when the previous fix succeeded (default: true).
+    pub skip_clean_when_safe: bool,
+    /// Depth for wave-sharding affinity: 0 = file-only (previous behavior),
+    /// 1 = parent directory (default), 2 = grandparent.
+    pub wave_grouping_depth: usize,
+    /// Rule IDs to skip as NeedsReview without attempting a fix.
+    pub rule_blocklist: Vec<String>,
+    /// Set to `true` by parallel workers that run inside a freshly-acquired
+    /// git worktree. Fresh worktrees are guaranteed to be at a clean HEAD (the
+    /// pool calls `git clean` + reset on release), so the per-fix `mvn clean`
+    /// step is pure overhead — incremental compile is correct from a cold
+    /// state. Skipping it saves ~1.5-2 s per issue × N issues per worker.
+    pub fresh_worktree: bool,
 }
 
 /// Resolved documentation configuration for runtime use.
@@ -943,7 +1041,9 @@ impl Config {
             skip_final_validation: self.skip_final_validation,
             final_validation_attempts: self.final_validation_attempts,
             targeted_tests_first: !self.skip_targeted_tests,
-            rescan_batch_size: self.rescan_batch_size.max(1),
+            // 0 is meaningful: defer all rescans to a single end-of-run scan.
+            rescan_batch_size: self.rescan_batch_size,
+            wave_scan_batch: self.wave_scan_batch.max(1),
             lean_ai: !self.no_lean_ai,
 
             skip_dedup: self.skip_dedup,
@@ -960,6 +1060,11 @@ impl Config {
             skip_linter_scan: self.skip_linter_scan,
             linter_autofix: self.linter_autofix,
             max_linter_findings: self.max_linter_findings,
+            skip_linter_fastpath: self.skip_linter_fastpath,
+            skip_issue_grouping: self.skip_issue_grouping,
+            max_group_size: self.max_group_size,
+            disable_wave_batching: self.disable_wave_batching,
+            skip_autofix_sonar: self.skip_autofix_sonar,
             baseline_lcov_path: None,
             pact: self.pact,
             engine_routing: crate::engine::EngineRoutingConfig {
@@ -969,6 +1074,10 @@ impl Config {
             test_generation: self.test_generation,
             compliance,
             risk_assessment: self.risk_assessment,
+            skip_clean_when_safe: self.skip_clean_when_safe,
+            wave_grouping_depth: self.wave_grouping_depth,
+            rule_blocklist: self.rule_blocklist,
+            fresh_worktree: false,
         };
 
         // Validate that all routed engines are available
@@ -1259,6 +1368,7 @@ mod tests {
             skip_final_validation: false,
             skip_targeted_tests: false,
             rescan_batch_size: 1,
+            wave_scan_batch: 1,
             no_lean_ai: false,
             final_validation_attempts: 5,
             skip_dedup: false,
@@ -1274,12 +1384,20 @@ mod tests {
             skip_linter_scan: false,
             linter_autofix: false,
             max_linter_findings: 200,
+            skip_linter_fastpath: false,
+            skip_issue_grouping: false,
+            max_group_size: 20,
+            disable_wave_batching: false,
+            skip_autofix_sonar: false,
             pact: PactConfig::default(),
             restore_personal_yaml: false,
             commit_issue: None,
             test_generation: TestGenerationConfig::default(),
             risk_assessment: RiskAssessmentConfig::default(),
             parallel: 1,
+            skip_clean_when_safe: true,
+            wave_grouping_depth: 1,
+            rule_blocklist: Vec::new(),
         }
     }
 
